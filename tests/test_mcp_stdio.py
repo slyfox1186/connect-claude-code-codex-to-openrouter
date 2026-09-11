@@ -13,6 +13,7 @@ from mcp import Client, StdioServerParameters
 LAUNCHER = str(Path(__file__).resolve().parents[1] / "bin" / "openrouter-mcp")
 EXPECTED_TOOLS = {
     "ask_llm", "ask_panel", "list_llm_models", "llm_model_info", "openrouter_usage",
+    "list_llm_categories",
 }
 
 
@@ -32,7 +33,7 @@ async def main() -> int:
 
         tools = await client.list_tools()
         names = {t.name for t in tools.tools}
-        check("all five tools listed", EXPECTED_TOOLS <= names, ", ".join(sorted(names)))
+        check("all tools listed", EXPECTED_TOOLS <= names, ", ".join(sorted(names)))
 
         ask = next((t for t in tools.tools if t.name == "ask_llm"), None)
         if ask:
@@ -74,6 +75,33 @@ async def main() -> int:
         check("an unusable call gets an actionable shape error",
               '"question":' in text and "Received:" in text and "validation error" not in text,
               text.strip()[:140])
+
+        # categories: the "ask one that's good at coding" path. Free, no model call.
+        cat = next((t for t in tools.tools if t.name == "ask_llm"), None)
+        if cat:
+            props = set((cat.input_schema or {}).get("properties") or {})
+            check("ask_llm accepts a category", "category" in props)
+        res = await client.call_tool("list_llm_categories", {"verify": True})
+        text = "".join(getattr(c, "text", "") for c in res.content)
+        check("categories cover the capabilities a user would ask for",
+              all(c in text for c in ("coding", "chat", "reasoning", "math", "budget",
+                                      "long_context", "creative", "agentic")))
+        check("every pinned category model is still listed by OpenRouter",
+              "NO LONGER LISTED" not in text,
+              next((l for l in text.splitlines() if "NO LONGER" in l), "")[:90])
+        check("category picks exclude the asking agent's own vendors",
+              "openai/" not in text and "anthropic/" not in text and "google/" not in text,
+              next((l for l in text.splitlines()
+                    if any(v in l for v in ("openai/", "anthropic/", "google/"))), "")[:90])
+        check("each category shows the evidence behind it", "Why each pick:" in text)
+
+        # an unknown capability must not silently pick something
+        res = await client.call_tool(
+            "ask_llm", {"question": "hi", "category": "underwater basket weaving"},
+        )
+        text = "".join(getattr(c, "text", "") for c in res.content)
+        check("an unknown category is refused rather than guessed",
+              "not a known category" in text.lower(), text.strip()[:120])
 
         # cheap catalogue call, no model tokens spent
         res = await client.call_tool("list_llm_models", {"search": "kimi-k3", "limit": 3})

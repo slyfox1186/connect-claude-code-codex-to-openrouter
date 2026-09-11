@@ -31,6 +31,10 @@ __all__ = [
     "get_api_key",
     "get_catalog",
     "resolve_model",
+    "resolve_category",
+    "category_models",
+    "list_categories",
+    "verify_categories",
     "as_list",
     "strip_call_syntax",
     "split_embedded_question",
@@ -484,6 +488,182 @@ def resolve_model(spec: str) -> tuple[str, str | None]:
         f"{', '.join(sorted(aliases)) or 'none'}. "
         "Run 'orask models --search <name>' to find a slug, or pass a full slug."
     )
+
+
+# --------------------------------------------------------------------------
+# categories
+#
+# "ask an LLM that is good at coding" has to land on a real slug. Categories
+# map a plain-English capability onto the two current benchmark leaders for
+# it, defined in config/models.json with the evidence and the date attached.
+#
+# OpenAI and Anthropic are excluded from category picks by default. This
+# bridge exists to fetch an opinion from outside the agent asking, and Claude
+# Code is Anthropic while Codex is OpenAI: routing a category back to those
+# vendors returns the house view the asker already holds. A full slug asked
+# for by name is still honoured.
+# --------------------------------------------------------------------------
+
+
+def _norm_category(term: str) -> str:
+    return re.sub(r"[\s\-]+", "_", (term or "").strip().lower())
+
+
+def _vendor(slug: str) -> str:
+    return slug.split("/", 1)[0].lstrip("~").lower() if "/" in slug else ""
+
+
+def excluded_vendors() -> list[str]:
+    cfg = load_config()
+    return [str(v).strip().lower() for v in (cfg.get("category_exclude_vendors") or []) if str(v).strip()]
+
+
+def resolve_category(term: str) -> tuple[str, dict[str, Any]] | None:
+    """Match plain English onto a configured category.
+
+    Handles the name itself, the `aka` synonyms, and a phrase the agent lifted
+    straight from the user ("something good at long context"). Returns None
+    rather than guessing when nothing matches, so the caller can fall back to
+    the default model instead of silently picking a category.
+    """
+    cats = load_config().get("categories") or {}
+    if not term or not term.strip() or not cats:
+        return None
+
+    wanted = _norm_category(term)
+    if wanted in cats:
+        return wanted, cats[wanted]
+
+    for name, spec in cats.items():
+        if wanted in [_norm_category(a) for a in (spec.get("aka") or [])]:
+            return name, spec
+
+    # A phrase rather than a keyword: score each category on how many of its
+    # labels appear in it. Longest label wins, so "long context" beats "context".
+    best: tuple[int, str, dict[str, Any]] | None = None
+    for name, spec in cats.items():
+        for label in [name] + list(spec.get("aka") or []):
+            token = _norm_category(label)
+            if token and token in wanted and (best is None or len(token) > best[0]):
+                best = (len(token), name, spec)
+    if best:
+        return best[1], best[2]
+    return None
+
+
+def _heal_slug(slug: str, catalog: list[dict[str, Any]], banned: list[str]) -> str | None:
+    """Closest live model to a slug that has been retired upstream.
+
+    Tries the full model name first, then drops trailing hyphen-separated
+    segments, so 'kimi-k9-retired' falls back through 'kimi-k9' to 'kimi' and
+    lands on the current Kimi rather than failing outright. A replacement from
+    an excluded vendor is no replacement at all.
+    """
+    name = slug.split("/", 1)[-1]
+    parts = name.split("-")
+    for cut in range(len(parts), 0, -1):
+        candidate, _ = _fuzzy("-".join(parts[:cut]), catalog)
+        if candidate and (not banned or _vendor(candidate) not in banned):
+            return candidate
+    return None
+
+
+def category_models(term: str) -> tuple[list[str], list[str]]:
+    """The models configured for a category, validated against the catalogue.
+
+    Returns (slugs, notes). A slug that has been retired upstream is replaced
+    by the closest live match rather than failing the call, and one that
+    violates the vendor exclusion is dropped, both with a note saying so.
+    """
+    match = resolve_category(term)
+    if not match:
+        known = ", ".join(sorted(load_config().get("categories") or {})) or "none configured"
+        raise OpenRouterError(
+            f"'{term}' is not a known category. Configured categories: {known}. "
+            "Use list_llm_categories to see what each one is for, or pass `model` "
+            "with an explicit slug."
+        )
+
+    name, spec = match
+    catalog = _catalog_or_empty()
+    known = {m.get("id") for m in catalog}
+    banned = excluded_vendors()
+    slugs: list[str] = []
+    notes: list[str] = []
+
+    for slug in as_list(spec.get("models")):
+        if banned and _vendor(slug) in banned:
+            notes.append(
+                f"category '{name}' lists {slug}, but vendor '{_vendor(slug)}' is excluded "
+                "from category picks; skipped it."
+            )
+            continue
+        if not known or slug in known:
+            slugs.append(slug)
+            continue
+        replacement = _heal_slug(slug, catalog, banned)
+        if replacement:
+            slugs.append(replacement)
+            notes.append(
+                f"category '{name}' pins {slug}, which OpenRouter no longer lists; "
+                f"used '{replacement}'. Update config/models.json to make this permanent."
+            )
+        else:
+            notes.append(f"category '{name}' pins {slug}, which is no longer available; skipped it.")
+
+    if not slugs:
+        raise OpenRouterError(
+            f"category '{name}' has no usable models left: none of "
+            f"{', '.join(as_list(spec.get('models'))) or 'its entries'} are currently "
+            "available. Edit the categories block in config/models.json."
+        )
+    return slugs, notes
+
+
+def list_categories() -> list[dict[str, Any]]:
+    """Every configured category, for display."""
+    cats = load_config().get("categories") or {}
+    rows = []
+    for name, spec in cats.items():
+        rows.append({
+            "category": name,
+            "models": as_list(spec.get("models")),
+            "aka": as_list(spec.get("aka")),
+            "why": spec.get("why") or "",
+            "measured": spec.get("measured") or "",
+        })
+    return rows
+
+
+def verify_categories() -> list[dict[str, Any]]:
+    """Check every pinned category slug against the live catalogue.
+
+    Benchmark leadership moves, so this is the maintenance check: it says
+    which pins are still real, which have been retired, and what each one
+    currently scores.
+    """
+    catalog = _catalog_or_empty()
+    by_id = {m.get("id"): m for m in catalog}
+    banned = excluded_vendors()
+    rows = []
+    for row in list_categories():
+        for slug in row["models"]:
+            model = by_id.get(slug)
+            index = None
+            if model:
+                index = ((model.get("benchmarks") or {}).get("artificial_analysis") or {}).get(
+                    "intelligence_index"
+                )
+            rows.append({
+                "category": row["category"],
+                "slug": slug,
+                "available": bool(model) or not by_id,
+                "excluded_vendor": bool(banned and _vendor(slug) in banned),
+                "intelligence_index": index,
+                "context": (model or {}).get("context_length"),
+                "measured": row["measured"],
+            })
+    return rows
 
 
 def _enforce_allowed(slug: str, allowed: list[str]) -> str:
@@ -1151,6 +1331,7 @@ def read_log(limit: int = 50) -> list[dict[str, Any]]:
 def ask(
     question: str | None,
     model: str | None = None,
+    category: str | None = None,
     context: str | None = None,
     files: Iterable[str] | str | None = None,
     effort: str | None = None,
@@ -1168,8 +1349,26 @@ def ask(
     cfg = load_config()
     started = time.monotonic()
 
-    slug, resolve_note = resolve_model(model or cfg.get("default_model") or "kimi")
-    notes: list[str] = [n for n in [resolve_note] if n]
+    notes: list[str] = []
+    if model and category:
+        # An explicit model is a deliberate choice; the category is the looser
+        # of the two requests, so it loses rather than silently overriding.
+        notes.append(
+            f"both model='{model}' and category='{category}' were given; used the "
+            "explicit model and ignored the category."
+        )
+        category = None
+
+    if category:
+        picks, cat_notes = category_models(category)
+        notes.extend(cat_notes)
+        name, _ = resolve_category(category)
+        slug, resolve_note = resolve_model(picks[0])
+        notes.append(f"category '{name}' -> {slug}")
+    else:
+        slug, resolve_note = resolve_model(model or cfg.get("default_model") or "kimi")
+    if resolve_note:
+        notes.append(resolve_note)
 
     history = load_thread(thread)
     messages, build_notes = build_messages(
@@ -1341,15 +1540,24 @@ def ask_panel(
     question: str | None,
     models: Iterable[str] | str | None = None,
     max_workers: int = 6,
+    category: str | None = None,
     **kwargs: Any,
 ) -> list[dict[str, Any]]:
     """Ask several models the same question in parallel.
 
     One model failing never takes the panel down: its slot comes back as an
     error entry so the caller still sees every other opinion.
+
+    A category supplies the panel when no explicit models are given. Each
+    category pairs two different vendors on purpose, so the panel is two
+    independent houses rather than one lab asked twice.
     """
     cfg = load_config()
-    wanted = as_list(models) or as_list(cfg.get("default_panel"))
+    panel_notes: list[str] = []
+    wanted = as_list(models)
+    if not wanted and category:
+        wanted, panel_notes = category_models(category)
+    wanted = wanted or as_list(cfg.get("default_panel"))
     if not wanted:
         wanted = [cfg.get("default_model") or "kimi"]
 
@@ -1373,6 +1581,8 @@ def ask_panel(
             pool.submit(ask, question, model=spec, **kwargs): index
             for index, spec in enumerate(seen)
         }
+        # `category` chose the roster above; each member is now an explicit
+        # model, so it must not be passed down again as a second request.
         for future in concurrent.futures.as_completed(futures):
             index = futures[future]
             spec = seen[index]
@@ -1386,6 +1596,9 @@ def ask_panel(
                     "error": str(exc),
                     "notes": [],
                 }
+    for note in panel_notes:
+        if results:
+            results[0].setdefault("notes", []).insert(0, note)
     return results
 
 

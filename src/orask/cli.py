@@ -21,7 +21,8 @@ from typing import Any
 from . import __version__
 from . import core
 
-SUBCOMMANDS = {"ask", "panel", "models", "info", "usage", "threads", "log", "doctor"}
+SUBCOMMANDS = {"ask", "panel", "models", "info", "usage", "threads", "log", "doctor",
+               "categories"}
 
 
 def _fmt_money(value: Any) -> str:
@@ -155,12 +156,21 @@ def build_parser() -> argparse.ArgumentParser:
     ask = subs.add_parser("ask", help="ask one model")
     _shared_ask_args(ask)
     ask.add_argument("-m", "--model", help="alias (kimi, glm) or full OpenRouter slug")
+    ask.add_argument(
+        "-C", "--category",
+        help="pick by capability instead of naming a model: coding, debugging, reasoning, "
+             "math, chat, agentic, research, long_context, creative, budget, general",
+    )
     ask.add_argument("-t", "--thread", help="keep a named conversation for follow-ups")
 
     panel = subs.add_parser("panel", help="ask several models in parallel and compare")
     _shared_ask_args(panel)
     panel.add_argument(
         "-M", "--models", help="comma-separated list (default: kimi,glm)",
+    )
+    panel.add_argument(
+        "-C", "--category",
+        help="put the two current leaders for a capability against each other",
     )
 
     models = subs.add_parser("models", help="search the live OpenRouter catalogue")
@@ -189,14 +199,52 @@ def build_parser() -> argparse.ArgumentParser:
     log.add_argument("-n", "--limit", type=int, default=20)
     log.add_argument("--json", action="store_true")
 
+    cats = subs.add_parser("categories", help="capabilities you can ask for by name")
+    cats.add_argument("--verify", action="store_true",
+                      help="check each pinned model against the live catalogue")
+    cats.add_argument("--json", action="store_true")
+
     subs.add_parser("doctor", help="check key, catalogue, aliases and registrations")
     return parser
+
+
+def _cmd_categories(args: argparse.Namespace) -> int:
+    rows = core.list_categories()
+    if args.verify:
+        checks = {(r["category"], r["slug"]): r for r in core.verify_categories()}
+    if args.json:
+        payload = rows if not args.verify else {"categories": rows,
+                                                "verified": list(checks.values())}
+        print(json.dumps(payload, indent=2))
+        return 0
+
+    for row in rows:
+        print(f"\n{row['category']}")
+        for slug in row["models"]:
+            line = f"    {slug}"
+            if args.verify:
+                check = checks.get((row["category"], slug)) or {}
+                iq = check.get("intelligence_index")
+                state = "ok" if check.get("available") else "NO LONGER LISTED"
+                line += f"    [{state}" + (f", index {iq:.1f}" if iq is not None else "") + "]"
+            print(line)
+        if row["aka"]:
+            print(f"    also matches: {', '.join(row['aka'])}")
+        print(f"    why: {row['why']}")
+        print(f"    checked: {row['measured']}")
+
+    banned = core.excluded_vendors()
+    if banned:
+        print(f"\nCategory picks never return {' or '.join(banned)} models: this bridge is for")
+        print("an opinion from outside the agent asking. Ask by full slug to override.")
+    return 0
 
 
 def _cmd_ask(args: argparse.Namespace) -> int:
     result = core.ask(
         " ".join(args.question),
         model=args.model,
+        category=getattr(args, "category", None),
         context=_gather_context(args),
         files=args.file,
         effort=args.effort,
@@ -222,6 +270,7 @@ def _cmd_panel(args: argparse.Namespace) -> int:
     results = core.ask_panel(
         " ".join(args.question),
         models=models,
+        category=getattr(args, "category", None),
         context=_gather_context(args),
         files=args.file,
         effort=args.effort,
@@ -423,6 +472,7 @@ def _cmd_doctor(_args: argparse.Namespace) -> int:
 HANDLERS = {
     "ask": _cmd_ask, "panel": _cmd_panel, "models": _cmd_models, "info": _cmd_info,
     "usage": _cmd_usage, "threads": _cmd_threads, "log": _cmd_log, "doctor": _cmd_doctor,
+    "categories": _cmd_categories,
 }
 
 

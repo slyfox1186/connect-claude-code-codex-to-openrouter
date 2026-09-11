@@ -39,6 +39,7 @@ threads under `~/.local/state/orask/threads/`.
 |---|---|
 | `ask_llm` | One model. Takes `question`, `model`, `context`, `files`, `role`, `effort`, `thread`. |
 | `ask_panel` | Several models in parallel, answers side by side. |
+| `list_llm_categories` | The capability categories, the models each resolves to, and the evidence. |
 | `list_llm_models` | Search the live catalogue for slugs, prices, context, reasoning efforts. |
 | `llm_model_info` | Full detail for one model. |
 | `openrouter_usage` | Account spend plus what this bridge has cost. |
@@ -55,6 +56,50 @@ flat JSON, one plain string per argument:
 
 The question is always its own argument. It does not go inside `context`, and no
 value is ever wrapped in XML tags.
+
+## Categories
+
+"Ask an LLM that is good at coding" has to land on a real slug, so `category`
+maps a capability onto the two current benchmark leaders for it. Pass it instead
+of `model`, and the agent picks:
+
+| category | models | picked on |
+|---|---|---|
+| `coding` | Kimi K3, GLM 5.3 | SciCode 58.7; coding index (SciCode + Terminal-Bench Hard + LiveCodeBench) |
+| `debugging` | GLM 5.3, Grok 4.6 | strongest on code and reasoning at once |
+| `reasoning` | Grok 4.6, Kimi K3 | GPQA Diamond 93.3 and 91.5 |
+| `math` | Kimi K3, Qwen3.8 Max | weighted competition-math tables; AIME is saturated |
+| `chat` | Muse Spark 1.2, Kimi K3 | LMArena text Elo 1499 and 1489 |
+| `agentic` | GLM 5.3, DeepSeek V4 Pro | tau2-bench airline 80.0 and 78.0 |
+| `research` | DeepSeek V4 Flash, Grok 4.6 | BrowseComp 77.0, DeepSearchQA 69.0 |
+| `long_context` | GLM 5.3, Kimi K3 | 1.31M and 1.05M token windows, MRCR v2 at 1M |
+| `creative` | GLM 5.3, Kimi K3 | Arena open creative-writing board |
+| `budget` | GLM 5.3 Flash, DeepSeek V4.1 Flash | $0.24 and $0.52 per million blended |
+| `general` | GLM 5.3, Grok 4.6 | highest published intelligence index |
+
+`ask_llm` takes the first; `ask_panel` puts both against each other. Synonyms
+resolve too, so "programming", "whole codebase" and "cheap" all land somewhere
+sensible, and a capability that matches nothing is refused rather than guessed.
+
+**No OpenAI, Anthropic or Google model is ever a category pick.** This bridge
+exists to fetch a view from outside the agent asking: Claude Code is Anthropic
+and Codex is OpenAI, so routing a category back to those returns the house view
+the asker already holds. Any of them can still be reached by full slug on
+purpose. The rule lives in `category_exclude_vendors`.
+
+Every category pairs **two different vendors**, so a panel is two independent
+houses rather than one lab asked twice.
+
+Leadership moves. Each entry records the benchmark evidence and the date it was
+checked, and `orask categories --verify` re-checks every pinned slug against the
+live catalogue, reporting anything retired or downgraded:
+
+```
+orask categories                    # what each category is and why
+orask categories --verify           # check the pins against the live catalogue
+orask "why is this slow?" -C coding
+orask panel "is this design sound?" -C reasoning
+```
 
 ## Roles
 
@@ -183,7 +228,9 @@ orask doctor                                                                  # 
 ```
 
 `test_core.py` stubs the catalogue, so it needs neither network nor key. It
-covers alias resolution and self-healing, `allowed_models` locking, effort
+covers category resolution (synonyms, phrases, retired pins, excluded vendors,
+and a check that the shipped config still pairs two live non-excluded vendors per
+category), alias resolution and self-healing, `allowed_models` locking, effort
 clamping per model, file truncation, binary and FIFO rejection, the secrets
 denylist, prompt caps, thread persistence and path-traversal flattening, cost
 estimation, retry policy, catalogue validation, and argument-shape recovery

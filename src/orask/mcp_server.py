@@ -28,6 +28,17 @@ compare. The other model cannot see the repository, so pass the relevant code
 with `files` and the situation with `context` - a question with no context
 gets a generic answer.
 
+When the user asks for a model that is good at something ("ask an LLM that is
+good at coding", "get advice from one that's good at chatting", "something
+strong at math"), pass that capability as `category` and leave `model` unset.
+Categories: coding, debugging, reasoning, math, chat, agentic, research,
+long_context, creative, budget, general. Each one resolves to the two current
+benchmark leaders for it; list_llm_categories shows the evidence behind each.
+
+Category picks never return an OpenAI, Anthropic or Google model: this bridge
+exists to fetch a view from outside the agent asking. Ask for one of those by
+full slug if you specifically want it.
+
 Configured aliases: kimi (Moonshot Kimi K3), glm (Z.ai GLM 5.3). Any other
 OpenRouter model can be reached by passing its full slug; use list_llm_models
 to find one.
@@ -157,9 +168,12 @@ async def _run(func, /, **kwargs):
     name="ask_llm",
     title="Ask another LLM for a second opinion",
     description=(
-        "Ask a different frontier model (Kimi K3 via alias 'kimi', GLM 5.3 via 'glm', or any "
-        "OpenRouter slug) for its independent take on the problem at hand. Use for "
-        "'ask Kimi', 'what does GLM think', 'get a second opinion', or when you are stuck. "
+        "Ask a different frontier model for its independent take on the problem at hand. "
+        "Use for 'ask Kimi', 'what does GLM think', 'get a second opinion', or when you are stuck. "
+        "When the user asks for a model good at something ('one that's good at coding', "
+        "'strong at math'), pass that as `category` and leave `model` unset: coding, debugging, "
+        "reasoning, math, chat, agentic, research, long_context, creative, budget, general. "
+        "Otherwise pass `model` ('kimi', 'glm', or any OpenRouter slug). "
         "The other model has no access to this machine or repo: pass the relevant source "
         "with `files` and the situation with `context`, or the answer will be generic.\n\n"
         + CALL_SHAPE
@@ -167,7 +181,8 @@ async def _run(func, /, **kwargs):
 )
 async def ask_llm(
     question: str | None = None,
-    model: str = "kimi",
+    model: str | None = None,
+    category: str | None = None,
     context: str | None = None,
     files: list[str] | str | None = None,
     role: str = "advisor",
@@ -188,6 +203,13 @@ async def ask_llm(
             own argument: do not fold it into `context` and do not wrap it in
             <question> tags. Be specific; state what you want back.
         model: 'kimi', 'glm', or a full OpenRouter slug like 'x-ai/grok-4.6'.
+            Leave unset when using `category`. Defaults to 'kimi' if neither
+            is given.
+        category: A capability to pick the model by, used when the user asks
+            for a model good at something rather than naming one: coding,
+            debugging, reasoning, math, chat, agentic, research, long_context,
+            creative, budget, general. Resolves to the current benchmark
+            leader for that category. An explicit `model` wins over this.
         context: Background the other model needs - the problem, what you tried,
             error output, constraints. One plain string, as long as you like;
             it sees nothing else. The question does not go in here.
@@ -214,8 +236,8 @@ async def ask_llm(
     question, context, files, shape_note = _question("ask_llm", question, context, files)
     result = await _run(
         core.ask,
-        question=question, model=model, context=context, files=files, role=role,
-        effort=effort, system=system, max_tokens=max_tokens, temperature=temperature,
+        question=question, model=model, category=category, context=context, files=files,
+        role=role, effort=effort, system=system, max_tokens=max_tokens, temperature=temperature,
         thread=thread, cwd=cwd, allow_expensive=allow_expensive,
         allow_secret_files=allow_secret_files, include_reasoning=show_reasoning,
     )
@@ -229,13 +251,18 @@ async def ask_llm(
         "Ask the same question of several models in parallel (default: Kimi K3 and GLM 5.3) "
         "and get every answer back side by side. Use when the user wants more than one "
         "outside view, when a decision is contested, or to see whether independent models "
-        "agree. Costs one call per model; one model failing does not lose the others.\n\n"
+        "agree. Pass `category` instead of `models` to put the two current leaders for a "
+        "capability against each other (coding, debugging, reasoning, math, chat, agentic, "
+        "research, long_context, creative, budget, general); each category pairs two "
+        "different vendors, so the panel is two independent houses. "
+        "Costs one call per model; one model failing does not lose the others.\n\n"
         + CALL_SHAPE + " `models` is a JSON array of aliases or slugs."
     ),
 )
 async def ask_panel(
     question: str | None = None,
     models: list[str] | str | None = None,
+    category: str | None = None,
     context: str | None = None,
     files: list[str] | str | None = None,
     role: str = "advisor",
@@ -252,7 +279,10 @@ async def ask_panel(
             always its own argument: do not fold it into `context` and do not
             wrap it in <question> tags.
         models: A JSON array of aliases or slugs, e.g. ["kimi", "glm"]. Defaults
-            to both configured models.
+            to both configured models. Leave unset when using `category`.
+        category: Put the two current leaders for a capability against each
+            other instead of naming models: coding, debugging, reasoning, math,
+            chat, agentic, research, long_context, creative, budget, general.
         context: Background every model should see. One plain string, as long as
             you like. The question does not go in here.
         files: A JSON array of absolute paths, included verbatim for every model.
@@ -266,8 +296,8 @@ async def ask_panel(
     question, context, files, shape_note = _question("ask_panel", question, context, files)
     results = await _run(
         core.ask_panel,
-        question=question, models=models, context=context, files=files, role=role,
-        effort=effort, system=system, max_tokens=max_tokens, cwd=cwd,
+        question=question, models=models, category=category, context=context, files=files,
+        role=role, effort=effort, system=system, max_tokens=max_tokens, cwd=cwd,
         allow_expensive=allow_expensive,
     )
     total = sum(
@@ -329,6 +359,63 @@ async def list_llm_models(
         )
     lines.append("")
     lines.append("Pass any slug above as `model` to ask_llm.")
+    return "\n".join(lines)
+
+
+@mcp.tool(
+    name="list_llm_categories",
+    title="Capabilities you can ask for by name",
+    description=(
+        "Show every capability category ask_llm and ask_panel accept, the two models each one "
+        "resolves to, and the benchmark evidence behind the pick. Use when the user asks which "
+        "model is best at something, or to check what a category would actually call before "
+        "spending money on it."
+    ),
+)
+async def list_llm_categories(verify: bool = False) -> str:
+    """List the capability categories.
+
+    Args:
+        verify: Also check each pinned model against the live OpenRouter
+            catalogue and report its current intelligence index, to see
+            whether a category has gone stale.
+    """
+    rows = await _run(core.list_categories)
+    lines = [
+        "| category | models | also matches | measured |",
+        "| --- | --- | --- | --- |",
+    ]
+    for row in rows:
+        aka = ", ".join(row["aka"][:4])
+        models = "<br>".join(f"`{m}`" for m in row["models"])
+        lines.append(f"| **{row['category']}** | {models} | {aka} | {row['measured']} |")
+    lines.append("")
+    lines.append("Why each pick:")
+    for row in rows:
+        lines.append(f"- **{row['category']}**: {row['why']}")
+
+    if verify:
+        checks = await _run(core.verify_categories)
+        lines += ["", "Live check against the OpenRouter catalogue:", ""]
+        lines.append("| category | slug | available | intelligence | context |")
+        lines.append("| --- | --- | --- | --- | --- |")
+        for row in checks:
+            iq = row["intelligence_index"]
+            lines.append(
+                f"| {row['category']} | `{row['slug']}` | "
+                f"{'yes' if row['available'] else 'NO LONGER LISTED'} | "
+                f"{f'{iq:.1f}' if iq is not None else '-'} | "
+                f"{row['context'] or 0:,} |"
+            )
+
+    excluded = await _run(core.excluded_vendors)
+    if excluded:
+        lines += [
+            "",
+            f"Category picks never return {' or '.join(excluded)} models: this bridge is for "
+            "an opinion from outside the agent asking. Ask for one of those by full slug if "
+            "you specifically want it.",
+        ]
     return "\n".join(lines)
 
 

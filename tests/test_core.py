@@ -617,6 +617,93 @@ check("a bare string in files is treated as one path",
       sum(1 for n in notes if "not found" in n) == 1, str(notes)[:100])
 
 
+# --------------------------------------------------------------------------
+# categories: "ask an LLM that is good at coding" has to reach a real slug
+# --------------------------------------------------------------------------
+
+_cat_cfg = dict(
+    core.load_config(),
+    category_exclude_vendors=["openai", "anthropic", "google"],
+    categories={
+        "coding": {"models": ["moonshotai/kimi-k3", "z-ai/glm-5.3"],
+                   "aka": ["code", "programming"], "why": "x", "measured": "2026-09-10"},
+        "long_context": {"models": ["z-ai/glm-5.3"], "aka": ["long context", "whole codebase"],
+                         "why": "x", "measured": "2026-09-10"},
+        "retired": {"models": ["moonshotai/kimi-k9-retired"], "aka": [], "why": "x", "measured": "x"},
+        "banned": {"models": ["openai/gpt-6-astra", "z-ai/glm-5.3"], "aka": [],
+                   "why": "x", "measured": "x"},
+        "gone": {"models": ["openai/gpt-6-astra"], "aka": [], "why": "x", "measured": "x"},
+    },
+)
+core._config_cache = _cat_cfg
+
+check("a category name resolves", core.resolve_category("coding")[0] == "coding")
+check("a category name is case and space insensitive",
+      core.resolve_category("Long Context")[0] == "long_context")
+check("an aka synonym resolves", core.resolve_category("programming")[0] == "coding")
+check("a phrase lifted from the user resolves",
+      core.resolve_category("something good at whole codebase work")[0] == "long_context",
+      str(core.resolve_category("something good at whole codebase work")))
+check("the longest matching label wins, not the first",
+      core.resolve_category("long context")[0] == "long_context")
+check("an unknown capability is not guessed at", core.resolve_category("underwater basket") is None)
+check("an empty term is not a category", core.resolve_category("") is None)
+
+slugs, notes = core.category_models("coding")
+check("a category returns its models in order",
+      slugs == ["moonshotai/kimi-k3", "z-ai/glm-5.3"], str(slugs))
+check("a healthy category reports no notes", notes == [], str(notes))
+
+slugs, notes = core.category_models("retired")
+check("a retired pin self-heals to the closest live model",
+      slugs == ["moonshotai/kimi-k3"], str(slugs))
+check("the substitution is reported", any("no longer lists" in n for n in notes), str(notes))
+
+slugs, notes = core.category_models("banned")
+check("an excluded vendor is dropped from a category", slugs == ["z-ai/glm-5.3"], str(slugs))
+check("dropping an excluded vendor is reported",
+      any("excluded" in n for n in notes), str(notes))
+
+try:
+    core.category_models("gone")
+    check("a category with nothing usable left is an error", False, "no error raised")
+except core.OpenRouterError as exc:
+    check("a category with nothing usable left is an error", True)
+    check("that error names the category and the config file",
+          "gone" in str(exc) and "models.json" in str(exc), str(exc)[:80])
+
+try:
+    core.category_models("underwater basket")
+    check("an unknown category is refused", False, "no error raised")
+except core.OpenRouterError as exc:
+    check("an unknown category is refused", True)
+    check("the refusal lists the real categories",
+          "coding" in str(exc) and "list_llm_categories" in str(exc), str(exc)[:90])
+
+check("every configured category is listed",
+      {r["category"] for r in core.list_categories()} == set(_cat_cfg["categories"]))
+
+core._config_cache = None  # back to the real packaged config
+
+# The shipped config has to survive the same checks, since it is what runs.
+_shipped = core.load_config()
+_cats = _shipped.get("categories") or {}
+check("the shipped config defines categories", len(_cats) >= 10, f"{len(_cats)} categories")
+check("every shipped category names two models",
+      all(len(core.as_list(c.get("models"))) == 2 for c in _cats.values()),
+      str({k: len(core.as_list(v.get("models"))) for k, v in _cats.items()
+           if len(core.as_list(v.get("models"))) != 2}))
+_banned = set(core.excluded_vendors())
+_offenders = [m for c in _cats.values() for m in core.as_list(c.get("models"))
+              if m.split("/")[0].lower() in _banned]
+check("no shipped category pins an excluded vendor", not _offenders, str(_offenders))
+_same = [k for k, v in _cats.items()
+         if len({m.split("/")[0] for m in core.as_list(v.get("models"))}) < 2]
+check("every shipped category pairs two different vendors", not _same, str(_same))
+check("every shipped category records its evidence and date",
+      all(c.get("why") and c.get("measured") for c in _cats.values()))
+
+
 print()
 print("summary:", len(FAILS), "failures")
 if FAILS:
