@@ -1,0 +1,1497 @@
+"""Core OpenRouter client for the Claude Code / Codex second-opinion bridge.
+
+Standard library only, on purpose: the CLI must keep working even if no
+third-party package is installed. The MCP front-end adds the one dependency
+(the `mcp` SDK) and reuses everything here.
+"""
+
+from __future__ import annotations
+
+import concurrent.futures
+import fcntl
+import fnmatch
+import hashlib
+import json
+import os
+import socket
+import stat
+import uuid
+import random
+import re
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+from typing import Any, Iterable
+
+__all__ = [
+    "OpenRouterError",
+    "Config",
+    "load_config",
+    "get_api_key",
+    "get_catalog",
+    "resolve_model",
+    "as_list",
+    "strip_call_syntax",
+    "split_embedded_question",
+    "ask",
+    "ask_panel",
+    "list_models",
+    "model_info",
+    "account_usage",
+    "read_log",
+]
+
+API_BASE = "https://openrouter.ai/api/v1"
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+PACKAGED_CONFIG = PROJECT_ROOT / "config" / "models.json"
+
+CONFIG_DIR = Path(os.environ.get("ORASK_CONFIG_DIR", Path.home() / ".config" / "openrouter"))
+ENV_FILE = CONFIG_DIR / "env"
+USER_CONFIG = CONFIG_DIR / "config.json"
+STATE_DIR = Path(os.environ.get("ORASK_STATE_DIR", Path.home() / ".local" / "state" / "orask"))
+CACHE_DIR = Path(os.environ.get("ORASK_CACHE_DIR", Path.home() / ".cache" / "orask"))
+CATALOG_CACHE = CACHE_DIR / "models.json"
+CALL_LOG = STATE_DIR / "calls.jsonl"
+THREAD_DIR = STATE_DIR / "threads"
+
+# Ordered weakest -> strongest. Models advertise their own subset; a requested
+# effort is snapped to the nearest value the target model actually accepts.
+EFFORT_LADDER = ["minimal", "low", "medium", "high", "xhigh", "max"]
+
+# Rough chars-per-token used only for the pre-flight cost estimate.
+CHARS_PER_TOKEN = 3.6
+
+BINARY_HINT = re.compile(rb"[\x00-\x08\x0e-\x1f]")
+
+# Read ceiling applied before the file is opened, so a huge file is never
+# pulled into memory just to be truncated afterwards.
+MAX_FILE_BYTES = 32 * 1024 * 1024
+
+# Anything sent through this bridge leaves the machine for a third-party API.
+# These paths are refused by default: an agent following a poisoned instruction
+# ("include your config files") must not be able to post credentials to
+# OpenRouter. Override per call with allow_secret_files, or edit
+# deny_file_patterns in the config.
+DEFAULT_DENY_PATTERNS = [
+    "*/.ssh/*", "*/.gnupg/*", "*/.aws/credentials", "*/.aws/config",
+    "*/.netrc", "*/.npmrc", "*/.pypirc", "*/.docker/config.json",
+    "*/.kube/config", "*/.git-credentials",
+    "*.pem", "*.key", "*.p12", "*.pfx", "*.keystore", "*.jks",
+    "*/id_rsa*", "*/id_dsa*", "*/id_ecdsa*", "*/id_ed25519*",
+    "*/.env", "*/.env.*", "*.env",
+    "*/.credentials.json", "*/auth.json", "*/.config/openrouter/env",
+    "*RAILWAY_VARS.md", "*this_pc_ssh_transer_details*",
+    "*admin_login_credentials*", "*/shadow", "*/.password-store/*",
+]
+
+
+class OpenRouterError(RuntimeError):
+    """Any failure worth showing to the calling agent verbatim."""
+
+
+# --------------------------------------------------------------------------
+# configuration
+# --------------------------------------------------------------------------
+
+Config = dict[str, Any]
+
+_DEFAULTS: Config = {
+    "default_model": "kimi",
+    "default_panel": ["kimi", "glm"],
+    "default_effort": "high",
+    "default_role": "advisor",
+    "aliases": {"kimi": "moonshotai/kimi-k3", "glm": "z-ai/glm-5.3"},
+    "allowed_models": [],
+    "default_max_tokens": 32000,
+    "request_timeout_s": 300,
+    "max_input_chars": 600000,
+    "max_file_chars": 200000,
+    "max_cost_usd_per_call": 1.0,
+    "catalog_ttl_s": 21600,
+    "thread_max_messages": 20,
+    "roles": {},
+}
+
+_config_cache: Config | None = None
+
+
+def load_config(refresh: bool = False) -> Config:
+    """Packaged defaults, overlaid by ~/.config/openrouter/config.json."""
+    global _config_cache
+    if _config_cache is not None and not refresh:
+        return _config_cache
+
+    cfg: Config = dict(_DEFAULTS)
+    for path in (PACKAGED_CONFIG, USER_CONFIG):
+        if not path.is_file():
+            continue
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise OpenRouterError(f"config file {path} is not valid JSON: {exc}") from exc
+        if not isinstance(loaded, dict):
+            raise OpenRouterError(
+                f"config file {path} must contain a JSON object, got {type(loaded).__name__}"
+            )
+        for key, value in loaded.items():
+            if key.startswith("_"):
+                continue
+            # aliases/roles merge so a user file can add one entry without
+            # having to restate the whole table.
+            if key in ("aliases", "roles") and isinstance(value, dict):
+                merged = dict(cfg.get(key) or {})
+                merged.update(value)
+                cfg[key] = merged
+            else:
+                cfg[key] = value
+
+    _config_cache = cfg
+    return cfg
+
+
+def get_api_key() -> str:
+    """Key from the environment, else from the 0600 key file."""
+    key = os.environ.get("OPENROUTER_API_KEY", "").strip()
+    if key:
+        return key
+
+    if ENV_FILE.is_file():
+        try:
+            lines = ENV_FILE.read_text(encoding="utf-8").splitlines()
+        except OSError as exc:
+            raise OpenRouterError(f"cannot read the key file {ENV_FILE}: {exc}") from exc
+        for raw in lines:
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            name, _, value = line.partition("=")
+            if name.strip() == "OPENROUTER_API_KEY":
+                # An empty value must read as "no key", not produce a 401 later.
+                found = value.strip().strip("'\"")
+                if found:
+                    return found
+
+    raise OpenRouterError(
+        "No OpenRouter API key. Set OPENROUTER_API_KEY, or put "
+        f"OPENROUTER_API_KEY=sk-or-... in {ENV_FILE} (chmod 600)."
+    )
+
+
+# --------------------------------------------------------------------------
+# HTTP
+# --------------------------------------------------------------------------
+
+# GETs are free to retry. A POST to /chat/completions is not: a 5xx can arrive
+# after the provider already generated (and billed) the tokens, so retrying it
+# would pay twice. POSTs therefore retry only on statuses that mean the request
+# never reached a model.
+RETRY_STATUS_GET = {408, 409, 429, 500, 502, 503, 504, 520, 522, 524}
+RETRY_STATUS_POST = {408, 429}
+
+
+def _request(
+    method: str,
+    path: str,
+    payload: dict[str, Any] | None = None,
+    timeout: float = 60.0,
+    retries: int = 3,
+) -> dict[str, Any]:
+    url = f"{API_BASE}{path}"
+    body = json.dumps(payload).encode("utf-8") if payload is not None else None
+    headers = {
+        "Authorization": f"Bearer {get_api_key()}",
+        "Content-Type": "application/json",
+        # Current attribution header; X-Title is the legacy alias, so both are
+        # sent. No HTTP-Referer, which is what would opt this key's usage into
+        # OpenRouter's public app rankings.
+        "X-OpenRouter-Title": "claude-codex-second-opinion",
+        "X-Title": "claude-codex-second-opinion",
+    }
+
+    retryable = RETRY_STATUS_POST if method == "POST" else RETRY_STATUS_GET
+    last_error: Exception | None = None
+    for attempt in range(retries + 1):
+        req = urllib.request.Request(url, data=body, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                raw = resp.read().decode("utf-8", "replace")
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                raise OpenRouterError(
+                    f"OpenRouter returned a non-JSON response to {method} {path}: "
+                    f"{raw.strip()[:400] or '(empty body)'}"
+                ) from exc
+            if not isinstance(parsed, dict):
+                raise OpenRouterError(
+                    f"OpenRouter returned {type(parsed).__name__}, expected a JSON object"
+                )
+            return parsed
+        except urllib.error.HTTPError as exc:
+            detail = ""
+            try:
+                detail = exc.read().decode("utf-8", "replace")[:2000]
+            except Exception:  # noqa: BLE001 - body already gone, status is enough
+                pass
+            message = _http_message(exc.code, detail)
+            if exc.code in retryable and attempt < retries:
+                last_error = OpenRouterError(message)
+                time.sleep(min(2**attempt + random.random(), 20))
+                continue
+            raise OpenRouterError(message) from exc
+        except urllib.error.URLError as exc:
+            last_error = OpenRouterError(f"network error calling OpenRouter: {exc.reason}")
+            # A POST may only be repeated when the failure provably happened
+            # before the request reached a model. A reset or dropped connection
+            # part-way through generation has already been billed, so repeating
+            # it would pay twice.
+            safe_to_repeat = method != "POST" or isinstance(
+                exc.reason, (ConnectionRefusedError, socket.gaierror)
+            )
+            if attempt < retries and safe_to_repeat:
+                time.sleep(min(2**attempt + random.random(), 20))
+                continue
+            raise last_error from exc
+        except TimeoutError as exc:
+            # Deliberately not retried: the provider may already be generating,
+            # and a repeat would be billed a second time.
+            last_error = OpenRouterError(
+                f"OpenRouter request timed out after {timeout:.0f}s. "
+                "Reasoning models on a large context can be slow; retry with a "
+                "lower effort, or raise request_timeout_s in the config."
+            )
+            raise last_error from exc
+
+    raise last_error or OpenRouterError("OpenRouter request failed")
+
+
+def _http_message(code: int, detail: str) -> str:
+    hint = {
+        401: "the API key was rejected - check the key in ~/.config/openrouter/env",
+        402: "insufficient OpenRouter credits - top up at openrouter.ai/credits",
+        403: "the key is not allowed to use this model (moderation or privacy setting)",
+        404: "no such model slug - run 'orask models --search <name>' for exact slugs",
+        429: "rate limited by OpenRouter or the upstream provider",
+    }.get(code)
+    parsed = detail
+    try:
+        obj = json.loads(detail)
+        parsed = obj.get("error", {}).get("message") or detail
+    except (json.JSONDecodeError, AttributeError):
+        pass
+    text = f"OpenRouter HTTP {code}"
+    if hint:
+        text += f" ({hint})"
+    if parsed:
+        text += f": {parsed.strip()[:800]}"
+    return text
+
+
+# --------------------------------------------------------------------------
+# model catalog
+# --------------------------------------------------------------------------
+
+_catalog_cache: list[dict[str, Any]] | None = None
+_catalog_fetched_at: float = 0.0
+
+
+def _valid_catalog(data: Any) -> bool:
+    return (
+        isinstance(data, list)
+        and bool(data)
+        and all(isinstance(entry, dict) and entry.get("id") for entry in data)
+    )
+
+
+def get_catalog(refresh: bool = False, allow_stale: bool = True) -> list[dict[str, Any]]:
+    """Live model list, memoised in-process and cached on disk.
+
+    Never raises on a network failure when a cached copy exists: model lookup
+    degrading to a stale catalogue beats the whole tool going down.
+    """
+    global _catalog_cache, _catalog_fetched_at
+    cfg = load_config()
+    ttl = float(cfg.get("catalog_ttl_s") or 0)
+
+    # The MCP server is long-lived: without a TTL on the in-memory copy it would
+    # serve the catalogue it started with for as long as the process lives, and
+    # silently use stale prices, efforts and model lists.
+    if (
+        _catalog_cache is not None
+        and not refresh
+        and (time.time() - _catalog_fetched_at) < ttl
+    ):
+        return _catalog_cache
+    cached: list[dict[str, Any]] | None = None
+    cache_age = float("inf")
+
+    if CATALOG_CACHE.is_file():
+        try:
+            blob = json.loads(CATALOG_CACHE.read_text(encoding="utf-8"))
+            data = blob.get("data")
+            # Validate the cache exactly as strictly as a fresh fetch: a corrupt
+            # or hand-edited file would otherwise crash every lookup downstream.
+            cached = data if _valid_catalog(data) else None
+            cache_age = time.time() - float(blob.get("fetched_at") or 0)
+        except (OSError, json.JSONDecodeError, TypeError, ValueError, AttributeError):
+            cached = None
+
+    if cached and not refresh and cache_age < ttl:
+        _catalog_cache = cached
+        _catalog_fetched_at = time.time() - cache_age
+        return cached
+
+    try:
+        data = _request("GET", "/models", timeout=45.0, retries=2).get("data") or []
+        if not _valid_catalog(data):
+            raise OpenRouterError("OpenRouter returned an unusable model catalogue")
+        _write_json_atomic(CATALOG_CACHE, {"fetched_at": time.time(), "data": data})
+        _catalog_cache = data
+        _catalog_fetched_at = time.time()
+        return data
+    except OpenRouterError:
+        if cached and allow_stale:
+            _catalog_cache = cached
+            _catalog_fetched_at = time.time() - min(cache_age, ttl)
+            return cached
+        raise
+
+
+def _write_json_atomic(
+    target: Path, payload: dict[str, Any], indent: int | None = None
+) -> bool:
+    """Write via a per-process temp file so concurrent writers cannot collide.
+
+    A fixed ".tmp" name is not safe here: a panel fans out into threads and the
+    CLI and MCP server can run at the same time.
+
+    Returns False instead of raising on an OS error. Every caller is persisting
+    an optimisation (the catalogue cache) or a record written after a paid API
+    call (a thread transcript); a read-only or full ~/.cache must never take
+    down a working fetch or discard an answer the user already paid for.
+    """
+    tmp: Path | None = None
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        tmp = target.with_name(f"{target.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
+        tmp.write_text(json.dumps(payload, indent=indent), encoding="utf-8")
+        tmp.replace(target)
+        return True
+    except OSError:
+        return False
+    finally:
+        if tmp is not None and tmp.exists():
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def _catalog_or_empty() -> list[dict[str, Any]]:
+    try:
+        return get_catalog()
+    except OpenRouterError:
+        return []
+
+
+def _intelligence(model: dict[str, Any]) -> float:
+    bench = (model.get("benchmarks") or {}).get("artificial_analysis") or {}
+    value = bench.get("intelligence_index")
+    return float(value) if isinstance(value, (int, float)) else -1.0
+
+
+def _rank_key(model: dict[str, Any]) -> tuple:
+    slug = model.get("id", "")
+    return (
+        _intelligence(model),
+        0 if slug.startswith("~") else 1,  # prefer a concrete, auditable slug
+        float(model.get("created") or 0),
+    )
+
+
+# --------------------------------------------------------------------------
+# model resolution
+# --------------------------------------------------------------------------
+
+
+def resolve_model(spec: str) -> tuple[str, str | None]:
+    """Turn 'kimi', 'glm-5.3' or a full slug into a real slug.
+
+    Returns (slug, note) where note is a human-readable warning when the
+    request was not satisfied exactly as written.
+    """
+    if not spec or not spec.strip():
+        spec = load_config().get("default_model") or "kimi"
+    spec = spec.strip()
+
+    cfg = load_config()
+    aliases = {k.lower(): v for k, v in (cfg.get("aliases") or {}).items()}
+    catalog = _catalog_or_empty()
+    known = {m.get("id") for m in catalog}
+    allowed = [s for s in (cfg.get("allowed_models") or []) if s]
+
+    key = spec.lower()
+    note: str | None = None
+
+    if key in aliases:
+        pinned = aliases[key]
+        if not known or pinned in known:
+            return _enforce_allowed(pinned, allowed), None
+        # Pinned slug retired upstream: fall back to the best current match
+        # for the alias name rather than failing the call.
+        slug, match_note = _fuzzy(key, catalog)
+        if slug:
+            return (
+                _enforce_allowed(slug, allowed),
+                f"alias '{spec}' is pinned to '{pinned}', which OpenRouter no longer lists; "
+                f"used '{slug}' instead. Update config/models.json to make this permanent."
+                + (f" ({match_note})" if match_note else ""),
+            )
+        raise OpenRouterError(
+            f"alias '{spec}' points at '{pinned}', which OpenRouter no longer lists, "
+            "and no similar model was found. Run 'orask models --search <name>'."
+        )
+
+    if "/" in spec:
+        bare = spec.lstrip("~")
+        if not known or spec in known or f"~{bare}" in known or bare in known:
+            exact = spec if (not known or spec in known) else (bare if bare in known else f"~{bare}")
+            return _enforce_allowed(exact, allowed), None
+        slug, match_note = _fuzzy(bare.split("/", 1)[1], catalog)
+        if slug:
+            return (
+                _enforce_allowed(slug, allowed),
+                f"'{spec}' is not in the OpenRouter catalogue; used the closest match "
+                f"'{slug}'." + (f" ({match_note})" if match_note else ""),
+            )
+        raise OpenRouterError(
+            f"'{spec}' is not an OpenRouter model slug and no close match was found. "
+            "Run 'orask models --search <name>' to see real slugs."
+        )
+
+    slug, match_note = _fuzzy(key, catalog)
+    if slug:
+        alias_list = ", ".join(sorted(aliases)) or "none configured"
+        note = (
+            f"'{spec}' is not a configured alias ({alias_list}); matched the live "
+            f"catalogue to '{slug}'." + (f" ({match_note})" if match_note else "")
+        )
+        return _enforce_allowed(slug, allowed), note
+
+    raise OpenRouterError(
+        f"cannot resolve model '{spec}'. Configured aliases: "
+        f"{', '.join(sorted(aliases)) or 'none'}. "
+        "Run 'orask models --search <name>' to find a slug, or pass a full slug."
+    )
+
+
+def _enforce_allowed(slug: str, allowed: list[str]) -> str:
+    if allowed and slug not in allowed:
+        raise OpenRouterError(
+            f"model '{slug}' is not in allowed_models "
+            f"({', '.join(allowed)}). Edit allowed_models in the config to permit it."
+        )
+    return slug
+
+
+def _fuzzy(term: str, catalog: list[dict[str, Any]]) -> tuple[str | None, str | None]:
+    """Best current model whose slug or name matches `term`.
+
+    Ranked by published intelligence index first, so 'kimi' lands on the
+    vendor's flagship rather than a small or elderly variant.
+    """
+    if not catalog or not term:
+        return None, None
+
+    needle = re.sub(r"[\s_]+", "-", term.strip().lower())
+    if not needle:
+        return None, None
+
+    scored: list[tuple[tuple, dict[str, Any]]] = []
+    for model in catalog:
+        slug = (model.get("id") or "").lower()
+        if not slug:
+            continue
+        explicit = needle in slug
+        # Batch endpoints answer in minutes and free tiers are rate limited:
+        # never pick them by fuzzy match unless the user typed them.
+        if (":batch" in slug and ":batch" not in needle) or (
+            ":free" in slug and ":free" not in needle
+        ):
+            continue
+        name = (model.get("name") or "").lower()
+        bare = slug.lstrip("~")
+        tail = bare.split("/", 1)[1] if "/" in bare else bare
+
+        if tail == needle or bare == needle:
+            quality = 4
+        elif tail.startswith(needle):
+            quality = 3
+        elif explicit:
+            quality = 2
+        elif needle in name.replace(" ", "-"):
+            quality = 1
+        else:
+            continue
+        scored.append(((quality,) + _rank_key(model), model))
+
+    if not scored:
+        return None, None
+    scored.sort(key=lambda item: item[0], reverse=True)
+    best = scored[0][1]
+    others = [m.get("id") for _, m in scored[1:4]]
+    note = f"other candidates: {', '.join(o for o in others if o)}" if others else None
+    return best.get("id"), note
+
+
+def _find(slug: str) -> dict[str, Any]:
+    for model in _catalog_or_empty():
+        if model.get("id") == slug:
+            return model
+    return {}
+
+
+def clamp_effort(slug: str, effort: str | None) -> tuple[str | None, str | None]:
+    """Snap a requested reasoning effort onto what the model accepts.
+
+    Kimi K3 and GLM 5.3, for instance, expose only max/high/low - sending
+    'medium' to them is not valid, so it is snapped to the nearest rung
+    (ties round upward, since a second opinion is worth more thinking).
+    """
+    if effort in (None, "", "none", "off"):
+        return None, None
+
+    model = _find(slug)
+    reasoning = model.get("reasoning") or {}
+    supported = [e for e in (reasoning.get("supported_efforts") or []) if e in EFFORT_LADDER]
+
+    params = model.get("supported_parameters") or []
+    if not supported:
+        if model and not ({"reasoning", "reasoning_effort"} & set(params)):
+            return None, f"{slug} does not take a reasoning effort; sent without one"
+        if effort not in EFFORT_LADDER:
+            return None, (
+                f"effort '{effort}' is not a recognised level "
+                f"({'/'.join(EFFORT_LADDER)}); sent without a reasoning effort"
+            )
+        return effort, None  # model unknown or efforts undeclared: pass through
+
+    if effort in supported:
+        return effort, None
+
+    if effort not in EFFORT_LADDER:
+        declared = reasoning.get("default_effort")
+        if declared in supported:
+            fallback = declared
+        else:
+            fallback = min(
+                supported,
+                key=lambda e: (
+                    abs(EFFORT_LADDER.index(e) - EFFORT_LADDER.index("high")),
+                    -EFFORT_LADDER.index(e),
+                ),
+            )
+        return fallback, f"effort '{effort}' is not a known level; used '{fallback}'"
+
+    want = EFFORT_LADDER.index(effort)
+    best = min(supported, key=lambda e: (abs(EFFORT_LADDER.index(e) - want), -EFFORT_LADDER.index(e)))
+    return best, f"{slug} accepts only {'/'.join(supported)}; effort '{effort}' snapped to '{best}'"
+
+
+# --------------------------------------------------------------------------
+# prompt assembly
+# --------------------------------------------------------------------------
+
+
+def denied_by_policy(path: Path, patterns: list[str]) -> str | None:
+    """The deny pattern this path matches, if any.
+
+    Matched against the path as given, its fully resolved form, and its bare
+    name. Checking only the literal string would let `/tmp/notes.txt`, a symlink
+    to `~/.ssh/id_rsa`, walk straight past the denylist.
+    """
+    forms = {path.as_posix(), path.name}
+    try:
+        forms.add(path.resolve().as_posix())
+        forms.add(path.resolve().name)
+    except (OSError, RuntimeError):
+        pass
+    # fnmatch is case-sensitive on POSIX, which would let ID_RSA or FOO.PEM
+    # walk past lowercase patterns.
+    lowered = {form.lower() for form in forms}
+    for pattern in patterns:
+        needle = pattern.lower()
+        for text in lowered:
+            if fnmatch.fnmatch(text, needle):
+                return pattern
+    return None
+
+
+def _read_file(path: Path, limit: int) -> tuple[str, str | None]:
+    # A FIFO, device or socket would block a plain read forever (or return
+    # endless data) and hang the bridge. The descriptor is opened first and
+    # checked with fstat, so nothing can swap a regular file for a FIFO between
+    # the check and the open. O_NOFOLLOW is safe because the caller passes an
+    # already-resolved path, and it closes the last symlink race.
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        return "", f"could not open {path}: {exc.strerror or exc}"
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            return "", f"{path} is not a regular file (fifo, device or socket); skipped"
+        if info.st_size > MAX_FILE_BYTES:
+            return "", (
+                f"{path} is {info.st_size / 1e6:.0f} MB, over the "
+                f"{MAX_FILE_BYTES / 1e6:.0f} MB read ceiling; skipped"
+            )
+        chunks: list[bytes] = []
+        remaining = MAX_FILE_BYTES + 1
+        while remaining > 0:
+            block = os.read(fd, min(1 << 20, remaining))
+            if not block:
+                break
+            chunks.append(block)
+            remaining -= len(block)
+        raw = b"".join(chunks)
+    except OSError as exc:
+        return "", f"could not read {path}: {exc.strerror or exc}"
+    finally:
+        os.close(fd)
+    if not raw:
+        return "", f"{path} is empty"
+    if BINARY_HINT.search(raw[:8192]):
+        return "", f"{path} looks binary; skipped"
+    if limit <= 0:
+        return "", f"file contents are disabled (max_file_chars={limit}); {path} skipped"
+    text = raw.decode("utf-8", "replace")
+    if len(text) > limit:
+        head = int(limit * 0.7)
+        tail = limit - head
+        marker = f"\n\n... [{len(raw)} bytes total, middle elided by orask] ...\n\n"
+        # text[-0:] would be the entire string, not an empty one.
+        text = text[:head] + marker + (text[len(text) - tail:] if tail > 0 else "")
+        return text, f"{path} truncated to {limit} chars"
+    return text, None
+
+
+# --------------------------------------------------------------------------
+# argument shapes
+#
+# A calling agent assembles these arguments as JSON and sometimes gets the
+# shape wrong: a list arrives as one comma-joined string, or the question ends
+# up pasted inside `context` wrapped in <question> tags with a stray closing
+# tag from the agent's own tool-call syntax trailing after it. The call is
+# recoverable in every one of those cases, and recovering it beats billing a
+# model for a prompt full of markup or making the agent burn a turn on a
+# schema error.
+# --------------------------------------------------------------------------
+
+# Tags seen leaking out of tool-call syntax. Only these are ever stripped, and
+# only when they wrap or terminate the whole value, so a genuine question about
+# XML keeps its markup.
+CALL_SYNTAX_TAGS = (
+    "question", "context", "prompt", "query", "task", "instructions",
+    "parameter", "parameters", "arg", "args", "argument", "arguments",
+    "invoke", "function_calls", "antml:invoke", "antml:parameter",
+    "antml:function_calls",
+)
+
+_OPEN_TAG = re.compile(r"\A<\s*([A-Za-z_:][\w:.-]*)(\s[^<>]*)?>\s*")
+_CLOSE_TAG = re.compile(r"\s*</\s*([A-Za-z_:][\w:.-]*)\s*>\s*\Z")
+
+# "## Question", "# Question", "Question:" or "QUESTION -" on its own line.
+_QUESTION_HEADING = re.compile(
+    r"^[ \t]*(?:#{1,6}[ \t]*)?question[ \t]*[:.\-]?[ \t]*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def as_list(value: Any) -> list[str]:
+    """Coerce a `files`/`models` argument into a list of strings.
+
+    A bare string is the common mistake, and iterating it would treat every
+    character as a separate entry. One path or slug per line if newlines are
+    present, otherwise comma separated.
+    """
+    if value is None:
+        return []
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return []
+        if text.startswith("[") and text.endswith("]"):
+            try:
+                parsed = json.loads(text)
+            except ValueError:
+                parsed = None
+            if isinstance(parsed, list):
+                return [str(item).strip() for item in parsed if str(item).strip()]
+        pieces = text.splitlines() if "\n" in text else text.split(",")
+        return [piece.strip() for piece in pieces if piece.strip()]
+    if isinstance(value, (list, tuple, set)):
+        return [str(item).strip() for item in value if str(item).strip()]
+    return [str(value).strip()] if str(value).strip() else []
+
+
+def strip_call_syntax(value: str | None) -> str | None:
+    """Drop tool-call markup that has leaked into an argument value.
+
+    Removes a wrapper pair that encloses the entire value, and an orphan
+    closing tag left at the end by a truncated call. Markup anywhere else is
+    left alone: it is far more likely to be content than a mistake.
+    """
+    if not value:
+        return value
+    text = value.strip()
+    for _ in range(6):  # nesting this deep is already pathological
+        before = text
+        opening = _OPEN_TAG.match(text)
+        if opening and opening.group(1).lower() in CALL_SYNTAX_TAGS:
+            tail = re.search(
+                rf"</\s*{re.escape(opening.group(1))}\s*>\s*\Z", text, re.IGNORECASE
+            )
+            if tail:
+                text = text[opening.end():tail.start()].strip()
+        closing = _CLOSE_TAG.search(text)
+        if closing and closing.group(1).lower() in CALL_SYNTAX_TAGS:
+            # An orphan closer with no matching opener: the call was truncated.
+            if not re.search(
+                rf"<\s*{re.escape(closing.group(1))}(\s[^<>]*)?>", text[: closing.start()],
+                re.IGNORECASE,
+            ):
+                text = text[: closing.start()].strip()
+        if text == before:
+            break
+    return text
+
+
+def _extract_tagged(text: str, tag: str) -> tuple[str, str] | None:
+    """Pull one <tag>...</tag> block out of `text`, returning (inner, rest)."""
+    match = re.search(
+        rf"<\s*{tag}(?:\s[^<>]*)?>(.*?)</\s*{tag}\s*>", text, re.IGNORECASE | re.DOTALL
+    )
+    if not match or not match.group(1).strip():
+        return None
+    rest = (text[: match.start()] + "\n\n" + text[match.end():]).strip()
+    return match.group(1).strip(), rest
+
+
+def split_embedded_question(
+    question: str | None, context: str | None
+) -> tuple[str | None, str | None, str | None]:
+    """Recover a question that was packed into `context` instead of sent on its own.
+
+    Returns (question, context, note). The note is non-empty only when
+    something was moved, and is meant to be shown to the caller so the next
+    call is made correctly. Nothing is guessed: a context with no question
+    marker in it comes back untouched with no question, and the caller reports
+    the shape error rather than paying for a prompt assembled on a hunch.
+    """
+    question = strip_call_syntax(question)
+    if question and question.strip():
+        return question.strip(), strip_call_syntax(context), None
+    if not context or not context.strip():
+        return None, strip_call_syntax(context), None
+
+    # Search the raw context, before any unwrapping: a context that is nothing
+    # but "<question>...</question>" would otherwise have its one marker
+    # stripped off as a wrapper and become unrecoverable.
+    for tag in ("question", "query", "ask", "prompt"):
+        found = _extract_tagged(context, tag)
+        if found:
+            inner, rest = found
+            return (
+                strip_call_syntax(inner),
+                strip_call_syntax(rest) or None,
+                f"`question` was empty and a <{tag}> block was found inside `context`; "
+                "used that as the question. Send `question` as its own argument next time.",
+            )
+
+    context = strip_call_syntax(context)
+    heading = None
+    for match in _QUESTION_HEADING.finditer(context):
+        heading = match  # the last heading wins; earlier ones are background
+    if heading and context[heading.end():].strip():
+        return (
+            strip_call_syntax(context[heading.end():]),
+            strip_call_syntax(context[: heading.start()]) or None,
+            "`question` was empty and a 'Question' heading was found inside `context`; "
+            "used the text under it as the question. Send `question` as its own "
+            "argument next time.",
+        )
+
+    return None, context, None
+
+
+MISSING_QUESTION = (
+    "no question was given. `question` is a required top-level argument holding a "
+    "plain string, separate from `context`. Send flat JSON, one value per argument:\n"
+    '  {"question": "what you want answered", "context": "background the other '
+    'model needs", "files": ["/abs/path/one.py"]}\n'
+    "Do not wrap a value in XML tags such as <question> or <context>, and do not put "
+    "the question text inside `context`."
+)
+
+
+def build_messages(
+    question: str | None,
+    context: str | None = None,
+    files: Iterable[str] | str | None = None,
+    system: str | None = None,
+    role: str | None = None,
+    cwd: str | None = None,
+    history: list[dict[str, str]] | None = None,
+    allow_secret_files: bool = False,
+) -> tuple[list[dict[str, str]], list[str]]:
+    """Assemble the message list plus any notes worth showing the caller."""
+    cfg = load_config()
+    notes: list[str] = []
+
+    question, context, shape_note = split_embedded_question(question, context)
+    if shape_note:
+        notes.append(shape_note)
+    if not question or not question.strip():
+        raise OpenRouterError(MISSING_QUESTION)
+
+    if system and system.strip():
+        system_prompt = system.strip()
+    else:
+        roles = cfg.get("roles") or {}
+        wanted = (role or cfg.get("default_role") or "advisor").strip().lower()
+        if wanted not in roles and roles:
+            notes.append(
+                f"role '{wanted}' is not defined ({', '.join(sorted(roles))}); used 'advisor'"
+            )
+            wanted = "advisor" if "advisor" in roles else next(iter(roles))
+        system_prompt = roles.get(wanted) or _DEFAULTS_ADVISOR
+
+    parts: list[str] = []
+    if context and context.strip():
+        parts.append("## Background from the agent asking\n\n" + context.strip())
+
+    limit_setting = cfg.get("max_file_chars")
+    file_limit = int(limit_setting) if limit_setting is not None else 200000
+    # Union by default. Replace semantics on a safety list is a footgun: adding
+    # one project pattern would silently drop every credential pattern.
+    deny = cfg.get("deny_file_patterns") or []
+    if cfg.get("deny_file_patterns_replace"):
+        patterns = list(deny)
+    else:
+        patterns = sorted(set(DEFAULT_DENY_PATTERNS) | set(deny))
+    base = Path(cwd).expanduser() if cwd else Path.cwd()
+    for entry in as_list(files):
+        if not entry or not str(entry).strip():
+            continue
+        candidate = Path(str(entry)).expanduser()
+        if not candidate.is_absolute():
+            candidate = base / candidate
+        # Resolve absolute paths too, not just relative ones: an unresolved
+        # absolute path lets a symlink (or a "..") slip past the denylist.
+        try:
+            candidate = candidate.resolve()
+        except (OSError, RuntimeError):
+            notes.append(f"could not resolve path, skipped: {candidate}")
+            continue
+        if not candidate.exists():
+            notes.append(f"file not found, skipped: {candidate}")
+            continue
+        if candidate.is_dir():
+            notes.append(f"{candidate} is a directory, skipped")
+            continue
+        if not allow_secret_files:
+            matched = denied_by_policy(candidate, patterns)
+            if matched:
+                notes.append(
+                    f"REFUSED to send {candidate} to a third-party API: it matches the "
+                    f"deny pattern '{matched}'. Pass allow_secret_files if this file is "
+                    "genuinely not a secret, or edit deny_file_patterns in the config."
+                )
+                continue
+        text, warning = _read_file(candidate, file_limit)
+        if warning:
+            notes.append(warning)
+        if not text:
+            continue
+        fence = "```"
+        while fence in text:
+            fence += "`"
+        parts.append(f"## File: {candidate}\n\n{fence}\n{text}\n{fence}")
+
+    parts.append("## Question\n\n" + question.strip())
+    user_content = "\n\n".join(parts)
+
+    cap = int(cfg.get("max_input_chars") or 600000)
+    if len(user_content) > cap:
+        raise OpenRouterError(
+            f"assembled prompt is {len(user_content)} chars, over the "
+            f"max_input_chars limit of {cap}. Send fewer files, or raise the limit "
+            "in the config if you mean to pay for it."
+        )
+
+    messages: list[dict[str, str]] = [{"role": "system", "content": system_prompt}]
+    for message in history or []:
+        if message.get("role") in ("user", "assistant") and message.get("content"):
+            messages.append({"role": message["role"], "content": message["content"]})
+    messages.append({"role": "user", "content": user_content})
+    return messages, notes
+
+
+_DEFAULTS_ADVISOR = (
+    "You are a senior engineer giving a blunt, high-signal second opinion to another AI "
+    "coding agent. You cannot see the repository and have no tools: reason only from what "
+    "you are given. Be specific and concrete, lead with the answer, and call out risks the "
+    "asker has probably not considered."
+)
+
+
+# --------------------------------------------------------------------------
+# cost
+# --------------------------------------------------------------------------
+
+
+def fmt_usd(value: float) -> str:
+    """Small amounts need more than two decimals to be readable."""
+    return f"${value:,.2f}" if abs(value) >= 0.01 else f"${value:.4f}"
+
+
+def _price(model: dict[str, Any], field: str) -> float:
+    try:
+        return float((model.get("pricing") or {}).get(field) or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def estimate_call_cost(slug: str, chars: int, max_tokens: int | None) -> tuple[float, bool]:
+    """Worst-case cost of a call: whole prompt in, max_tokens out.
+
+    Returns (usd, priced). `priced` is False when the model is not in the
+    catalogue, so the caller can say the guard could not be evaluated instead
+    of treating an unknown price as free.
+    """
+    model = _find(slug)
+    if not model:
+        return 0.0, False
+    prompt = (chars / CHARS_PER_TOKEN) * _price(model, "prompt")
+    output = float(max_tokens or 0) * _price(model, "completion")
+    return prompt + output, True
+
+
+def estimate_input_cost(slug: str, chars: int) -> float:
+    """Prompt-side cost only (kept for callers that just want the input side)."""
+    return estimate_call_cost(slug, chars, 0)[0]
+
+
+def actual_cost(slug: str, usage: dict[str, Any]) -> float:
+    """Prefer OpenRouter's own cost; fall back to catalogue pricing."""
+    for key in ("cost", "total_cost"):
+        value = usage.get(key)
+        if isinstance(value, (int, float)) and value > 0:
+            return float(value)
+    model = _find(slug)
+    if not model:
+        return 0.0
+    prompt = float(usage.get("prompt_tokens") or 0)
+    completion = float(usage.get("completion_tokens") or 0)
+    return prompt * _price(model, "prompt") + completion * _price(model, "completion")
+
+
+# --------------------------------------------------------------------------
+# threads
+# --------------------------------------------------------------------------
+
+
+def _thread_path(name: str) -> Path:
+    """Filename for a thread.
+
+    Sanitising alone collides: "plan a" and "plan-a!" flatten to the same stem,
+    as do two names differing only past the length cut. A short digest of the
+    raw name keeps distinct threads in distinct files.
+    """
+    raw = name.strip()
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "-", raw)[:60].strip("-") or "thread"
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:8]
+    path = THREAD_DIR / f"{safe}-{digest}.json"
+    if not path.exists():
+        # Keep using a transcript written before the digest was introduced.
+        legacy = THREAD_DIR / f"{safe}.json"
+        if legacy.is_file():
+            return legacy
+    return path
+
+
+def load_thread(name: str | None) -> list[dict[str, str]]:
+    if not name:
+        return []
+    path = _thread_path(name)
+    if not path.is_file():
+        return []
+    try:
+        blob = json.loads(path.read_text(encoding="utf-8"))
+        messages = blob.get("messages") or []
+        return [m for m in messages if isinstance(m, dict) and m.get("content")]
+    except (OSError, json.JSONDecodeError):
+        return []
+
+
+def save_thread(name: str | None, question: str, answer: str, slug: str) -> bool:
+    """Persist a thread turn. Returns False if it could not be written.
+
+    Read-modify-write under an exclusive lock: without it two concurrent turns
+    on the same thread both load the same history and the second write silently
+    discards the first exchange.
+    """
+    if not name:
+        return True
+    path = _thread_path(name)
+    lock_handle = None
+    try:
+        THREAD_DIR.mkdir(parents=True, exist_ok=True)
+        lock_handle = open(path.with_suffix(".lock"), "a+")
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+    except OSError:
+        if lock_handle is not None:
+            lock_handle.close()
+        lock_handle = None  # proceed unlocked rather than lose the answer
+    try:
+        return _save_thread_locked(path, name, question, answer, slug)
+    finally:
+        if lock_handle is not None:
+            try:
+                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+            finally:
+                lock_handle.close()
+
+
+def _save_thread_locked(
+    path: Path, name: str, question: str, answer: str, slug: str
+) -> bool:
+    history = load_thread(name)
+    history.append({"role": "user", "content": question})
+    history.append({"role": "assistant", "content": answer, "model": slug})
+    setting = load_config().get("thread_max_messages")
+    keep = int(setting) if setting is not None else 20
+    if keep > 0:
+        history = history[-keep:]
+    return _write_json_atomic(
+        path,
+        {"name": name, "updated_at": time.time(), "messages": history},
+        indent=1,
+    )
+
+
+def list_threads() -> list[dict[str, Any]]:
+    if not THREAD_DIR.is_dir():
+        return []
+    out = []
+    for path in sorted(THREAD_DIR.glob("*.json")):
+        try:
+            blob = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        out.append(
+            {
+                "name": path.stem,
+                "messages": len(blob.get("messages") or []),
+                "updated_at": blob.get("updated_at"),
+            }
+        )
+    return out
+
+
+# --------------------------------------------------------------------------
+# call log
+# --------------------------------------------------------------------------
+
+
+def log_call(entry: dict[str, Any]) -> None:
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        with CALL_LOG.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps({"ts": time.time(), **entry}) + "\n")
+    except OSError:
+        pass  # never fail a call because the log is unwritable
+
+
+def read_log(limit: int = 50) -> list[dict[str, Any]]:
+    """Most recent `limit` entries. The log is append-only and never rotated,
+    so only the tail is read rather than the whole file."""
+    if not CALL_LOG.is_file() or limit <= 0:
+        return []
+    try:
+        size = CALL_LOG.stat().st_size
+        window = min(size, max(int(limit) * 512, 65536))
+        with CALL_LOG.open("rb") as handle:
+            handle.seek(size - window)
+            blob = handle.read(window)
+        text = blob.decode("utf-8", "replace")
+        if window < size:
+            # The first line is probably a fragment of an earlier record.
+            text = text.partition("\n")[2]
+        lines = text.splitlines()
+    except OSError:
+        return []
+    out = []
+    for line in lines[-limit:]:
+        try:
+            out.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return out
+
+
+# --------------------------------------------------------------------------
+# the main event
+# --------------------------------------------------------------------------
+
+
+def ask(
+    question: str | None,
+    model: str | None = None,
+    context: str | None = None,
+    files: Iterable[str] | str | None = None,
+    effort: str | None = None,
+    role: str | None = None,
+    system: str | None = None,
+    max_tokens: int | None = None,
+    temperature: float | None = None,
+    thread: str | None = None,
+    cwd: str | None = None,
+    allow_expensive: bool = False,
+    allow_secret_files: bool = False,
+    include_reasoning: bool = False,
+) -> dict[str, Any]:
+    """Ask one model and return a structured result."""
+    cfg = load_config()
+    started = time.monotonic()
+
+    slug, resolve_note = resolve_model(model or cfg.get("default_model") or "kimi")
+    notes: list[str] = [n for n in [resolve_note] if n]
+
+    history = load_thread(thread)
+    messages, build_notes = build_messages(
+        question, context=context, files=files, system=system, role=role,
+        cwd=cwd, history=history, allow_secret_files=allow_secret_files,
+    )
+    notes.extend(build_notes)
+    if history:
+        notes.append(f"continuing thread '{thread}' with {len(history)} prior messages")
+
+    chars = sum(len(m["content"]) for m in messages)
+
+    if max_tokens is not None and int(max_tokens) < 1:
+        # 0 would read as "no cap": no max_tokens sent and zero output priced,
+        # so the provider's own ceiling applies against a $0.00 estimate.
+        raise OpenRouterError(
+            "max_tokens must be 1 or more; omit it to use the configured default"
+        )
+    limit = max_tokens if max_tokens is not None else cfg.get("default_max_tokens")
+    ceiling = ((_find(slug).get("top_provider") or {}).get("max_completion_tokens")) or 0
+    if limit and ceiling and int(limit) > int(ceiling):
+        limit = int(ceiling)
+
+    guard = float(cfg.get("max_cost_usd_per_call") or 0)
+    # With no cap of our own the provider's ceiling is what could actually be
+    # billed, so the guard is judged against that rather than against zero.
+    worst_output = int(limit) if limit else int(ceiling or 0)
+    estimate, priced = estimate_call_cost(slug, chars, worst_output)
+    if guard and not allow_expensive:
+        if not priced:
+            policy = str(cfg.get("cost_guard_on_unknown_pricing") or "warn").lower()
+            if policy == "block":
+                raise OpenRouterError(
+                    f"refusing to send: no catalogue pricing for {slug}, so the "
+                    f"{fmt_usd(guard)} per-call cost guard cannot be checked, and "
+                    "cost_guard_on_unknown_pricing is 'block'. Pass allow_expensive "
+                    "to send anyway."
+                )
+            notes.append(
+                f"no catalogue pricing for {slug}, so the {fmt_usd(guard)} per-call "
+                "cost guard could not be checked (cost_guard_on_unknown_pricing="
+                f"'{policy}')"
+            )
+        elif estimate > guard:
+            raise OpenRouterError(
+                f"refusing to send: worst-case cost for {slug} is about "
+                f"{fmt_usd(estimate)} ({chars} chars in, up to {limit} tokens out), over "
+                f"the {fmt_usd(guard)} per-call guard. Trim the context, lower "
+                "max_tokens, or pass allow_expensive to override."
+            )
+
+    payload: dict[str, Any] = {
+        "model": slug,
+        "messages": messages,
+        "usage": {"include": True},
+    }
+
+    wanted_effort = effort if effort is not None else cfg.get("default_effort")
+    final_effort, effort_note = clamp_effort(slug, wanted_effort)
+    if effort_note:
+        notes.append(effort_note)
+    if final_effort:
+        payload["reasoning"] = {"effort": final_effort}
+
+    if limit:
+        payload["max_tokens"] = int(limit)
+    if temperature is not None:
+        payload["temperature"] = float(temperature)
+
+    timeout = float(cfg.get("request_timeout_s") or 300)
+    try:
+        response = _request("POST", "/chat/completions", payload, timeout=timeout)
+    except OpenRouterError as exc:
+        log_call(
+            {
+                "model": slug, "requested": model, "ok": False,
+                "error": str(exc)[:500], "chars_in": chars,
+                "latency_s": round(time.monotonic() - started, 2), "thread": thread,
+            }
+        )
+        raise
+
+    choices = response.get("choices") or []
+    if not choices:
+        raise OpenRouterError(
+            f"{slug} returned no choices. Raw response: {json.dumps(response)[:600]}"
+        )
+    message = choices[0].get("message") or {}
+    answer = (message.get("content") or "").strip()
+    reasoning = (message.get("reasoning") or "").strip()
+    finish = choices[0].get("finish_reason") or choices[0].get("native_finish_reason")
+
+    if not answer and reasoning:
+        answer = reasoning
+        notes.append(
+            "the model returned only reasoning text and no final answer "
+            "(often means max_tokens was consumed while thinking); showing the reasoning"
+        )
+        reasoning = ""
+    empty = not answer
+    if empty:
+        notes.append(
+            f"{slug} returned no answer at all (finish_reason={finish}); "
+            "the call was still billed"
+        )
+
+    if finish == "length":
+        cap = payload.get("max_tokens")
+        notes.append(
+            f"answer was cut off at the {cap} token limit; ask for a shorter answer "
+            "or raise max_tokens"
+            if cap
+            else "answer was cut off by the provider's own output limit"
+        )
+
+    usage = response.get("usage") or {}
+    cost = actual_cost(slug, usage)
+    elapsed = round(time.monotonic() - started, 2)
+
+    if thread and answer and not save_thread(thread, question, answer, slug):
+        notes.append(
+            f"could not write the thread transcript to {THREAD_DIR}; this answer "
+            "will not be part of the next follow-up"
+        )
+
+    log_call(
+        {
+            "model": slug, "requested": model, "ok": not empty, "empty": empty,
+            "effort": final_effort, "role": role or cfg.get("default_role"),
+            "prompt_tokens": usage.get("prompt_tokens"),
+            "completion_tokens": usage.get("completion_tokens"),
+            "reasoning_tokens": (usage.get("completion_tokens_details") or {}).get(
+                "reasoning_tokens"
+            ),
+            "cost_usd": round(cost, 6), "latency_s": elapsed,
+            "chars_in": chars, "thread": thread,
+        }
+    )
+
+    return {
+        # An empty completion is reported as a failure: a caller keying on `ok`
+        # must not treat "no answer" as a second opinion.
+        "ok": not empty,
+        "error": (
+            f"{slug} returned an empty answer (finish_reason={finish})" if empty else None
+        ),
+        "model": slug,
+        "requested": model,
+        "answer": answer,
+        "reasoning": reasoning if include_reasoning else "",
+        "effort": final_effort,
+        "finish_reason": finish,
+        "provider": response.get("provider"),
+        "usage": {
+            "prompt_tokens": usage.get("prompt_tokens"),
+            "completion_tokens": usage.get("completion_tokens"),
+            "reasoning_tokens": (usage.get("completion_tokens_details") or {}).get(
+                "reasoning_tokens"
+            ),
+            "cost_usd": round(cost, 6),
+        },
+        "latency_s": elapsed,
+        "thread": thread,
+        "notes": notes,
+    }
+
+
+def ask_panel(
+    question: str | None,
+    models: Iterable[str] | str | None = None,
+    max_workers: int = 6,
+    **kwargs: Any,
+) -> list[dict[str, Any]]:
+    """Ask several models the same question in parallel.
+
+    One model failing never takes the panel down: its slot comes back as an
+    error entry so the caller still sees every other opinion.
+    """
+    cfg = load_config()
+    wanted = as_list(models) or as_list(cfg.get("default_panel"))
+    if not wanted:
+        wanted = [cfg.get("default_model") or "kimi"]
+
+    seen: list[str] = []
+    for entry in wanted:
+        if entry.lower() not in [s.lower() for s in seen]:
+            seen.append(entry)
+
+    if kwargs.pop("thread", None):
+        # Silently dropping it would leave the caller believing the panel was
+        # continuing a conversation.
+        raise OpenRouterError(
+            "thread is not supported for a panel: several models writing one "
+            "transcript would interleave. Use ask() per model with its own thread."
+        )
+
+    results: list[dict[str, Any]] = [{} for _ in seen]
+    workers = max(1, min(int(max_workers), len(seen)))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {
+            pool.submit(ask, question, model=spec, **kwargs): index
+            for index, spec in enumerate(seen)
+        }
+        for future in concurrent.futures.as_completed(futures):
+            index = futures[future]
+            spec = seen[index]
+            try:
+                results[index] = future.result()
+            except Exception as exc:  # noqa: BLE001 - report, never propagate
+                results[index] = {
+                    "ok": False,
+                    "requested": spec,
+                    "model": spec,
+                    "error": str(exc),
+                    "notes": [],
+                }
+    return results
+
+
+# --------------------------------------------------------------------------
+# discovery helpers
+# --------------------------------------------------------------------------
+
+
+def list_models(
+    search: str | None = None,
+    vendor: str | None = None,
+    limit: int = 25,
+    include_batch: bool = False,
+    sort: str = "intelligence",
+) -> list[dict[str, Any]]:
+    """Search the live catalogue so any of OpenRouter's models is reachable."""
+    catalog = get_catalog()
+    needle = (search or "").strip().lower()
+    vendor_needle = (vendor or "").strip().lower().rstrip("/")
+
+    rows = []
+    for model in catalog:
+        slug = model.get("id") or ""
+        low = slug.lower()
+        if not include_batch and ":batch" in low:
+            continue
+        if vendor_needle and not low.lstrip("~").startswith(vendor_needle + "/"):
+            continue
+        if needle and needle not in low and needle not in (model.get("name") or "").lower():
+            continue
+        reasoning = model.get("reasoning") or {}
+        rows.append(
+            {
+                "slug": slug,
+                "name": model.get("name"),
+                "context": model.get("context_length"),
+                "intelligence_index": _intelligence(model) if _intelligence(model) >= 0 else None,
+                "usd_per_m_input": round(_price(model, "prompt") * 1_000_000, 3),
+                "usd_per_m_output": round(_price(model, "completion") * 1_000_000, 3),
+                "reasoning_efforts": reasoning.get("supported_efforts") or [],
+                "modalities": (model.get("architecture") or {}).get("input_modalities") or [],
+            }
+        )
+
+    if sort == "context":
+        rows.sort(key=lambda r: r["context"] or 0, reverse=True)
+    elif sort == "price":
+        rows.sort(key=lambda r: r["usd_per_m_input"])
+    elif sort == "name":
+        rows.sort(key=lambda r: r["slug"])
+    else:
+        rows.sort(
+            key=lambda r: (r["intelligence_index"] if r["intelligence_index"] is not None else -1),
+            reverse=True,
+        )
+    return rows[: max(1, int(limit))]
+
+
+def model_info(spec: str) -> dict[str, Any]:
+    slug, note = resolve_model(spec)
+    model = _find(slug)
+    if not model:
+        raise OpenRouterError(f"no catalogue entry for '{slug}'")
+    reasoning = model.get("reasoning") or {}
+    top = model.get("top_provider") or {}
+    bench = (model.get("benchmarks") or {}).get("artificial_analysis") or {}
+    return {
+        "slug": slug,
+        "resolved_from": spec,
+        "note": note,
+        "name": model.get("name"),
+        "description": (model.get("description") or "")[:1200],
+        "context_length": model.get("context_length"),
+        "max_output_tokens": top.get("max_completion_tokens"),
+        "moderated": top.get("is_moderated"),
+        "usd_per_m_input": round(_price(model, "prompt") * 1_000_000, 3),
+        "usd_per_m_output": round(_price(model, "completion") * 1_000_000, 3),
+        "usd_per_m_cache_read": round(_price(model, "input_cache_read") * 1_000_000, 3),
+        "reasoning_efforts": reasoning.get("supported_efforts") or [],
+        "reasoning_default": reasoning.get("default_effort"),
+        "reasoning_mandatory": reasoning.get("mandatory"),
+        "modalities": (model.get("architecture") or {}).get("input_modalities") or [],
+        "intelligence_index": bench.get("intelligence_index"),
+        "coding_index": bench.get("coding_index"),
+        "agentic_index": bench.get("agentic_index"),
+    }
+
+
+def account_usage() -> dict[str, Any]:
+    data = _request("GET", "/key", timeout=30.0, retries=2).get("data") or {}
+    entries = read_log(limit=100000)
+    spend = sum(float(e.get("cost_usd") or 0) for e in entries if e.get("ok"))
+    day_cutoff = time.time() - 86400
+    spend_day = sum(
+        float(e.get("cost_usd") or 0)
+        for e in entries
+        if e.get("ok") and float(e.get("ts") or 0) >= day_cutoff
+    )
+    return {
+        "key_label": data.get("label"),
+        "account_usage_usd": data.get("usage"),
+        "credit_limit_usd": data.get("limit"),
+        "credit_remaining_usd": data.get("limit_remaining"),
+        "free_tier": data.get("is_free_tier"),
+        "bridge_calls_logged": len([e for e in entries if e.get("ok")]),
+        "bridge_spend_usd": round(spend, 4),
+        "bridge_spend_last_24h_usd": round(spend_day, 4),
+        "log_file": str(CALL_LOG),
+    }

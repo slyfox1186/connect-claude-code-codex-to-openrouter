@@ -1,0 +1,126 @@
+# ---------------------------------------------------------------------------
+# Secrets. This repo is public, so these come first and stay broad.
+# The OpenRouter key is read at runtime from ~/.config/openrouter/env and has
+# never lived in the tree. These rules exist so it cannot start to.
+# ---------------------------------------------------------------------------
+env
+.env
+.env.*
+*.env
+env.local
+secrets.json
+*secret*
+*credential*
+*_token
+*.token
+.netrc
+.npmrc
+.pypirc
+.git-credentials
+
+# Keys and certificates
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+*.keystore
+*.jks
+id_rsa*
+id_dsa*
+id_ecdsa*
+id_ed25519*
+
+# ---------------------------------------------------------------------------
+# This bridge's own runtime state. Defaults live under ~/.local/state and
+# ~/.cache, but ORASK_STATE_DIR / ORASK_CACHE_DIR / ORASK_CONFIG_DIR can point
+# them anywhere, including here. The call log and saved threads hold the full
+# text of every question asked, so they must never be published.
+# ---------------------------------------------------------------------------
+calls.jsonl
+threads/
+.cache/
+cache/
+state/
+config/config.json
+config/*.local.json
+
+# The packaged defaults ARE part of the project: never let a rule above or
+# below swallow them.
+!config/models.json
+!.gitignore
+!.gitattributes
+
+# ---------------------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+sdist/
+wheels/
+*.egg-info/
+*.egg
+.installed.cfg
+MANIFEST
+
+# Virtual environments. The project uses a named conda env
+# (/home/jman/miniconda3/envs/openrouter-mcp), so an env directory appearing
+# in the tree is a mistake, not a dependency.
+.venv/
+venv/
+ENV/
+.conda/
+conda-meta/
+
+# Tooling caches
+.pytest_cache/
+.mypy_cache/
+.dmypy.json
+.ruff_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+*.cover
+
+# ---------------------------------------------------------------------------
+# Agent and editor local state
+# ---------------------------------------------------------------------------
+.claude/settings.local.json
+.claude/memory/
+.mcp.local.json
+.codex/
+.vscode/
+.idea/
+*.iml
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ---------------------------------------------------------------------------
+# Scratch and rejected work
+# ---------------------------------------------------------------------------
+*.log
+*.bak
+*.orig
+*.rej
+*.tmp
+tmp/
+scratch/
+scratchpad/
+
+# Local only: personal setup notes, never published.
+JEFF_START_HERE.md

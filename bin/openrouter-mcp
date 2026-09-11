@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# MCP stdio server. stdout is the protocol channel: never echo to it.
+set -euo pipefail
+
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+PROJECT="$(dirname "$(dirname "$SELF")")"
+
+# Interpreter, in priority order: an explicit override, the conda env this
+# project is built against, then whatever python3 is on PATH so a clone of
+# this repo runs somewhere other than the machine it was written on.
+PYTHON="${ORASK_PYTHON:-}"
+if [[ -z $PYTHON || ! -x $PYTHON ]]; then
+    for candidate in \
+        "$HOME/miniconda3/envs/openrouter-mcp/bin/python" \
+        "$HOME/anaconda3/envs/openrouter-mcp/bin/python" \
+        "$(command -v python3 2>/dev/null || true)"
+    do
+        if [[ -n $candidate && -x $candidate ]]; then
+            PYTHON="$candidate"
+            break
+        fi
+    done
+fi
+
+if [[ -z $PYTHON ]]; then
+    echo "openrouter-mcp: no usable Python interpreter found; set ORASK_PYTHON" >&2
+    exit 1
+fi
+
+export PYTHONPATH="$PROJECT/src${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONUNBUFFERED=1
+exec "$PYTHON" -m orask.mcp_server "$@"

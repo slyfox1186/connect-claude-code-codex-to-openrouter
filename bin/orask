@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# CLI: ask another OpenRouter model for a second opinion.
+set -euo pipefail
+
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+PROJECT="$(dirname "$(dirname "$SELF")")"
+
+# Interpreter, in priority order: an explicit override, the conda env this
+# project is built against, then whatever python3 is on PATH so a clone of
+# this repo runs somewhere other than the machine it was written on.
+PYTHON="${ORASK_PYTHON:-}"
+if [[ -z $PYTHON || ! -x $PYTHON ]]; then
+    for candidate in \
+        "$HOME/miniconda3/envs/openrouter-mcp/bin/python" \
+        "$HOME/anaconda3/envs/openrouter-mcp/bin/python" \
+        "$(command -v python3 2>/dev/null || true)"
+    do
+        if [[ -n $candidate && -x $candidate ]]; then
+            PYTHON="$candidate"
+            break
+        fi
+    done
+fi
+
+if [[ -z $PYTHON ]]; then
+    echo "orask: no usable Python interpreter found." >&2
+    echo "orask: set ORASK_PYTHON, or create the env with:" >&2
+    echo "       conda create -y -n openrouter-mcp python=3.13 && conda run -n openrouter-mcp pip install mcp" >&2
+    exit 1
+fi
+
+export PYTHONPATH="$PROJECT/src${PYTHONPATH:+:$PYTHONPATH}"
+exec "$PYTHON" -m orask.cli "$@"
