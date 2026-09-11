@@ -28,6 +28,11 @@ compare. The other model cannot see the repository, so pass the relevant code
 with `files` and the situation with `context` - a question with no context
 gets a generic answer.
 
+Never paste a file's contents into `question` or `context`. Put its path in
+`files` and the bridge sends the file itself: source and prose go in as text,
+while a PDF, screenshot, diagram or sound file is attached to the message as
+a real attachment. A directory path in `files` sends the files inside it.
+
 When the user asks for a model that is good at something ("ask an LLM that is
 good at coding", "get advice from one that's good at chatting", "something
 strong at math"), pass that capability as `category` and leave `model` unset.
@@ -175,7 +180,10 @@ async def _run(func, /, **kwargs):
         "reasoning, math, chat, agentic, research, long_context, creative, budget, general. "
         "Otherwise pass `model` ('kimi', 'glm', or any OpenRouter slug). "
         "The other model has no access to this machine or repo: pass the relevant source "
-        "with `files` and the situation with `context`, or the answer will be generic.\n\n"
+        "with `files` and the situation with `context`, or the answer will be generic. "
+        "Never paste a file's contents into the question: put its path in `files` and the "
+        "bridge sends the file itself. Source goes in as text; a PDF, image or audio file "
+        "is attached to the message directly; a directory sends the files inside it.\n\n"
         + CALL_SHAPE
     ),
 )
@@ -192,6 +200,7 @@ async def ask_llm(
     temperature: float | None = None,
     thread: str | None = None,
     cwd: str | None = None,
+    pdf_engine: str | None = None,
     show_reasoning: bool = False,
     allow_expensive: bool = False,
     allow_secret_files: bool = False,
@@ -213,8 +222,15 @@ async def ask_llm(
         context: Background the other model needs - the problem, what you tried,
             error output, constraints. One plain string, as long as you like;
             it sees nothing else. The question does not go in here.
-        files: A JSON array of absolute paths, included verbatim. Relative paths
-            resolve against `cwd`. Large files are truncated in the middle.
+        files: A JSON array of paths to send. Never paste a file into `question`
+            or `context` instead: put the path here and the bridge sends the
+            file itself. Source and prose go in as text (large ones truncated
+            in the middle); a PDF, image (png/jpg/webp/gif) or audio file is
+            attached to the message as an attachment, so it never has to be
+            described or transcribed. A directory path sends the files inside
+            it, skipping build output and .git. Relative paths resolve against
+            `cwd`. Images and audio need a model that accepts them; PDFs work
+            on every model.
         role: advisor (blunt second opinion, default), reviewer (hunt for
             defects), debugger (rank root causes), architect (assess a design),
             redteam (attack the plan).
@@ -227,6 +243,9 @@ async def ask_llm(
         thread: Name a conversation to keep, so a later call with the same name
             is a follow-up the model remembers.
         cwd: Directory that relative `files` paths resolve against.
+        pdf_engine: How an attached PDF is read: 'cloudflare-ai' (default, free,
+            right for a text PDF), 'mistral-ocr' (reads scans, billed per
+            1,000 pages) or 'native' (only for models that take files directly).
         show_reasoning: Also return the model's reasoning trace.
         allow_expensive: Bypass the per-call cost guard for a large prompt.
         allow_secret_files: Permit a file that matches the secrets denylist
@@ -238,7 +257,7 @@ async def ask_llm(
         core.ask,
         question=question, model=model, category=category, context=context, files=files,
         role=role, effort=effort, system=system, max_tokens=max_tokens, temperature=temperature,
-        thread=thread, cwd=cwd, allow_expensive=allow_expensive,
+        thread=thread, cwd=cwd, pdf_engine=pdf_engine, allow_expensive=allow_expensive,
         allow_secret_files=allow_secret_files, include_reasoning=show_reasoning,
     )
     return _note(_render(result, show_reasoning), shape_note)
@@ -270,6 +289,7 @@ async def ask_panel(
     system: str | None = None,
     max_tokens: int | None = None,
     cwd: str | None = None,
+    pdf_engine: str | None = None,
     allow_expensive: bool = False,
 ) -> str:
     """Ask several models the same question at once.
@@ -285,12 +305,16 @@ async def ask_panel(
             chat, agentic, research, long_context, creative, budget, general.
         context: Background every model should see. One plain string, as long as
             you like. The question does not go in here.
-        files: A JSON array of absolute paths, included verbatim for every model.
+        files: A JSON array of paths, sent to every model. Source goes in as
+            text, a PDF or image is attached directly, and a directory sends
+            the files inside it. Never paste a file into `question` instead.
         role: advisor, reviewer, debugger, architect or redteam.
         effort: Reasoning effort, snapped per model to what each supports.
         system: Replace the role prompt with your own.
         max_tokens: Cap each answer.
         cwd: Directory that relative `files` paths resolve against.
+        pdf_engine: How an attached PDF is read: 'cloudflare-ai' (default, free),
+            'mistral-ocr' (reads scans, billed per 1,000 pages) or 'native'.
         allow_expensive: Bypass the per-call cost guard.
     """
     question, context, files, shape_note = _question("ask_panel", question, context, files)
@@ -298,7 +322,7 @@ async def ask_panel(
         core.ask_panel,
         question=question, models=models, category=category, context=context, files=files,
         role=role, effort=effort, system=system, max_tokens=max_tokens, cwd=cwd,
-        allow_expensive=allow_expensive,
+        pdf_engine=pdf_engine, allow_expensive=allow_expensive,
     )
     total = sum(
         float((r.get("usage") or {}).get("cost_usd") or 0) for r in results if r.get("ok")

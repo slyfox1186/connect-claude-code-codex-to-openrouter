@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Register the OpenRouter second-opinion bridge with Claude Code and Codex.
-# Safe to re-run: every step is idempotent and every edited file is backed up.
+# Safe to re-run, and re-running is how an existing install is brought up to
+# date: every step converges on the current project rather than skipping when
+# it finds an older registration. Every edited file is backed up first.
 # Nothing here is specific to one machine: paths come from $HOME and from where
 # this file sits, so a clone installs the same way on any Linux or macOS box.
 set -euo pipefail
@@ -16,6 +18,7 @@ CONFIG_DIR="${ORASK_CONFIG_DIR:-$HOME/.config/openrouter}"
 KEY_FILE="$CONFIG_DIR/env"
 PIN_FILE="$PROJECT/.orask-python"
 STAMP="$(date +%Y-%m-%d_%H%M%S)"
+CHANGED=0
 MIN_PYTHON="3.10"
 
 say()  { printf '  %s\n' "$*"; }
@@ -185,70 +188,170 @@ PY
 step "Registering the MCP server with Claude Code"
 if ! command -v claude >/dev/null 2>&1; then
     say "SKIPPED: the 'claude' CLI is not on PATH"
-elif "$PYTHON" - "$CLAUDE_JSON" <<'PY'
+else
+    # An entry left by an older install points at whatever was true then: a
+    # different project directory, a different interpreter, no env at all. It
+    # has to be compared against what this run would write, not just counted.
+    CLAUDE_STATE="$("$PYTHON" - "$CLAUDE_JSON" "$SERVER_JSON" <<'PY' || echo failed
 import json, sys
 try:
     with open(sys.argv[1], encoding="utf-8") as fh:
-        sys.exit(0 if "openrouter" in (json.load(fh).get("mcpServers") or {}) else 1)
+        current = (json.load(fh).get("mcpServers") or {}).get("openrouter")
 except (OSError, ValueError):
-    sys.exit(1)
+    current = None
+if not current:
+    print("missing")
+    raise SystemExit
+want = json.loads(sys.argv[2])
+# Only the keys this installer manages are compared. Anything the agent added
+# on its own is not a reason to rewrite the entry.
+drift = sorted(key for key, value in want.items() if current.get(key) != value)
+print("current" if not drift else "stale:" + ",".join(drift))
 PY
-then
-    say "already registered (remove with: claude mcp remove openrouter -s user)"
-else
-    cp -p "$CLAUDE_JSON" "$HOME/.claude.json.bak.$STAMP" 2>/dev/null \
-        && say "backed up ~/.claude.json -> ~/.claude.json.bak.$STAMP"
-    # Written through the Claude CLI rather than by editing ~/.claude.json
-    # directly, because a running session owns that file.
-    if claude mcp add-json openrouter "$SERVER_JSON" --scope user >/dev/null; then
-        say "registered as user-scope MCP server 'openrouter'"
-    else
-        say "FAILED: 'claude mcp add-json' did not accept the server; register it by hand with:"
-        say "  claude mcp add-json openrouter '$SERVER_JSON' --scope user"
-    fi
+)"
+    case "$CLAUDE_STATE" in
+        current)
+            say "already registered and up to date" ;;
+        failed)
+            say "FAILED: could not read $CLAUDE_JSON; register by hand with:"
+            say "  claude mcp add-json openrouter '$SERVER_JSON' --scope user" ;;
+        *)
+            cp -p "$CLAUDE_JSON" "$HOME/.claude.json.bak.$STAMP" 2>/dev/null \
+                && say "backed up ~/.claude.json -> ~/.claude.json.bak.$STAMP"
+            if [[ $CLAUDE_STATE == stale:* ]]; then
+                say "registered, but out of date (${CLAUDE_STATE#stale:}); replacing it"
+                claude mcp remove openrouter -s user >/dev/null 2>&1 || true
+            fi
+            # Written through the Claude CLI rather than by editing ~/.claude.json
+            # directly, because a running session owns that file.
+            if claude mcp add-json openrouter "$SERVER_JSON" --scope user >/dev/null; then
+                CHANGED=1
+                if [[ $CLAUDE_STATE == stale:* ]]; then
+                    say "updated the user-scope MCP server 'openrouter'"
+                else
+                    say "registered as user-scope MCP server 'openrouter'"
+                fi
+            else
+                say "FAILED: 'claude mcp add-json' did not accept the server; register it by hand with:"
+                say "  claude mcp add-json openrouter '$SERVER_JSON' --scope user"
+            fi ;;
+    esac
 fi
 
 step "Registering the MCP server with Codex"
 if [[ ! -f $CODEX_TOML ]] && ! command -v codex >/dev/null 2>&1; then
     say "SKIPPED: Codex is not installed ($CODEX_TOML does not exist)"
-elif [[ -f $CODEX_TOML ]] && grep -q '^\[mcp_servers\.openrouter\]' "$CODEX_TOML"; then
-    say "already registered (delete the [mcp_servers.openrouter] block to undo)"
 else
     if [[ -f $CODEX_TOML ]]; then
         cp -p "$CODEX_TOML" "$CODEX_TOML.bak.$STAMP"
-        say "backed up -> $CODEX_TOML.bak.$STAMP"
     else
         mkdir -p "$(dirname "$CODEX_TOML")"
         say "creating $CODEX_TOML"
     fi
-    "$PYTHON" - "$CODEX_TOML" "$PROJECT/bin/openrouter-mcp" "$PYTHON" <<'PY'
-import json, sys
+    # An existing block is rewritten in place rather than left alone. A block
+    # written by an older install can name a stale project path, or list fewer
+    # tools than the server now has, and Codex would go on believing it.
+    CODEX_STATE="$("$PYTHON" - "$CODEX_TOML" "$PROJECT/bin/openrouter-mcp" "$PYTHON" <<'PY' || echo failed
+import json, os, sys, tempfile
+
 path, command, interpreter = sys.argv[1], sys.argv[2], sys.argv[3]
-block = f"""
-[mcp_servers.openrouter]
+HEADER = "[mcp_servers.openrouter]"
+TOOLS = ["ask_llm", "ask_panel", "list_llm_models", "list_llm_categories",
+         "llm_model_info", "openrouter_usage"]
+block = f"""{HEADER}
 command = {json.dumps(command)}
 args = []
 env = {{ ORASK_PYTHON = {json.dumps(interpreter)} }}
 startup_timeout_sec = 30
 # Reasoning models on a large context can take minutes; a panel runs in parallel.
 tool_timeout_sec = 600
-enabled_tools = ["ask_llm", "ask_panel", "list_llm_models", "llm_model_info", "openrouter_usage"]
+enabled_tools = {json.dumps(TOOLS)}
 """
-with open(path, "a", encoding="utf-8") as fh:
-    fh.write(block)
+
+try:
+    with open(path, encoding="utf-8") as fh:
+        original = fh.read()
+except OSError:
+    original = ""
+
+lines = original.splitlines(keepends=True)
+start = end = None
+for index, line in enumerate(lines):
+    stripped = line.strip()
+    if start is None:
+        if stripped == HEADER:
+            start = index
+        continue
+    # The block ends at the next table header that is not one of its own
+    # subtables; a trailing subtable belongs to this server and is replaced
+    # with it rather than orphaned under the next one.
+    if stripped.startswith("[") and not stripped.startswith("[mcp_servers.openrouter."):
+        end = index
+        break
+
+if start is None:
+    updated = original
+    if updated and not updated.endswith("\n"):
+        updated += "\n"
+    updated += "\n" + block
+    state = "added"
+else:
+    if end is None:
+        end = len(lines)
+    if "".join(lines[start:end]).strip() == block.strip():
+        print("unchanged")
+        raise SystemExit
+    updated = "".join(lines[:start]) + block + "".join(lines[end:])
+    state = "updated"
+
+# Written through a temporary file and renamed: a half-written config.toml
+# would stop Codex from starting at all.
+directory = os.path.dirname(os.path.abspath(path)) or "."
+os.makedirs(directory, exist_ok=True)
+handle = tempfile.NamedTemporaryFile(
+    "w", encoding="utf-8", dir=directory, prefix=".orask-", delete=False
+)
+try:
+    handle.write(updated)
+    handle.flush()
+    os.fsync(handle.fileno())
+finally:
+    handle.close()
+os.replace(handle.name, path)
+print(state)
 PY
-    say "appended [mcp_servers.openrouter]"
+)"
+    case "$CODEX_STATE" in
+        unchanged)
+            say "already registered and up to date"
+            rm -f "$CODEX_TOML.bak.$STAMP" ;;
+        added)
+            CHANGED=1
+            say "appended [mcp_servers.openrouter] to $CODEX_TOML" ;;
+        updated)
+            CHANGED=1
+            say "rewrote the existing [mcp_servers.openrouter] block"
+            say "backed up -> $CODEX_TOML.bak.$STAMP" ;;
+        *)
+            say "FAILED: could not update $CODEX_TOML"
+            say "the file is unchanged; a copy of it is at $CODEX_TOML.bak.$STAMP" ;;
+    esac
 fi
 
 step "Verifying"
 "$PROJECT/bin/orask" doctor || true
 
+printf '\n== Done\n\n'
+if [[ $CHANGED == 1 ]]; then
+    say "A registration changed, so restart Claude Code and Codex to pick it up"
+    say "(an already running session keeps the tool list it started with)."
+else
+    say "Registrations were already current. The launchers are symlinks into"
+    say "$PROJECT, so project code updates are live without re-registering;"
+    say "restart an agent only if its tool list changed."
+fi
+
 cat <<'DONE'
-
-== Done
-
-Restart Claude Code and Codex to pick up the new MCP server (an already
-running session keeps the tool list it started with).
 
 Then just ask, in either agent:
   "ask Kimi what it thinks about this"

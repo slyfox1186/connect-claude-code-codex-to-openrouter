@@ -1,6 +1,8 @@
 """Command-line front-end: orask.
 
     orask "why is this leaking?" -m glm -f server.py
+    orask "what does this diagram show?" -f ~/shots/arch.png -m glm
+    orask "does this spec contradict itself?" -f ~/docs/spec.pdf
     git diff | orask ask "review this diff" --role reviewer
     orask panel "is this plan sound?" -c "$(cat PLAN.md)"
     orask models --search kimi
@@ -125,7 +127,12 @@ def _shared_ask_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("-c", "--context", help="background text to include")
     parser.add_argument(
         "-f", "--file", action="append", default=[], metavar="PATH",
-        help="include a file's contents (repeatable)",
+        help="send a file, or a directory of files (repeatable). Source goes in as "
+             "text; a PDF, image or audio file is attached to the message directly",
+    )
+    parser.add_argument(
+        "--pdf-engine", choices=list(core.PDF_ENGINES),
+        help="how an attached PDF is read (default: cloudflare-ai, free)",
     )
     parser.add_argument("-e", "--effort", help="reasoning effort: low|medium|high|xhigh|max|none")
     parser.add_argument(
@@ -253,6 +260,7 @@ def _cmd_ask(args: argparse.Namespace) -> int:
         max_tokens=args.max_tokens,
         temperature=args.temperature,
         thread=args.thread,
+        pdf_engine=args.pdf_engine,
         allow_expensive=args.allow_expensive,
         allow_secret_files=args.allow_secret_files,
         include_reasoning=args.show_reasoning,
@@ -278,6 +286,7 @@ def _cmd_panel(args: argparse.Namespace) -> int:
         system=args.system,
         max_tokens=args.max_tokens,
         temperature=args.temperature,
+        pdf_engine=args.pdf_engine,
         allow_expensive=args.allow_expensive,
         allow_secret_files=args.allow_secret_files,
         include_reasoning=args.show_reasoning,

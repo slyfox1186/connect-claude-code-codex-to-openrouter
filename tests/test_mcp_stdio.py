@@ -5,12 +5,30 @@ Costs a few cents - it makes one real model call.
 """
 
 import asyncio
+import base64
 import sys
+import tempfile
 from pathlib import Path
 
 from mcp import Client, StdioServerParameters
 
 LAUNCHER = str(Path(__file__).resolve().parents[1] / "bin" / "openrouter-mcp")
+
+# A one-page PDF whose only content is a codeword, so "the model saw the file"
+# cannot be faked by a lucky guess.
+PROOF_PDF_B64 = (
+    "JVBERi0xLjQKMSAwIG9iajw8L1R5cGUvQ2F0YWxvZy9QYWdlcyAyIDAgUj4+ZW5kb2JqCjIgMCBvYmo8PC9UeXBl"
+    "L1BhZ2VzL0tpZHNbMyAwIFJdL0NvdW50IDE+PmVuZG9iagozIDAgb2JqPDwvVHlwZS9QYWdlL1BhcmVudCAyIDAg"
+    "Ui9NZWRpYUJveFswIDAgNjEyIDc5Ml0vQ29udGVudHMgNCAwIFIvUmVzb3VyY2VzPDwvRm9udDw8L0YxIDUgMCBS"
+    "Pj4+Pj4+ZW5kb2JqCjQgMCBvYmo8PC9MZW5ndGggMTI3Pj5zdHJlYW0KQlQgL0YxIDIyIFRmIDcyIDcwMCBUZCAo"
+    "Q29kZXdvcmQ6IFBFTElDQU4tOTkzMSkgVGogRVQKQlQgL0YxIDE2IFRmIDcyIDY2MCBUZCAoVGhpcyBwYWdlIHBy"
+    "b3ZlcyBhIFBERiByZWFjaGVkIHRoZSBtb2RlbC4pIFRqIEVUCmVuZHN0cmVhbWVuZG9iago1IDAgb2JqPDwvVHlw"
+    "ZS9Gb250L1N1YnR5cGUvVHlwZTEvQmFzZUZvbnQvSGVsdmV0aWNhPj5lbmRvYmoKeHJlZgowIDYKMDAwMDAwMDAw"
+    "MCA2NTUzNSBmIAowMDAwMDAwMDA5IDAwMDAwIG4gCjAwMDAwMDAwNTIgMDAwMDAgbiAKMDAwMDAwMDEwMSAwMDAw"
+    "MCBuIAowMDAwMDAwMjExIDAwMDAwIG4gCjAwMDAwMDAzODMgMDAwMDAgbiAKdHJhaWxlcjw8L1NpemUgNi9Sb290"
+    "IDEgMCBSPj4Kc3RhcnR4cmVmCjQ0NAolJUVPRgo="
+)
+
 EXPECTED_TOOLS = {
     "ask_llm", "ask_panel", "list_llm_models", "llm_model_info", "openrouter_usage",
     "list_llm_categories",
@@ -40,6 +58,9 @@ async def main() -> int:
             props = set((ask.input_schema or {}).get("properties") or {})
             check("ask_llm schema has question/model/context/files",
                   {"question", "model", "context", "files"} <= props)
+            check("ask_llm exposes the pdf engine choice", "pdf_engine" in props)
+            check("ask_llm description tells the caller not to paste files in",
+                  "Never paste a file" in (ask.description or ""))
             # The call shape has to travel with the tool, not just live in the
             # server instructions: a model reads the description at call time.
             desc = ask.description or ""
@@ -155,6 +176,26 @@ async def main() -> int:
         check("an unreachable model is labelled FAILED, not NO ANSWER",
               "no-such-model-xyz - FAILED" in text,
               next((l for l in text.splitlines() if "no-such-model" in l), "")[:90])
+
+        # An attachment has to survive the whole path: tool argument, base64,
+        # the wire, and the model actually seeing it. A codeword the model can
+        # only produce by decoding the file is the proof.
+        with tempfile.TemporaryDirectory() as tmp:
+            pdf = Path(tmp) / "proof.pdf"
+            pdf.write_bytes(base64.b64decode(PROOF_PDF_B64))
+            res = await client.call_tool(
+                "ask_llm",
+                {
+                    "question": "What codeword is in the attached PDF? Reply with just it.",
+                    "model": "kimi", "files": [str(pdf)],
+                    "effort": "low", "max_tokens": 4000,
+                },
+            )
+            text = "".join(getattr(c, "text", "") for c in res.content)
+            check("a pdf attachment reaches the model", "PELICAN-9931" in text,
+                  text.strip()[-160:])
+            check("the answer says the file was attached, not pasted",
+                  "attached 1 file" in text)
 
         # error path must come back as a readable message, not a crash
         res = await client.call_tool("ask_llm", {"question": "hi", "model": "no-such-model-xyz"})

@@ -1,4 +1,4 @@
-# orask — OpenRouter second-opinion bridge for Claude Code and Codex
+# orask: OpenRouter second-opinion bridge for Claude Code and Codex
 
 Lets an AI coding agent consult other frontier models mid-task:
 
@@ -6,9 +6,9 @@ Lets an AI coding agent consult other frontier models mid-task:
 
 Two front-ends over one engine:
 
-- **MCP server** (`bin/openrouter-mcp`) — registered with Claude Code and Codex,
+- **MCP server** (`bin/openrouter-mcp`), registered with Claude Code and Codex,
   exposing five tools so the agent can consult another model on its own.
-- **CLI** (`bin/orask`) — the same engine from any shell, and the fallback if the
+- **CLI** (`bin/orask`), the same engine from any shell, and the fallback if the
   MCP layer ever breaks.
 
 The engine (`src/orask/core.py`) is **standard library only**. The MCP layer is
@@ -93,6 +93,67 @@ flat JSON, one plain string per argument:
 The question is always its own argument. It does not go inside `context`, and no
 value is ever wrapped in XML tags.
 
+## Sending files
+
+Never paste a file into the question. Put its path in `files` and the bridge
+sends the file itself.
+
+| What you point at | What goes over the wire |
+|---|---|
+| Source, config, prose, a diff | Pasted in as fenced text, labelled with its full path |
+| PDF | Attached as a file part, parsed by OpenRouter before the model reads it |
+| PNG, JPG, WEBP, GIF | Attached as an image part |
+| WAV, MP3, OGG, FLAC, M4A, AAC | Attached as an audio part |
+| A directory | The files inside it, pruning `.git`, `node_modules` and build output |
+
+The type is decided by the file's magic bytes first and its extension second, so
+a screenshot saved with no suffix still attaches as an image.
+
+```bash
+orask "what does this diagram show?" -f ~/shots/arch.png -m kimi
+orask "does this spec contradict the code?" -f ~/docs/spec.pdf -f src/api.py
+orask "review this package" -f src/orask/ --role reviewer
+```
+
+A PDF works on every model, because OpenRouter parses it before the model sees
+it. `pdf_engine` picks how: `cloudflare-ai` (the default, free, right for a text
+PDF), `mistral-ocr` (reads scanned pages, billed per 1,000 pages) or `native`
+(models that take a file directly). Images and audio need a model that accepts
+that modality; ask one that does not and the file is held back with a note
+naming what it does accept, rather than spending a call on a request that fails.
+`llm_model_info` reports the modalities of any model.
+
+Attachments are bounded by bytes rather than by characters, since base64 inflates
+anything by a third: `max_attachment_bytes` per file, `max_attachment_total_bytes`
+per call, `max_attachments` per message, `max_dir_files` per expanded directory.
+The secrets denylist applies to attachments exactly as it does to text, so a
+private key does not become sendable by having binary contents.
+
+### Following up on a document
+
+Name a `thread` and the attachment stays with it, so the next question about the
+same PDF does not mean sending it again:
+
+```bash
+orask "what does clause 4 say?" -f contract.pdf -t contract
+orask "does clause 9 contradict it?"            -t contract
+```
+
+The turn is stored with its attachment parts, and OpenRouter's file annotations
+from the answer are stored alongside and replayed on the assistant turn. The
+annotations are what let OpenRouter recognise a document it has already parsed
+and skip the parse, which is where the `mistral-ocr` per-page charge would land.
+
+They are only a parse receipt, not the document: annotations replayed without the
+file leave the model with nothing to read. That is why the file part is carried
+too, which is also how OpenRouter's own example does it. A live probe caught the
+difference, and `test_core.py` now pins it.
+
+Carrying base64 in a transcript has a budget of its own, `thread_attachment_bytes`
+(4 MB). Over that the attachment is not kept and the answer says to pass the file
+again on the next turn, rather than leaving a follow-up that quietly cannot see
+the document.
+
 ## Categories
 
 "Ask an LLM that is good at coding" has to land on a real slug, so `category`
@@ -168,7 +229,7 @@ call is made correctly.
 
 
 **Per-model reasoning efforts.** Kimi K3 and GLM 5.3 accept only
-`max`/`high`/`low` — sending `medium` is invalid. `clamp_effort()` snaps any
+`max`/`high`/`low`, so sending `medium` is invalid. `clamp_effort()` snaps any
 requested effort onto what the target model actually advertises, rounding up on a
 tie, and says so in the response notes. Verified against the live catalogue.
 
@@ -182,16 +243,29 @@ against the live catalogue and ranked by published intelligence index, so `grok`
 lands on the current flagship, not an elderly variant. `:batch` endpoints (which
 answer in minutes) and `:free` tiers are never selected implicitly.
 
-**Cost control.** Worst-case cost — whole prompt in, `max_tokens` out — is
-computed before sending and refused above `max_cost_usd_per_call` ($1.00).
+**Cost control.** Worst-case cost, meaning the whole prompt in and `max_tokens`
+out, is computed before sending and refused above `max_cost_usd_per_call` ($1.00).
 When a model has no catalogue pricing the guard says it could not be evaluated
 instead of treating unknown as free. Every call is logged with OpenRouter's own
 reported cost.
 
 **POSTs are not retried into a double bill.** A 5xx on `/chat/completions` can
 arrive after the provider already generated and billed the tokens, so POSTs retry
-only on 408/429 — statuses meaning the request never reached a model. GETs keep
+only on 408/429, the statuses that mean the request never reached a model. GETs keep
 the full retry set. Read timeouts are never retried, for the same reason.
+
+**Typed failures are translated.** OpenRouter returns a stable `error_type` at
+`error.metadata.error_type` on `/chat/completions`. The image ones each have a
+different fix, so `image_too_large`, `unsupported_image_format`, `invalid_image`
+and the rest are turned into the sentence that says what to do instead of a bare
+HTTP 400. An unrecognised type is still printed rather than swallowed.
+
+**The cost guard estimates attachments, and says that it is estimating.**
+OpenRouter has no preflight token-counting endpoint and does not publish how a
+provider tiles an image, so an attachment's share of the pre-flight estimate is a
+deliberately high heuristic, and the answer says so. The real numbers come back
+afterwards in `usage.prompt_tokens_details` (`audio_tokens`, `video_tokens`,
+`cached_tokens`), which the result now reports.
 
 **Secrets denylist.** `files` paths matching `deny_file_patterns` (ssh keys,
 `.env`, `*.pem`, `RAILWAY_VARS.md`, `admin_login_credentials*`, this bridge's own
@@ -202,8 +276,8 @@ party. Override per call with `allow_secret_files`.
 Every path is resolved before the check, so a symlink (`/tmp/notes.txt` pointing
 at `~/.ssh/id_rsa`) cannot walk past it, and matching is case-insensitive so
 `ID_RSA` and `CERT.PEM` are caught too. User patterns are unioned with the
-built-ins rather than replacing them — adding one project pattern must not
-silently disable credential protection; `deny_file_patterns_replace: true` makes
+built-ins rather than replacing them, because adding one project pattern must
+not silently disable credential protection; `deny_file_patterns_replace: true` makes
 replacement a deliberate act.
 
 **Only regular files are read.** A FIFO, device or socket would block forever and
@@ -225,7 +299,7 @@ all four stdin shapes.
 
 **Errors reach the model verbatim.** The MCP SDK replaces an unexpected
 exception's text with a generic "Error executing tool", so expected failures are
-re-raised as `ToolError` — the one type it forwards intact. That is how the
+re-raised as `ToolError`, the one type it forwards intact. That is how the
 calling agent learns to run `orask models --search` instead of retrying blindly.
 
 **Catalogue caching honours its TTL in memory.** The MCP server is long-lived;
@@ -244,8 +318,8 @@ thread cannot silently drop an exchange.
 Kimi and GLM reviewed this module through the bridge itself, twice. The first
 round found the cost guard ignoring output tokens, POST retries that could
 double-bill, an unbounded in-memory catalogue cache, and unvalidated file reads.
-The second round verified those fixes and independently — both models, separately
-— found a symlink bypass of the secrets denylist, plus `text[-0:]` returning the
+The second round verified those fixes, and both models independently and
+separately found a symlink bypass of the secrets denylist, plus `text[-0:]` returning the
 whole string instead of nothing when `max_file_chars` was 0. All findings are
 fixed and regression-tested. One claim was rejected on evidence: GLM reported
 `X-OpenRouter-Title` as not a real header, but the current OpenRouter docs
@@ -273,9 +347,16 @@ estimation, retry policy, catalogue validation, and argument-shape recovery
 (question folded into `context`, leaked tool-call tags, list arguments sent as a
 bare string).
 
+For attachments it covers type classification by magic bytes and by extension,
+the content parts each kind produces, the modality gate, the byte and count
+ceilings, the denylist applying to binaries, directory expansion and pruning,
+and the fact that base64 is judged by bytes rather than against the text cap.
+
 `test_mcp_stdio.py` replays the real malformed call over the protocol. That check
 costs nothing: it points at an unresolvable model, so reaching model resolution
-is itself the proof that the question was accepted.
+is itself the proof that the question was accepted. It also sends a real one-page
+PDF whose only content is a codeword, so the round trip is proved by the model
+returning something it could only have read out of the file.
 
 ## Adding a model
 

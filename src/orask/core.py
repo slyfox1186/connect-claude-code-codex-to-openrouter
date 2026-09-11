@@ -7,6 +7,7 @@ third-party package is installed. The MCP front-end adds the one dependency
 
 from __future__ import annotations
 
+import base64
 import concurrent.futures
 import fcntl
 import fnmatch
@@ -38,6 +39,12 @@ __all__ = [
     "as_list",
     "strip_call_syntax",
     "split_embedded_question",
+    "classify_attachment",
+    "expand_paths",
+    "text_chars",
+    "attachment_summary",
+    "summarize_parts",
+    "sent_attachments",
     "ask",
     "ask_panel",
     "list_models",
@@ -71,6 +78,57 @@ BINARY_HINT = re.compile(rb"[\x00-\x08\x0e-\x1f]")
 # Read ceiling applied before the file is opened, so a huge file is never
 # pulled into memory just to be truncated afterwards.
 MAX_FILE_BYTES = 32 * 1024 * 1024
+
+# Attachments ride along as base64, which inflates them by a third and is not
+# subject to the text character cap, so they carry their own byte ceilings.
+MAX_ATTACHMENT_BYTES = 16 * 1024 * 1024
+MAX_ATTACHMENT_TOTAL_BYTES = 32 * 1024 * 1024
+
+# Anything OpenRouter can carry as a real attachment instead of as pasted text.
+# PDFs go through the file-parser plugin and work on every model; images and
+# audio need the target model to advertise that input modality.
+IMAGE_MEDIA = {
+    ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+    ".webp": "image/webp", ".gif": "image/gif",
+}
+AUDIO_FORMATS = {
+    ".wav": "wav", ".mp3": "mp3", ".ogg": "ogg", ".flac": "flac",
+    ".m4a": "m4a", ".aac": "aac", ".aiff": "aiff", ".aif": "aiff",
+    ".pcm": "pcm16",
+}
+PDF_MEDIA = "application/pdf"
+
+# Sniffed before the extension is trusted: a screenshot saved as "diagram" with
+# no suffix, or a .txt that is really a PDF, should still attach correctly.
+MAGIC_SIGNATURES = (
+    (b"%PDF-", "pdf", PDF_MEDIA),
+    (b"\x89PNG\r\n\x1a\n", "image", "image/png"),
+    (b"\xff\xd8\xff", "image", "image/jpeg"),
+    (b"GIF87a", "image", "image/gif"),
+    (b"GIF89a", "image", "image/gif"),
+    (b"OggS", "audio", "ogg"),
+    (b"fLaC", "audio", "flac"),
+    (b"ID3", "audio", "mp3"),
+)
+
+PDF_ENGINES = ("cloudflare-ai", "mistral-ocr", "native")
+
+# Directories that are never what someone means by "send this folder".
+SKIP_DIRS = {
+    ".git", ".hg", ".svn", "node_modules", "__pycache__", ".venv", "venv",
+    "env", "dist", "build", ".next", "target", ".mypy_cache", ".pytest_cache",
+    ".ruff_cache", ".tox", ".idea", ".vscode", "vendor", ".terraform",
+    ".gradle", ".cache", "coverage", ".nyc_output", "site-packages",
+}
+
+# Per-attachment token counts for the pre-flight cost guard only. OpenRouter
+# has no preflight token-counting endpoint and does not publish how a provider
+# tiles an image, so these cannot be exact; they lean high so the guard errs
+# toward refusing rather than toward a surprise bill. The real figures come
+# back afterwards in usage.prompt_tokens_details.
+TOKENS_PER_IMAGE = 1500
+TOKENS_PER_PDF_BYTE = 1 / 150
+TOKENS_PER_AUDIO_BYTE = 1 / 1000
 
 # Anything sent through this bridge leaves the machine for a third-party API.
 # These paths are refused by default: an agent following a poisoned instruction
@@ -111,6 +169,12 @@ _DEFAULTS: Config = {
     "request_timeout_s": 300,
     "max_input_chars": 600000,
     "max_file_chars": 200000,
+    "max_attachment_bytes": MAX_ATTACHMENT_BYTES,
+    "max_attachment_total_bytes": MAX_ATTACHMENT_TOTAL_BYTES,
+    "max_attachments": 20,
+    "max_dir_files": 50,
+    "thread_attachment_bytes": 4 * 1024 * 1024,
+    "pdf_engine": "cloudflare-ai",
     "max_cost_usd_per_call": 1.0,
     "catalog_ttl_s": 21600,
     "thread_max_messages": 20,
@@ -270,6 +334,21 @@ def _request(
     raise last_error or OpenRouterError("OpenRouter request failed")
 
 
+# OpenRouter's stable machine-readable failure category. On /chat/completions
+# it arrives at error.metadata.error_type. These are the ones an attachment can
+# provoke, and each has a different fix, which a bare HTTP 400 does not convey.
+ERROR_TYPE_HINTS = {
+    "invalid_image": "the image is corrupt or unreadable; re-export it and try again",
+    "image_too_large": "the image is over this provider's size or pixel limit; "
+                       "scale it down and send it again",
+    "image_too_small": "the image is under this provider's minimum pixel size",
+    "unsupported_image_format": "this provider does not take that image format; "
+                                "convert it to png or jpg",
+    "image_not_found": "the referenced image could not be resolved",
+    "image_download_failed": "OpenRouter could not fetch the image from that URL",
+}
+
+
 def _http_message(code: int, detail: str) -> str:
     hint = {
         401: "the API key was rejected - check the key in ~/.config/openrouter/env",
@@ -281,7 +360,11 @@ def _http_message(code: int, detail: str) -> str:
     parsed = detail
     try:
         obj = json.loads(detail)
-        parsed = obj.get("error", {}).get("message") or detail
+        error = obj.get("error") or {}
+        parsed = error.get("message") or detail
+        typed = (error.get("metadata") or {}).get("error_type")
+        if typed:
+            hint = ERROR_TYPE_HINTS.get(typed, f"error_type: {typed}")
     except (json.JSONDecodeError, AttributeError):
         pass
     text = f"OpenRouter HTTP {code}"
@@ -808,39 +891,178 @@ def denied_by_policy(path: Path, patterns: list[str]) -> str | None:
     return None
 
 
-def _read_file(path: Path, limit: int) -> tuple[str, str | None]:
-    # A FIFO, device or socket would block a plain read forever (or return
-    # endless data) and hang the bridge. The descriptor is opened first and
-    # checked with fstat, so nothing can swap a regular file for a FIFO between
-    # the check and the open. O_NOFOLLOW is safe because the caller passes an
-    # already-resolved path, and it closes the last symlink race.
+def _slurp(path: Path, ceiling: int) -> tuple[bytes, str | None]:
+    """Read a regular file up to `ceiling` bytes, or say why it was skipped.
+
+    A FIFO, device or socket would block a plain read forever (or return
+    endless data) and hang the bridge. The descriptor is opened first and
+    checked with fstat, so nothing can swap a regular file for a FIFO between
+    the check and the open. O_NOFOLLOW is safe because the caller passes an
+    already-resolved path, and it closes the last symlink race.
+    """
     flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
         fd = os.open(path, flags)
     except OSError as exc:
-        return "", f"could not open {path}: {exc.strerror or exc}"
+        return b"", f"could not open {path}: {exc.strerror or exc}"
     try:
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode):
-            return "", f"{path} is not a regular file (fifo, device or socket); skipped"
-        if info.st_size > MAX_FILE_BYTES:
-            return "", (
-                f"{path} is {info.st_size / 1e6:.0f} MB, over the "
-                f"{MAX_FILE_BYTES / 1e6:.0f} MB read ceiling; skipped"
+            return b"", f"{path} is not a regular file (fifo, device or socket); skipped"
+        if info.st_size > ceiling:
+            return b"", (
+                f"{path} is {_human_bytes(info.st_size)}, over the "
+                f"{_human_bytes(ceiling)} read ceiling; skipped"
             )
         chunks: list[bytes] = []
-        remaining = MAX_FILE_BYTES + 1
+        remaining = ceiling + 1
         while remaining > 0:
             block = os.read(fd, min(1 << 20, remaining))
             if not block:
                 break
             chunks.append(block)
             remaining -= len(block)
-        raw = b"".join(chunks)
+        return b"".join(chunks), None
     except OSError as exc:
-        return "", f"could not read {path}: {exc.strerror or exc}"
+        return b"", f"could not read {path}: {exc.strerror or exc}"
     finally:
         os.close(fd)
+
+
+def _peek(path: Path, count: int = 16) -> bytes:
+    """First few bytes, for sniffing the real type. Never raises."""
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError:
+        return b""
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return b""
+        return os.read(fd, count)
+    except OSError:
+        return b""
+    finally:
+        os.close(fd)
+
+
+def classify_attachment(path: Path) -> tuple[str, str] | None:
+    """Classify a file as ("pdf"|"image"|"audio", media type or audio format).
+
+    None means "send this one as text", which is the right answer for source
+    code and prose. The magic bytes win over the extension: a screenshot saved
+    with no suffix still attaches as an image, and a .txt that is really a PDF
+    is not pasted in as mojibake.
+    """
+    head = _peek(path)
+    for signature, kind, media in MAGIC_SIGNATURES:
+        if head.startswith(signature):
+            return kind, media
+    # RIFF....WEBP and RIFF....WAVE share a container, so the tag at byte 8 is
+    # what separates them.
+    if head[:4] == b"RIFF" and len(head) >= 12:
+        if head[8:12] == b"WEBP":
+            return "image", "image/webp"
+        if head[8:12] == b"WAVE":
+            return "audio", "wav"
+
+    suffix = path.suffix.lower()
+    if suffix == ".pdf":
+        return "pdf", PDF_MEDIA
+    if suffix in IMAGE_MEDIA:
+        return "image", IMAGE_MEDIA[suffix]
+    if suffix in AUDIO_FORMATS:
+        return "audio", AUDIO_FORMATS[suffix]
+    return None
+
+
+def _human_bytes(size: int) -> str:
+    if size >= 1_000_000:
+        return f"{size / 1e6:.1f} MB"
+    if size >= 1000:
+        return f"{size / 1e3:.0f} KB"
+    return f"{size} B"
+
+
+def expand_paths(entries: Iterable[str], base: Path, limit: int) -> tuple[list[Path], list[str]]:
+    """Resolve the `files` argument to real files, expanding any directory.
+
+    Passing a directory is the shorthand worth having: "send it this folder"
+    should not mean listing forty paths by hand. Build output, dependency trees
+    and VCS metadata are pruned, because nobody means those.
+    """
+    out: list[Path] = []
+    notes: list[str] = []
+    seen: set[str] = set()
+
+    def take(candidate: Path) -> None:
+        key = candidate.as_posix()
+        if key not in seen:
+            seen.add(key)
+            out.append(candidate)
+
+    for entry in entries:
+        if not entry or not str(entry).strip():
+            continue
+        candidate = Path(str(entry).strip()).expanduser()
+        if not candidate.is_absolute():
+            candidate = base / candidate
+        # Resolve absolute paths too, not just relative ones: an unresolved
+        # absolute path lets a symlink (or a "..") slip past the denylist.
+        try:
+            candidate = candidate.resolve()
+        except (OSError, RuntimeError):
+            notes.append(f"could not resolve path, skipped: {candidate}")
+            continue
+        if not candidate.exists():
+            notes.append(f"file not found, skipped: {candidate}")
+            continue
+        if not candidate.is_dir():
+            take(candidate)
+            continue
+
+        if limit <= 0:
+            notes.append(
+                f"{candidate} is a directory and max_dir_files is 0, so it was not "
+                "expanded; name the files you want instead"
+            )
+            continue
+        found: list[Path] = []
+        truncated = False
+        for dirpath, dirnames, filenames in os.walk(candidate):
+            dirnames[:] = sorted(
+                d for d in dirnames if d not in SKIP_DIRS and not d.startswith(".")
+            )
+            for name in sorted(filenames):
+                found.append(Path(dirpath) / name)
+                if len(found) > limit:
+                    truncated = True
+                    break
+            if truncated:
+                break
+        if not found:
+            notes.append(f"{candidate} holds no files worth sending, skipped")
+            continue
+        if truncated:
+            found = found[:limit]
+            notes.append(
+                f"{candidate} holds more than {limit} files; sent the first {limit}. "
+                "Name the files you want, or raise max_dir_files in the config."
+            )
+        notes.append(f"expanded directory {candidate} to {len(found)} files")
+        for item in found:
+            try:
+                take(item.resolve())
+            except (OSError, RuntimeError):
+                continue
+
+    return out, notes
+
+
+def _read_file(path: Path, limit: int) -> tuple[str, str | None]:
+    raw, problem = _slurp(path, MAX_FILE_BYTES)
+    if problem:
+        return "", problem
     if not raw:
         return "", f"{path} is empty"
     if BINARY_HINT.search(raw[:8192]):
@@ -1017,6 +1239,157 @@ MISSING_QUESTION = (
 )
 
 
+def _setting(key: str, default: int) -> int:
+    """An integer config value where 0 means 0.
+
+    `cfg.get(key) or default` would read a deliberate 0 as "unset", which is
+    exactly how someone turns one of these ceilings off.
+    """
+    value = load_config().get(key)
+    if value is None:
+        return default
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _model_modalities(slug: str | None) -> set[str]:
+    """What the model accepts as input. Empty means unknown, never "nothing"."""
+    if not slug:
+        return set()
+    entry = _find(slug) or {}
+    listed = (entry.get("architecture") or {}).get("input_modalities") or []
+    return {str(item).lower() for item in listed}
+
+
+def _gather_files(
+    files: Iterable[str] | str | None,
+    base: Path,
+    allow_secret_files: bool,
+    model_slug: str | None,
+) -> tuple[list[str], list[dict[str, Any]], list[str]]:
+    """Turn the `files` argument into inline text sections and attachment parts.
+
+    Source and prose are pasted in as fenced text, because that is what a model
+    reasons over best. A PDF, image or audio file is attached to the message
+    instead: transcribing one into the prompt is impossible for the caller and
+    lossy where it is not.
+    """
+    cfg = load_config()
+    notes: list[str] = []
+
+    limit_setting = cfg.get("max_file_chars")
+    file_limit = int(limit_setting) if limit_setting is not None else 200000
+    # Union by default. Replace semantics on a safety list is a footgun: adding
+    # one project pattern would silently drop every credential pattern.
+    deny = cfg.get("deny_file_patterns") or []
+    if cfg.get("deny_file_patterns_replace"):
+        patterns = list(deny)
+    else:
+        patterns = sorted(set(DEFAULT_DENY_PATTERNS) | set(deny))
+
+    candidates, walk_notes = expand_paths(as_list(files), base, _setting("max_dir_files", 50))
+    notes.extend(walk_notes)
+
+    per_file = _setting("max_attachment_bytes", MAX_ATTACHMENT_BYTES)
+    total_cap = _setting("max_attachment_total_bytes", MAX_ATTACHMENT_TOTAL_BYTES)
+    ceiling = _setting("max_attachments", 20)
+    modalities = _model_modalities(model_slug)
+
+    sections: list[str] = []
+    attachments: list[dict[str, Any]] = []
+    manifest: list[str] = []
+    spent = 0
+
+    for candidate in candidates:
+        if candidate.is_dir():
+            notes.append(f"{candidate} is a directory, skipped")
+            continue
+        if not allow_secret_files:
+            matched = denied_by_policy(candidate, patterns)
+            if matched:
+                notes.append(
+                    f"REFUSED to send {candidate} to a third-party API: it matches the "
+                    f"deny pattern '{matched}'. Pass allow_secret_files if this file is "
+                    "genuinely not a secret, or edit deny_file_patterns in the config."
+                )
+                continue
+
+        classified = classify_attachment(candidate)
+        if classified is None:
+            text, warning = _read_file(candidate, file_limit)
+            if warning:
+                notes.append(warning)
+            if not text:
+                continue
+            fence = "```"
+            while fence in text:
+                fence += "`"
+            sections.append(f"## File: {candidate}\n\n{fence}\n{text}\n{fence}")
+            continue
+
+        family, media = classified
+        # A PDF is parsed by OpenRouter before it reaches the model, so it works
+        # everywhere. An image or a sound file has to be something the model
+        # itself takes, and sending one blind is a billed request that fails.
+        if family in ("image", "audio") and modalities and family not in modalities:
+            notes.append(
+                f"{candidate} is {family} input, which {model_slug} does not accept "
+                f"(it takes {', '.join(sorted(modalities))}); not sent. "
+                "Use llm_model_info or list_llm_models to pick a model that does."
+            )
+            continue
+        if len(attachments) >= ceiling:
+            notes.append(
+                f"{candidate} not attached: already at the {ceiling} attachment limit"
+            )
+            continue
+
+        raw, problem = _slurp(candidate, per_file)
+        if problem:
+            notes.append(problem)
+            continue
+        if not raw:
+            notes.append(f"{candidate} is empty")
+            continue
+        if spent + len(raw) > total_cap:
+            notes.append(
+                f"{candidate} ({_human_bytes(len(raw))}) not attached: it would take this "
+                f"call past the {_human_bytes(total_cap)} total attachment ceiling"
+            )
+            continue
+        spent += len(raw)
+        blob = base64.b64encode(raw).decode("ascii")
+        if family == "image":
+            attachments.append(
+                {"type": "image_url", "image_url": {"url": f"data:{media};base64,{blob}"}}
+            )
+        elif family == "audio":
+            # Audio wants bare base64 plus a format field, not a data URI.
+            attachments.append(
+                {"type": "input_audio", "input_audio": {"data": blob, "format": media}}
+            )
+        else:
+            attachments.append(
+                {
+                    "type": "file",
+                    "file": {
+                        "filename": candidate.name,
+                        "file_data": f"data:{media};base64,{blob}",
+                    },
+                }
+            )
+        manifest.append(f"- {candidate} ({family}, {_human_bytes(len(raw))})")
+
+    if manifest:
+        sections.append(
+            "## Attached files\n\nAttached to this message directly, in this order:"
+            "\n\n" + "\n".join(manifest)
+        )
+    return sections, attachments, notes
+
+
 def build_messages(
     question: str | None,
     context: str | None = None,
@@ -1026,8 +1399,15 @@ def build_messages(
     cwd: str | None = None,
     history: list[dict[str, str]] | None = None,
     allow_secret_files: bool = False,
-) -> tuple[list[dict[str, str]], list[str]]:
-    """Assemble the message list plus any notes worth showing the caller."""
+    model_slug: str | None = None,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Assemble the message list plus any notes worth showing the caller.
+
+    The last user message is a plain string when everything went in as text,
+    and a list of content parts when something was attached. `model_slug` is
+    what decides whether an image or a sound file can go at all; leave it unset
+    and nothing is filtered on modality.
+    """
     cfg = load_config()
     notes: list[str] = []
 
@@ -1053,57 +1433,19 @@ def build_messages(
     if context and context.strip():
         parts.append("## Background from the agent asking\n\n" + context.strip())
 
-    limit_setting = cfg.get("max_file_chars")
-    file_limit = int(limit_setting) if limit_setting is not None else 200000
-    # Union by default. Replace semantics on a safety list is a footgun: adding
-    # one project pattern would silently drop every credential pattern.
-    deny = cfg.get("deny_file_patterns") or []
-    if cfg.get("deny_file_patterns_replace"):
-        patterns = list(deny)
-    else:
-        patterns = sorted(set(DEFAULT_DENY_PATTERNS) | set(deny))
     base = Path(cwd).expanduser() if cwd else Path.cwd()
-    for entry in as_list(files):
-        if not entry or not str(entry).strip():
-            continue
-        candidate = Path(str(entry)).expanduser()
-        if not candidate.is_absolute():
-            candidate = base / candidate
-        # Resolve absolute paths too, not just relative ones: an unresolved
-        # absolute path lets a symlink (or a "..") slip past the denylist.
-        try:
-            candidate = candidate.resolve()
-        except (OSError, RuntimeError):
-            notes.append(f"could not resolve path, skipped: {candidate}")
-            continue
-        if not candidate.exists():
-            notes.append(f"file not found, skipped: {candidate}")
-            continue
-        if candidate.is_dir():
-            notes.append(f"{candidate} is a directory, skipped")
-            continue
-        if not allow_secret_files:
-            matched = denied_by_policy(candidate, patterns)
-            if matched:
-                notes.append(
-                    f"REFUSED to send {candidate} to a third-party API: it matches the "
-                    f"deny pattern '{matched}'. Pass allow_secret_files if this file is "
-                    "genuinely not a secret, or edit deny_file_patterns in the config."
-                )
-                continue
-        text, warning = _read_file(candidate, file_limit)
-        if warning:
-            notes.append(warning)
-        if not text:
-            continue
-        fence = "```"
-        while fence in text:
-            fence += "`"
-        parts.append(f"## File: {candidate}\n\n{fence}\n{text}\n{fence}")
+    sections, attachments, file_notes = _gather_files(
+        files, base, allow_secret_files, model_slug
+    )
+    parts.extend(sections)
+    notes.extend(file_notes)
 
     parts.append("## Question\n\n" + question.strip())
     user_content = "\n\n".join(parts)
 
+    # Attachments are deliberately outside this cap: they are governed by the
+    # byte ceilings instead, because base64 inflates a perfectly ordinary
+    # screenshot past any sensible character limit.
     cap = int(cfg.get("max_input_chars") or 600000)
     if len(user_content) > cap:
         raise OpenRouterError(
@@ -1112,12 +1454,108 @@ def build_messages(
             "in the config if you mean to pay for it."
         )
 
-    messages: list[dict[str, str]] = [{"role": "system", "content": system_prompt}]
+    messages: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}]
+    replayed = 0
     for message in history or []:
         if message.get("role") in ("user", "assistant") and message.get("content"):
-            messages.append({"role": message["role"], "content": message["content"]})
-    messages.append({"role": "user", "content": user_content})
+            turn: dict[str, Any] = {
+                "role": message["role"], "content": message["content"]
+            }
+            # Sending a past turn's file annotations back is what tells
+            # OpenRouter it has already parsed that PDF, so a long thread about
+            # one document parses it once rather than once per question.
+            if message["role"] == "assistant" and message.get("annotations"):
+                turn["annotations"] = message["annotations"]
+            if message["role"] == "user" and isinstance(message.get("content"), list):
+                replayed += sum(
+                    1 for part in message["content"]
+                    if isinstance(part, dict) and part.get("type") != "text"
+                )
+            messages.append(turn)
+    if replayed:
+        notes.append(
+            f"carried {replayed} earlier attachment(s) forward with their parse "
+            "annotations, so the document is still in view and is not parsed again"
+        )
+    # Text first, then the attachments: providers parse a trailing image more
+    # reliably than one that arrives before the instruction about it.
+    if attachments:
+        messages.append(
+            {"role": "user", "content": [{"type": "text", "text": user_content}] + attachments}
+        )
+    else:
+        messages.append({"role": "user", "content": user_content})
     return messages, notes
+
+
+def text_chars(messages: list[dict[str, Any]]) -> int:
+    """Characters of real text in a message list, ignoring base64 attachments."""
+    total = 0
+    for message in messages:
+        content = message.get("content")
+        if isinstance(content, str):
+            total += len(content)
+        elif isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    total += len(part.get("text") or "")
+    return total
+
+
+def sent_attachments(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The attachment parts of the final user message, in the order sent."""
+    if not messages:
+        return []
+    content = messages[-1].get("content")
+    if not isinstance(content, list):
+        return []
+    return [
+        part for part in content
+        if isinstance(part, dict) and part.get("type") != "text"
+    ]
+
+
+def summarize_parts(parts: Iterable[dict[str, Any]]) -> dict[str, Any]:
+    """Count attachment parts and estimate what they will cost in tokens.
+
+    The estimate exists to keep the per-call cost guard meaningful, and it is
+    rough on purpose: real usage depends on how a provider tiles an image and
+    how many pages a PDF turns out to hold.
+    """
+    counts = {"image": 0, "pdf": 0, "audio": 0}
+    tokens = 0.0
+    for part in parts:
+        if not isinstance(part, dict):
+            continue
+        kind = part.get("type")
+        if kind == "image_url":
+            counts["image"] += 1
+            tokens += TOKENS_PER_IMAGE
+        elif kind == "input_audio":
+            counts["audio"] += 1
+            blob = ((part.get("input_audio") or {}).get("data")) or ""
+            tokens += len(blob) * 0.75 * TOKENS_PER_AUDIO_BYTE
+        elif kind == "file":
+            counts["pdf"] += 1
+            blob = ((part.get("file") or {}).get("file_data")) or ""
+            tokens += len(blob) * 0.75 * TOKENS_PER_PDF_BYTE
+    counts["tokens"] = int(tokens)
+    counts["total"] = counts["image"] + counts["pdf"] + counts["audio"]
+    return counts
+
+
+def attachment_summary(messages: list[dict[str, Any]]) -> dict[str, Any]:
+    """Everything this request carries, replayed thread attachments included.
+
+    All of it is re-sent on the wire and priced again, so the cost guard has to
+    see the replayed parts as well as the new ones.
+    """
+    parts: list[dict[str, Any]] = []
+    for message in messages:
+        content = message.get("content")
+        if isinstance(content, list):
+            parts.extend(p for p in content if isinstance(p, dict))
+    return summarize_parts(parts)
 
 
 _DEFAULTS_ADVISOR = (
@@ -1203,7 +1641,7 @@ def _thread_path(name: str) -> Path:
     return path
 
 
-def load_thread(name: str | None) -> list[dict[str, str]]:
+def load_thread(name: str | None) -> list[dict[str, Any]]:
     if not name:
         return []
     path = _thread_path(name)
@@ -1217,7 +1655,14 @@ def load_thread(name: str | None) -> list[dict[str, str]]:
         return []
 
 
-def save_thread(name: str | None, question: str, answer: str, slug: str) -> bool:
+def save_thread(
+    name: str | None,
+    question: str,
+    answer: str,
+    slug: str,
+    annotations: list[dict[str, Any]] | None = None,
+    attachments: list[dict[str, Any]] | None = None,
+) -> bool:
     """Persist a thread turn. Returns False if it could not be written.
 
     Read-modify-write under an exclusive lock: without it two concurrent turns
@@ -1237,7 +1682,9 @@ def save_thread(name: str | None, question: str, answer: str, slug: str) -> bool
             lock_handle.close()
         lock_handle = None  # proceed unlocked rather than lose the answer
     try:
-        return _save_thread_locked(path, name, question, answer, slug)
+        return _save_thread_locked(
+            path, name, question, answer, slug, annotations, attachments
+        )
     finally:
         if lock_handle is not None:
             try:
@@ -1247,11 +1694,32 @@ def save_thread(name: str | None, question: str, answer: str, slug: str) -> bool
 
 
 def _save_thread_locked(
-    path: Path, name: str, question: str, answer: str, slug: str
+    path: Path,
+    name: str,
+    question: str,
+    answer: str,
+    slug: str,
+    annotations: list[dict[str, Any]] | None = None,
+    attachments: list[dict[str, Any]] | None = None,
 ) -> bool:
     history = load_thread(name)
-    history.append({"role": "user", "content": question})
-    history.append({"role": "assistant", "content": answer, "model": slug})
+    # The attachments ride on the user turn, which is where they were sent, so
+    # a follow-up still has the document in front of it. Annotations alone do
+    # not carry content: they only tell OpenRouter it has already parsed this
+    # file, so it can skip the parse and its cost.
+    if attachments:
+        history.append(
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": question}] + attachments,
+            }
+        )
+    else:
+        history.append({"role": "user", "content": question})
+    turn: dict[str, Any] = {"role": "assistant", "content": answer, "model": slug}
+    if annotations:
+        turn["annotations"] = annotations
+    history.append(turn)
     setting = load_config().get("thread_max_messages")
     keep = int(setting) if setting is not None else 20
     if keep > 0:
@@ -1341,6 +1809,7 @@ def ask(
     temperature: float | None = None,
     thread: str | None = None,
     cwd: str | None = None,
+    pdf_engine: str | None = None,
     allow_expensive: bool = False,
     allow_secret_files: bool = False,
     include_reasoning: bool = False,
@@ -1374,12 +1843,25 @@ def ask(
     messages, build_notes = build_messages(
         question, context=context, files=files, system=system, role=role,
         cwd=cwd, history=history, allow_secret_files=allow_secret_files,
+        model_slug=slug,
     )
     notes.extend(build_notes)
     if history:
         notes.append(f"continuing thread '{thread}' with {len(history)} prior messages")
 
-    chars = sum(len(m["content"]) for m in messages)
+    chars = text_chars(messages)
+    attached = attachment_summary(messages)
+    fresh = summarize_parts(sent_attachments(messages))
+    if fresh["total"]:
+        notes.append(
+            f"attached {fresh['total']} file(s) to the message rather than pasting "
+            f"them in as text ({fresh['image']} image, {fresh['pdf']} pdf, "
+            f"{fresh['audio']} audio); their share of the cost estimate is a "
+            "heuristic, since OpenRouter has no preflight token count"
+        )
+    # Fold the attachments into the same character-based estimate the cost guard
+    # reads, so a folder of screenshots cannot walk past it as "almost no text".
+    billable = chars + int(attached["tokens"] * CHARS_PER_TOKEN)
 
     if max_tokens is not None and int(max_tokens) < 1:
         # 0 would read as "no cap": no max_tokens sent and zero output priced,
@@ -1396,7 +1878,7 @@ def ask(
     # With no cap of our own the provider's ceiling is what could actually be
     # billed, so the guard is judged against that rather than against zero.
     worst_output = int(limit) if limit else int(ceiling or 0)
-    estimate, priced = estimate_call_cost(slug, chars, worst_output)
+    estimate, priced = estimate_call_cost(slug, billable, worst_output)
     if guard and not allow_expensive:
         if not priced:
             policy = str(cfg.get("cost_guard_on_unknown_pricing") or "warn").lower()
@@ -1415,7 +1897,7 @@ def ask(
         elif estimate > guard:
             raise OpenRouterError(
                 f"refusing to send: worst-case cost for {slug} is about "
-                f"{fmt_usd(estimate)} ({chars} chars in, up to {limit} tokens out), over "
+                f"{fmt_usd(estimate)} ({billable} chars in, up to {limit} tokens out), over "
                 f"the {fmt_usd(guard)} per-call guard. Trim the context, lower "
                 "max_tokens, or pass allow_expensive to override."
             )
@@ -1438,6 +1920,30 @@ def ask(
     if temperature is not None:
         payload["temperature"] = float(temperature)
 
+    if fresh["pdf"] or attached["pdf"]:
+        # OpenRouter parses the PDF before the model sees it, which is why a PDF
+        # attaches to any model at all. The engine decides what that costs:
+        # cloudflare-ai is free and fine for a text PDF, mistral-ocr bills per
+        # 1,000 pages and is the one that can read a scan.
+        engine = str(pdf_engine or cfg.get("pdf_engine") or "cloudflare-ai").strip().lower()
+        if engine not in PDF_ENGINES:
+            notes.append(
+                f"pdf_engine '{engine}' is not one of {', '.join(PDF_ENGINES)}; "
+                "used cloudflare-ai"
+            )
+            engine = "cloudflare-ai"
+        payload["plugins"] = [{"id": "file-parser", "pdf": {"engine": engine}}]
+        if fresh["pdf"]:
+            notes.append(
+                f"PDF parsed by '{engine}'"
+                + (
+                    " which bills separately per 1,000 pages"
+                    if engine == "mistral-ocr"
+                    else "; pass pdf_engine='mistral-ocr' if the PDF is a scan that "
+                         "needs OCR"
+                )
+            )
+
     timeout = float(cfg.get("request_timeout_s") or 300)
     try:
         response = _request("POST", "/chat/completions", payload, timeout=timeout)
@@ -1458,6 +1964,9 @@ def ask(
         )
     message = choices[0].get("message") or {}
     answer = (message.get("content") or "").strip()
+    # Present when OpenRouter parsed an attached file for this call. Sent back
+    # on the next turn, it stands in for re-parsing the same document.
+    annotations = message.get("annotations") or None
     reasoning = (message.get("reasoning") or "").strip()
     finish = choices[0].get("finish_reason") or choices[0].get("native_finish_reason")
 
@@ -1485,10 +1994,38 @@ def ask(
         )
 
     usage = response.get("usage") or {}
+    prompt_detail = usage.get("prompt_tokens_details") or {}
     cost = actual_cost(slug, usage)
     elapsed = round(time.monotonic() - started, 2)
 
-    if thread and answer and not save_thread(thread, question, answer, slug):
+    carried: list[dict[str, Any]] | None = None
+    if thread and fresh["total"]:
+        parts = sent_attachments(messages)
+        # Base64 in a transcript adds up fast, so only a thread's worth of it is
+        # kept. Past that the caller is told to pass the files again rather than
+        # left with a follow-up the model cannot see the document for.
+        budget = _setting("thread_attachment_bytes", 4 * 1024 * 1024)
+        weight = sum(len(json.dumps(part)) for part in parts)
+        if weight <= budget:
+            carried = parts
+            notes.append(
+                f"kept {len(parts)} attachment(s) on thread '{thread}', so a follow-up "
+                "still sees them without you sending them again"
+            )
+        else:
+            notes.append(
+                f"the attachments are {_human_bytes(weight)}, over the "
+                f"{_human_bytes(budget)} a thread will carry; pass the same files "
+                "again on the next turn, or raise thread_attachment_bytes"
+            )
+    elif fresh["total"] and annotations and not thread:
+        notes.append(
+            "OpenRouter parsed the attached file for this call. Pass a `thread` name "
+            "to keep following up on it without sending or parsing it again."
+        )
+    if thread and answer and not save_thread(
+        thread, question, answer, slug, annotations, carried
+    ):
         notes.append(
             f"could not write the thread transcript to {THREAD_DIR}; this answer "
             "will not be part of the next follow-up"
@@ -1504,7 +2041,7 @@ def ask(
                 "reasoning_tokens"
             ),
             "cost_usd": round(cost, 6), "latency_s": elapsed,
-            "chars_in": chars, "thread": thread,
+            "chars_in": chars, "attachments": attached["total"], "thread": thread,
         }
     )
 
@@ -1523,11 +2060,16 @@ def ask(
         "finish_reason": finish,
         "provider": response.get("provider"),
         "usage": {
+            # prompt_tokens already includes images, audio and video; the detail
+            # block is what says how much of it they were.
             "prompt_tokens": usage.get("prompt_tokens"),
             "completion_tokens": usage.get("completion_tokens"),
             "reasoning_tokens": (usage.get("completion_tokens_details") or {}).get(
                 "reasoning_tokens"
             ),
+            "audio_tokens": prompt_detail.get("audio_tokens"),
+            "video_tokens": prompt_detail.get("video_tokens"),
+            "cached_tokens": prompt_detail.get("cached_tokens"),
             "cost_usd": round(cost, 6),
         },
         "latency_s": elapsed,

@@ -4,6 +4,7 @@ No network, no API key needed:
     python tests/test_core.py        (any interpreter; no mcp package needed)
 """
 
+import json
 import sys
 import tempfile
 from pathlib import Path
@@ -149,7 +150,10 @@ with tempfile.TemporaryDirectory() as tmp:
     check("context is included", "It crashes on start." in body)
     check("question is included", "What breaks here?" in body)
     check("file content is inlined", "print('hello')" in body)
-    check("relative paths resolve against cwd", body.count("print('hello')") == 2)
+    check("relative paths resolve against cwd",
+          f"## File: {root.resolve() / 'a.py'}" in body)
+    check("the same file named twice is only sent once",
+          body.count("print('hello')") == 1)
     check("a missing file is reported, not fatal", any("not found" in n for n in notes))
     check("a binary file is skipped", any("binary" in n for n in notes))
 
@@ -702,6 +706,199 @@ _same = [k for k, v in _cats.items()
 check("every shipped category pairs two different vendors", not _same, str(_same))
 check("every shipped category records its evidence and date",
       all(c.get("why") and c.get("measured") for c in _cats.values()))
+
+
+# --------------------------------------------------------------------------
+# attachments: a PDF, an image or a sound file rides along as an attachment
+# rather than being transcribed into the prompt
+# --------------------------------------------------------------------------
+
+PNG_1PX = bytes.fromhex(
+    "89504e470d0a1a0a0000000d4948445200000001000000010806000000"
+    "1f15c4890000000a49444154789c6360000002000100ffff0300000600"
+    "0557bfabd40000000049454e44ae426082"
+)
+PDF_TINY = b"%PDF-1.4\n1 0 obj<</Type/Catalog>>endobj\ntrailer<</Root 1 0 R>>\n%%EOF\n"
+WAV_TINY = b"RIFF$\x00\x00\x00WAVEfmt \x10\x00\x00\x00\x01\x00\x01\x00" + b"\x00" * 20
+
+with tempfile.TemporaryDirectory() as tmp:
+    root = Path(tmp)
+    (root / "shot.png").write_bytes(PNG_1PX)
+    (root / "spec.pdf").write_bytes(PDF_TINY)
+    (root / "clip.wav").write_bytes(WAV_TINY)
+    (root / "app.py").write_text("print('hi')\n")
+    # no extension at all: the magic bytes have to carry it
+    (root / "screenshot").write_bytes(PNG_1PX)
+
+    check("a png is classified as an image",
+          core.classify_attachment(root / "shot.png") == ("image", "image/png"))
+    check("a pdf is classified as a pdf",
+          core.classify_attachment(root / "spec.pdf") == ("pdf", "application/pdf"))
+    check("a wav is classified as audio",
+          core.classify_attachment(root / "clip.wav") == ("audio", "wav"))
+    check("source code is not an attachment",
+          core.classify_attachment(root / "app.py") is None)
+    check("magic bytes beat a missing extension",
+          core.classify_attachment(root / "screenshot") == ("image", "image/png"))
+
+    messages, notes = core.build_messages(
+        "what is in these?",
+        files=[str(root / "shot.png"), str(root / "spec.pdf"), str(root / "app.py")],
+        model_slug="moonshotai/kimi-k3",
+    )
+    content = messages[-1]["content"]
+    check("attachments turn the user message into content parts",
+          isinstance(content, list), type(content).__name__)
+    kinds = [part["type"] for part in content]
+    check("the text part comes first", kinds[0] == "text")
+    check("an image becomes an image_url part", "image_url" in kinds)
+    check("a pdf becomes a file part", "file" in kinds)
+    image_part = next(p for p in content if p["type"] == "image_url")
+    check("the image is a base64 data url",
+          image_part["image_url"]["url"].startswith("data:image/png;base64,"))
+    file_part = next(p for p in content if p["type"] == "file")
+    check("the pdf carries its filename", file_part["file"]["filename"] == "spec.pdf")
+    check("the pdf is a base64 data url",
+          file_part["file"]["file_data"].startswith("data:application/pdf;base64,"))
+    check("source alongside an attachment is still inlined as text",
+          "print('hi')" in content[0]["text"])
+    check("the text part lists what was attached",
+          "## Attached files" in content[0]["text"] and "shot.png" in content[0]["text"])
+
+    summary = core.attachment_summary(messages)
+    check("the attachment summary counts each kind",
+          summary["image"] == 1 and summary["pdf"] == 1 and summary["total"] == 2,
+          str(summary))
+    check("text_chars ignores the base64 payload",
+          core.text_chars(messages) < 2000, str(core.text_chars(messages)))
+
+    # kimi's fake catalogue entry takes text and image but not audio
+    _, notes = core.build_messages(
+        "transcribe", files=[str(root / "clip.wav")], model_slug="moonshotai/kimi-k3",
+    )
+    check("audio is refused for a model that cannot take it",
+          any("does not accept" in n for n in notes), str(notes)[:100])
+    messages, _ = core.build_messages("transcribe", files=[str(root / "clip.wav")])
+    audio = [p for p in messages[-1]["content"] if p["type"] == "input_audio"]
+    check("with no model named, audio is attached anyway", len(audio) == 1)
+    check("audio sends bare base64 and a format, not a data uri",
+          audio and audio[0]["input_audio"]["format"] == "wav"
+          and not audio[0]["input_audio"]["data"].startswith("data:"))
+
+    # base64 is far bigger than the text cap, and must not be judged against it
+    core._config_cache = dict(cfg, max_input_chars=2000)
+    messages, _ = core.build_messages("q", files=[str(root / "shot.png")])
+    check("an attachment is not counted against max_input_chars",
+          isinstance(messages[-1]["content"], list))
+    core._config_cache = cfg
+
+    # byte ceilings, not character ceilings, are what bound an attachment
+    core._config_cache = dict(cfg, max_attachment_bytes=10)
+    _, notes = core.build_messages("q", files=[str(root / "shot.png")])
+    check("an oversized attachment is skipped with a note",
+          any("read ceiling" in n for n in notes), str(notes)[:100])
+    core._config_cache = dict(cfg, max_attachments=1)
+    messages, notes = core.build_messages(
+        "q", files=[str(root / "shot.png"), str(root / "spec.pdf")],
+    )
+    check("the attachment count ceiling holds",
+          any("attachment limit" in n for n in notes), str(notes)[:100])
+    core._config_cache = cfg
+
+    # a secret must not become sendable just by being binary
+    (root / "id_rsa").write_bytes(PNG_1PX)
+    _, notes = core.build_messages("q", files=[str(root / "id_rsa")])
+    check("the denylist applies to attachments too",
+          any("REFUSED" in n for n in notes), str(notes)[:100])
+
+
+# ---- directories expand instead of being skipped ---------------------------
+with tempfile.TemporaryDirectory() as tmp:
+    root = Path(tmp)
+    (root / "src").mkdir()
+    (root / "src" / "one.py").write_text("one = 1")
+    (root / "src" / "two.py").write_text("two = 2")
+    (root / "src" / "node_modules").mkdir()
+    (root / "src" / "node_modules" / "junk.js").write_text("junk")
+    (root / "src" / ".git").mkdir()
+    (root / "src" / ".git" / "HEAD").write_text("ref: refs/heads/main")
+
+    messages, notes = core.build_messages("review this", files=[str(root / "src")])
+    body = messages[-1]["content"]
+    check("a directory is expanded, not skipped", "one = 1" in body and "two = 2" in body)
+    check("node_modules is pruned", "junk" not in body)
+    check(".git is pruned", "refs/heads/main" not in body)
+    check("the expansion is reported", any("expanded directory" in n for n in notes))
+
+    core._config_cache = dict(cfg, max_dir_files=1)
+    _, notes = core.build_messages("review this", files=[str(root / "src")])
+    check("max_dir_files bounds an expansion",
+          any("more than 1 files" in n for n in notes), str(notes)[:120])
+    core._config_cache = cfg
+
+
+
+# --------------------------------------------------------------------------
+# threads carry the document, not just a note that there was one
+#
+# Annotations alone do NOT put a file back in front of the model: OpenRouter's
+# own example re-sends the file part and uses the annotations only to skip the
+# parse. A live probe caught that the hard way, so it is pinned here.
+# --------------------------------------------------------------------------
+
+_FILE_PART = {
+    "type": "file",
+    "file": {"filename": "spec.pdf", "file_data": "data:application/pdf;base64,JVBERi0="},
+}
+_ANNOT = [{"type": "file", "file": {"hash": "abc", "name": "spec.pdf", "content": []}}]
+
+core.save_thread("carry", "what is in it?", "a codeword", "m",
+                 annotations=_ANNOT, attachments=[_FILE_PART])
+_hist = core.load_thread("carry")
+check("a carried attachment rides on the user turn",
+      isinstance(_hist[0]["content"], list)
+      and any(p.get("type") == "file" for p in _hist[0]["content"]))
+check("the question text is still the first part of that turn",
+      _hist[0]["content"][0] == {"type": "text", "text": "what is in it?"})
+check("annotations ride on the assistant turn", _hist[1].get("annotations") == _ANNOT)
+
+_msgs, _notes = core.build_messages("follow up question", history=_hist)
+_user = [m for m in _msgs if m["role"] == "user"]
+check("the replayed turn still carries the file part",
+      any(p.get("type") == "file"
+          for m in _user if isinstance(m["content"], list) for p in m["content"]))
+check("the replayed assistant turn carries the annotations",
+      any(m.get("annotations") == _ANNOT for m in _msgs if m["role"] == "assistant"))
+check("carrying a document forward is reported",
+      any("carried 1 earlier attachment" in n for n in _notes), str(_notes)[:110])
+
+# a turn with nothing attached must stay a plain string, as before
+core.save_thread("carry-none", "plain question", "plain answer", "m")
+check("a turn with no attachment stays a plain string",
+      core.load_thread("carry-none")[0]["content"] == "plain question")
+
+# the cost guard has to see replayed parts too: they are re-sent and re-priced
+check("attachment_summary counts replayed parts, not just new ones",
+      core.attachment_summary(_msgs)["pdf"] == 1)
+check("sent_attachments reports only what this call added",
+      core.sent_attachments(_msgs) == [])
+
+
+# ---- typed error codes become something the caller can act on -------------
+_img_err = json.dumps({
+    "error": {"code": 400, "message": "bad image",
+              "metadata": {"error_type": "image_too_large"}},
+})
+check("an image_too_large error explains itself",
+      "scale it down" in core._http_message(400, _img_err),
+      core._http_message(400, _img_err)[:100])
+_unknown = json.dumps({"error": {"code": 400, "message": "nope",
+                                 "metadata": {"error_type": "something_new"}}})
+check("an unrecognised error_type is still surfaced",
+      "something_new" in core._http_message(400, _unknown))
+check("a plain error still reports its status and message",
+      "402" in core._http_message(402, '{"error":{"message":"no credits"}}'))
+
 
 
 print()
