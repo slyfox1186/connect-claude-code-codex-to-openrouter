@@ -72,14 +72,19 @@ wheels/
 .installed.cfg
 MANIFEST
 
-# Virtual environments. The project uses a named conda env
-# (/home/jman/miniconda3/envs/openrouter-mcp), so an env directory appearing
-# in the tree is a mistake, not a dependency.
+# Virtual environments. The project normally runs from its own conda env
+# (envs/openrouter-mcp under whatever conda root the machine has), but on a
+# machine with no conda install.sh builds a project-local .venv instead, so one
+# can legitimately exist here. It still never gets committed.
 .venv/
 venv/
 ENV/
 .conda/
 conda-meta/
+
+# The interpreter install.sh resolved on this machine. Machine-specific by
+# definition: the launchers read it, git never sees it.
+.orask-python
 
 # Tooling caches
 .pytest_cache/

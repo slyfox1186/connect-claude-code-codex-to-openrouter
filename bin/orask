@@ -2,30 +2,22 @@
 # CLI: ask another OpenRouter model for a second opinion.
 set -euo pipefail
 
-SELF="$(readlink -f "${BASH_SOURCE[0]}")"
-PROJECT="$(dirname "$(dirname "$SELF")")"
+# Resolve this launcher to the project it lives in. The symlink walk is inline
+# because through the ~/.local/bin symlink the shared helper is not findable
+# yet, and readlink -f is GNU-only.
+SELF="${BASH_SOURCE[0]}"
+while [[ -L $SELF ]]; do
+    LINK_DIR="$(cd -P "$(dirname "$SELF")" && pwd)"
+    SELF="$(readlink "$SELF")"
+    [[ $SELF == /* ]] || SELF="$LINK_DIR/$SELF"
+done
+PROJECT="$(cd -P "$(dirname "$SELF")/.." && pwd)"
 
-# Interpreter, in priority order: an explicit override, the conda env this
-# project is built against, then whatever python3 is on PATH so a clone of
-# this repo runs somewhere other than the machine it was written on.
-PYTHON="${ORASK_PYTHON:-}"
-if [[ -z $PYTHON || ! -x $PYTHON ]]; then
-    for candidate in \
-        "$HOME/miniconda3/envs/openrouter-mcp/bin/python" \
-        "$HOME/anaconda3/envs/openrouter-mcp/bin/python" \
-        "$(command -v python3 2>/dev/null || true)"
-    do
-        if [[ -n $candidate && -x $candidate ]]; then
-            PYTHON="$candidate"
-            break
-        fi
-    done
-fi
+source "$PROJECT/bin/_python-env.sh"
 
-if [[ -z $PYTHON ]]; then
+if ! orask_find_python "$PROJECT"; then
     echo "orask: no usable Python interpreter found." >&2
-    echo "orask: set ORASK_PYTHON, or create the env with:" >&2
-    echo "       conda create -y -n openrouter-mcp python=3.13 && conda run -n openrouter-mcp pip install mcp" >&2
+    echo "orask: run $PROJECT/install.sh, or set ORASK_PYTHON to an interpreter." >&2
     exit 1
 fi
 

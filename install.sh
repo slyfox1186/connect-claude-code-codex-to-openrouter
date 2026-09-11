@@ -1,54 +1,158 @@
 #!/usr/bin/env bash
 # Register the OpenRouter second-opinion bridge with Claude Code and Codex.
 # Safe to re-run: every step is idempotent and every edited file is backed up.
+# Nothing here is specific to one machine: paths come from $HOME and from where
+# this file sits, so a clone installs the same way on any Linux or macOS box.
 set -euo pipefail
 
-PROJECT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$PROJECT/bin/_python-env.sh"
 
-# Interpreter, in priority order: an explicit override, the conda env this
-# project is built against, then whatever python3 is on PATH.
-PYTHON="${ORASK_PYTHON:-}"
-if [[ -z $PYTHON || ! -x $PYTHON ]]; then
-    for candidate in \
-        "$HOME/miniconda3/envs/openrouter-mcp/bin/python" \
-        "$HOME/anaconda3/envs/openrouter-mcp/bin/python" \
-        "$(command -v python3 2>/dev/null || true)"
-    do
-        if [[ -n $candidate && -x $candidate ]]; then
-            PYTHON="$candidate"
-            break
-        fi
-    done
-fi
+: "${HOME:?HOME must be set}"
 BIN_DIR="$HOME/.local/bin"
 CLAUDE_JSON="$HOME/.claude.json"
 CODEX_TOML="$HOME/.codex/config.toml"
-KEY_FILE="$HOME/.config/openrouter/env"
+CONFIG_DIR="${ORASK_CONFIG_DIR:-$HOME/.config/openrouter}"
+KEY_FILE="$CONFIG_DIR/env"
+PIN_FILE="$PROJECT/.orask-python"
 STAMP="$(date +%Y-%m-%d_%H%M%S)"
+MIN_PYTHON="3.10"
 
 say()  { printf '  %s\n' "$*"; }
 step() { printf '\n== %s\n' "$*"; }
+die()  { printf '  %s\n' "$*" >&2; exit 1; }
+
+# stat -c is GNU, stat -f is BSD; a machine has one or the other.
+file_mode() { stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1" 2>/dev/null || true; }
+
+# An interpreter is usable only if it is new enough AND can import the module
+# the MCP server actually imports. `import mcp` alone passes on the 1.x SDK,
+# which has no mcp.server.mcpserver and would fail at server start instead.
+python_ok() {
+    [[ -n ${1:-} && -x ${1:-} ]] || return 1
+    "$1" - "$MIN_PYTHON" <<'PY' 2>/dev/null
+import sys
+want = tuple(int(p) for p in sys.argv[1].split("."))
+if sys.version_info[:2] < want:
+    sys.exit(1)
+import mcp.server.mcpserver  # noqa: F401
+PY
+}
+
+python_report() {
+    "$1" -c 'import sys, importlib.metadata as m; print("Python %d.%d.%d, mcp %s" % (*sys.version_info[:3], m.version("mcp")))' 2>/dev/null \
+        || echo "unknown build"
+}
+
+# Where a conda env would go. The project convention is ~/miniconda3, but any
+# conda-style root already on the machine is used rather than forcing a second
+# installation of the same thing.
+conda_binary() {
+    local root
+    for root in "$HOME/miniconda3" "$HOME/anaconda3" "$HOME/miniforge3" \
+                "$HOME/mambaforge" "/opt/conda"; do
+        if [[ -x "$root/bin/conda" ]]; then
+            printf '%s\n' "$root/bin/conda"
+            return 0
+        fi
+    done
+    command -v conda 2>/dev/null || true
+}
+
+# Build the env this project expects: its own conda env, Python 3.13, mcp.
+bootstrap_conda() {
+    local conda_bin="$1" prefix
+    prefix="$(dirname "$(dirname "$conda_bin")")/envs/$ORASK_CONDA_ENV_NAME"
+    if [[ -x "$prefix/bin/python" ]]; then
+        say "reusing the existing env at $prefix"
+    else
+        say "creating $prefix (Python $ORASK_CONDA_PYTHON)"
+        "$conda_bin" create -y -p "$prefix" "python=$ORASK_CONDA_PYTHON" >/dev/null \
+            || return 1
+    fi
+    say "installing the mcp SDK into it"
+    "$prefix/bin/python" -m pip install --upgrade --quiet mcp || return 1
+    PYTHON="$prefix/bin/python"
+}
+
+# Last resort for a machine with no conda at all, so the bridge still installs.
+bootstrap_venv() {
+    local base="$1"
+    say "no conda found; creating $PROJECT/.venv instead"
+    "$base" -m venv "$PROJECT/.venv" || return 1
+    "$PROJECT/.venv/bin/python" -m pip install --upgrade --quiet pip mcp || return 1
+    PYTHON="$PROJECT/.venv/bin/python"
+}
 
 step "Checking prerequisites"
-[[ -n $PYTHON && -x $PYTHON ]] || {
-    echo "  MISSING: no usable Python interpreter" >&2
-    echo "  Create the env with:" >&2
-    echo "    conda create -y -n openrouter-mcp python=3.13" >&2
-    echo "    conda run -n openrouter-mcp pip install mcp" >&2
-    echo "  Or point ORASK_PYTHON at an interpreter that has the mcp package." >&2
-    exit 1
-}
-"$PYTHON" -c "import mcp" 2>/dev/null || {
-    echo "  MISSING: the mcp package in $PYTHON" >&2
-    echo "  Install it with: $PYTHON -m pip install mcp" >&2
-    exit 1
-}
-say "interpreter and mcp package present ($PYTHON)"
+orask_find_python "$PROJECT" || true
+if python_ok "${PYTHON:-}"; then
+    say "interpreter ready: $PYTHON ($(python_report "$PYTHON"))"
+else
+    # Anything on the machine that could at least build an env.
+    BASE_PYTHON="${PYTHON:-}"
+    [[ -n $BASE_PYTHON ]] || BASE_PYTHON="$(command -v python3 2>/dev/null || true)"
+    CONDA_BIN="$(conda_binary)"
 
+    say "no interpreter here has Python >= $MIN_PYTHON with the mcp SDK (>=2.0)."
+    if [[ -n $CONDA_BIN ]]; then
+        say "install.sh can create the conda env '$ORASK_CONDA_ENV_NAME'"
+        say "(Python $ORASK_CONDA_PYTHON + mcp) under $(dirname "$(dirname "$CONDA_BIN")")/envs/."
+    else
+        say "install.sh can create a virtualenv at $PROJECT/.venv (Python + mcp)."
+    fi
+
+    PROCEED="${ORASK_BOOTSTRAP:-}"
+    if [[ -z $PROCEED && -t 0 ]]; then
+        printf '  Create it now? [Y/n] '
+        read -r reply || reply=""
+        if [[ -z $reply || $reply == [Yy]* ]]; then
+            PROCEED=1
+        fi
+    fi
+    if [[ $PROCEED != 1 ]]; then
+        echo >&2
+        if [[ -n $CONDA_BIN ]]; then
+            die "Nothing installed. Build it yourself with:
+    conda create -y -n $ORASK_CONDA_ENV_NAME python=$ORASK_CONDA_PYTHON
+    conda run -n $ORASK_CONDA_ENV_NAME pip install mcp
+  then re-run this script, or point ORASK_PYTHON at an interpreter that has mcp.
+  Re-run with ORASK_BOOTSTRAP=1 to build it without asking."
+        fi
+        die "Nothing installed. This machine has no conda. Either install Miniconda
+  (https://www.anaconda.com/docs/getting-started/miniconda/install) and re-run,
+  or point ORASK_PYTHON at a Python >= $MIN_PYTHON that has the mcp SDK.
+  Re-run with ORASK_BOOTSTRAP=1 to build a local virtualenv instead."
+    fi
+
+    if [[ -n $CONDA_BIN ]] && bootstrap_conda "$CONDA_BIN"; then
+        :
+    elif [[ -n $BASE_PYTHON ]] && bootstrap_venv "$BASE_PYTHON"; then
+        :
+    else
+        die "Could not build an environment. Install Miniconda or python3, then re-run."
+    fi
+
+    python_ok "$PYTHON" || die "MISSING: $PYTHON is still not a Python >= $MIN_PYTHON with mcp.server.mcpserver"
+    say "interpreter ready: $PYTHON ($(python_report "$PYTHON"))"
+fi
+
+# Both launchers read this pin first, so the CLI and the MCP server run on the
+# interpreter that was verified here rather than re-guessing at start-up.
+if printf '%s\n' "$PYTHON" > "$PIN_FILE" 2>/dev/null; then
+    say "pinned the interpreter for the launchers ($PIN_FILE)"
+else
+    say "NOTE: could not write $PIN_FILE; the launchers will search for an interpreter"
+fi
+
+# A tarball or zip download loses the executable bit that git tracks.
+chmod +x "$PROJECT/bin/orask" "$PROJECT/bin/openrouter-mcp" 2>/dev/null || true
+
+mkdir -p "$CONFIG_DIR" && chmod 700 "$CONFIG_DIR" 2>/dev/null || true
 if [[ -f $KEY_FILE ]]; then
     say "API key file present ($KEY_FILE)"
-    mode="$(stat -c '%a' "$KEY_FILE")"
-    if [[ $mode != 600 ]]; then
+    mode="$(file_mode "$KEY_FILE")"
+    if [[ -n $mode && $mode != 600 ]]; then
         chmod 600 "$KEY_FILE"
         say "tightened key file permissions from $mode to 600"
     fi
@@ -63,6 +167,20 @@ for tool in orask openrouter-mcp; do
     ln -sfn "$PROJECT/bin/$tool" "$BIN_DIR/$tool"
     say "$BIN_DIR/$tool -> $PROJECT/bin/$tool"
 done
+case ":${PATH:-}:" in
+    *":$BIN_DIR:"*) ;;
+    *)  say "WARNING: $BIN_DIR is not on PATH, so 'orask' will not be found."
+        say "add this to ~/.bashrc or ~/.zshrc:  export PATH=\"\$HOME/.local/bin:\$PATH\"" ;;
+esac
+
+# Built with json.dumps so a project path containing a quote, a backslash or a
+# space cannot produce a config file that the agent then fails to parse.
+SERVER_JSON="$("$PYTHON" - "$PROJECT/bin/openrouter-mcp" "$PYTHON" <<'PY'
+import json, sys
+print(json.dumps({"type": "stdio", "command": sys.argv[1], "args": [],
+                  "env": {"ORASK_PYTHON": sys.argv[2]}, "timeout": 600000}))
+PY
+)"
 
 step "Registering the MCP server with Claude Code"
 if ! command -v claude >/dev/null 2>&1; then
@@ -82,37 +200,43 @@ else
         && say "backed up ~/.claude.json -> ~/.claude.json.bak.$STAMP"
     # Written through the Claude CLI rather than by editing ~/.claude.json
     # directly, because a running session owns that file.
-    claude mcp add-json openrouter "$(cat <<JSON
-{
-  "type": "stdio",
-  "command": "$PROJECT/bin/openrouter-mcp",
-  "args": [],
-  "env": {},
-  "timeout": 600000
-}
-JSON
-)" --scope user >/dev/null
-    say "registered as user-scope MCP server 'openrouter'"
+    if claude mcp add-json openrouter "$SERVER_JSON" --scope user >/dev/null; then
+        say "registered as user-scope MCP server 'openrouter'"
+    else
+        say "FAILED: 'claude mcp add-json' did not accept the server; register it by hand with:"
+        say "  claude mcp add-json openrouter '$SERVER_JSON' --scope user"
+    fi
 fi
 
 step "Registering the MCP server with Codex"
-if [[ ! -f $CODEX_TOML ]]; then
-    say "SKIPPED: $CODEX_TOML does not exist"
-elif grep -q '^\[mcp_servers\.openrouter\]' "$CODEX_TOML"; then
+if [[ ! -f $CODEX_TOML ]] && ! command -v codex >/dev/null 2>&1; then
+    say "SKIPPED: Codex is not installed ($CODEX_TOML does not exist)"
+elif [[ -f $CODEX_TOML ]] && grep -q '^\[mcp_servers\.openrouter\]' "$CODEX_TOML"; then
     say "already registered (delete the [mcp_servers.openrouter] block to undo)"
 else
-    cp -p "$CODEX_TOML" "$CODEX_TOML.bak.$STAMP"
-    say "backed up -> $CODEX_TOML.bak.$STAMP"
-    cat >> "$CODEX_TOML" <<TOML
-
+    if [[ -f $CODEX_TOML ]]; then
+        cp -p "$CODEX_TOML" "$CODEX_TOML.bak.$STAMP"
+        say "backed up -> $CODEX_TOML.bak.$STAMP"
+    else
+        mkdir -p "$(dirname "$CODEX_TOML")"
+        say "creating $CODEX_TOML"
+    fi
+    "$PYTHON" - "$CODEX_TOML" "$PROJECT/bin/openrouter-mcp" "$PYTHON" <<'PY'
+import json, sys
+path, command, interpreter = sys.argv[1], sys.argv[2], sys.argv[3]
+block = f"""
 [mcp_servers.openrouter]
-command = "$PROJECT/bin/openrouter-mcp"
+command = {json.dumps(command)}
 args = []
+env = {{ ORASK_PYTHON = {json.dumps(interpreter)} }}
 startup_timeout_sec = 30
 # Reasoning models on a large context can take minutes; a panel runs in parallel.
 tool_timeout_sec = 600
 enabled_tools = ["ask_llm", "ask_panel", "list_llm_models", "llm_model_info", "openrouter_usage"]
-TOML
+"""
+with open(path, "a", encoding="utf-8") as fh:
+    fh.write(block)
+PY
     say "appended [mcp_servers.openrouter]"
 fi
 

@@ -33,6 +33,42 @@ Runtime paths: key at `~/.config/openrouter/env` (0600), catalogue cache at
 `~/.cache/orask/models.json`, call log at `~/.local/state/orask/calls.jsonl`,
 threads under `~/.local/state/orask/threads/`.
 
+## Install
+
+```
+git clone https://github.com/slyfox1186/connect-claude-code-codex-to-openrouter.git
+cd connect-claude-code-codex-to-openrouter
+./install.sh
+```
+
+`install.sh` looks for a Python 3.10+ that can import the `mcp` SDK (>=2.0). If
+there is none it offers to build one: its own conda env named `openrouter-mcp`
+on Python 3.13, under whichever conda root the machine already has
+(`~/miniconda3` first), or a project-local `.venv` on a machine with no conda at
+all. It then symlinks `orask` and `openrouter-mcp` into `~/.local/bin`, registers
+the MCP server with Claude Code at user scope and with Codex, and finishes by
+running `orask doctor`.
+
+Then add the key:
+
+```
+printf 'OPENROUTER_API_KEY=sk-or-...\n' > ~/.config/openrouter/env
+chmod 600 ~/.config/openrouter/env
+```
+
+Re-running the installer is safe. Every step checks for itself first, and any
+file it edits is backed up with a timestamp beside it.
+
+Nothing in the repo is tied to one machine: every path comes from `$HOME` or
+from where the clone happens to sit, so it installs the same way on any Linux or
+macOS box. Three environment variables steer it if needed:
+
+| variable | effect |
+|---|---|
+| `ORASK_PYTHON` | use this interpreter instead of searching for one |
+| `ORASK_BOOTSTRAP=1` | build the env without asking, for an unattended install |
+| `ORASK_CONFIG_DIR` | keep the key and user config somewhere other than `~/.config/openrouter` |
+
 ## MCP tools
 
 | Tool | Purpose |
