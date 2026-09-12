@@ -183,7 +183,10 @@ file limits and the output cap still apply.
 
 Whatever the budget, the prompt is estimated against it before the call goes out:
 
-- room left over, and `max_tokens` is lowered to fit it, with a note saying so
+- enough room for the chosen output allowance, and the call proceeds
+- some room, but less than the chosen output allowance: MCP refuses before
+  submitting so the caller can narrow the task or revise its budget; the CLI
+  retains its documented automatic reduction and reports the effective cap
 - no room left, and the call is refused before it is billed, naming the estimate
   and the window
 
@@ -192,6 +195,9 @@ context-compression plugin, which drops text from the middle of the prompt until
 it fits and caps the answer at half the window to leave room for what survives.
 `false` refuses even on the endpoints of 8k or less that OpenRouter compresses by
 default. Unset leaves that default alone.
+
+MCP also refuses when compression would reduce the chosen output allowance.
+It does not silently enlarge budgets, weaken reasoning, or make a paid retry.
 
 The window in force, and the estimated prompt size, comes back on every
 answer: `context: 41231/200000` in the header line, and `context_window` in the
@@ -490,6 +496,38 @@ with `length`, inspect its usage, increase the output allowance within the model
 and cost limits, or split the work. Retry only the incomplete model in a panel.
 There is no automatic paid retry, and exhaustive reviews must not use compression.
 
+**Diagnosing successful and failed consultations.** Verbose lifecycle metadata
+is enabled by default in `/tmp/orask-<uid>/diagnostics.jsonl`. It covers MCP/CLI
+startup, worker admission/progress/recovery, model resolution, assembled input
+size, context fitting, cost checks, effective effort/output budget, HTTP attempts,
+retries and timing, provider completion, usage, accounting and persistence.
+Every model call has a `call_id`; a shared `consultation_id` connects the MCP
+process, detached worker and panel members. Results include these IDs, the log
+path and `write_errors`. Incomplete results display output caps and token usage
+alongside their partial answer and cost, so a retry can address the actual limit.
+
+```bash
+tail -F "/tmp/orask-$(id -u)/diagnostics.jsonl"
+rg '<consultation_id-or-call_id>' "/tmp/orask-$(id -u)"/diagnostics.jsonl*
+```
+
+The directory is private (0700), files are private (0600), and symlink/hardlink
+targets are refused. A process lock serializes writes and rotation. Each file is
+capped at 5 MiB, with three backups, for approximately 20 MiB retained. Lock waits
+are bounded; storage errors increment `write_errors` and issue one stderr warning
+per process without losing a paid answer or writing to MCP stdout. Workers retain
+those counters in their results. Logs deliberately omit prompt/source/answer
+bodies, reasoning text, credentials, headers, full local source paths and raw
+exception messages. Errors include their type and code location instead.
+
+Set `ORASK_DIAGNOSTIC_DIR` in the launching environment to change the directory;
+its parent must already exist. An existing log directory must be owned by the
+current user with mode 0700. Restart the MCP clients to load new code/environment.
+`/tmp` is temporary and logs rotate: preserve relevant files when investigating.
+Logging cannot guarantee that a provider finishes; it supplies evidence without
+requiring another paid reproduction. Transport failures without usage now retain
+an unknown cost in the accounting log instead of recording zero.
+
 **Self-healing aliases.** Aliases are pinned to concrete slugs so cost is
 auditable. If a pinned slug disappears from OpenRouter, resolution falls back to
 the best live match for the alias name and reports the substitution rather than
@@ -678,6 +716,10 @@ answers, attachment replay, private persistence, stdin limits, client registrati
 and installer failure recovery. Coding-group regressions exercise all four
 provider requests, arbitrary task keywords, explicit subsets, missing members,
 allowlist refusals, discovery metadata, and actual MCP stdio/worker results.
+Diagnostics regressions cover private concurrent JSONL writes, rotation, unsafe
+paths, logging/storage failures, HTTP retry and timeout events, cross-process
+correlation, incomplete-response rendering and refusal before billing when MCP
+context fitting would shrink output. All these checks run offline.
 These deterministic checks validate routing and delivered prompt text; they
 do not measure Claude Code/Codex natural-language tool-choice reliability.
 Live tests are separate opt-in checks.

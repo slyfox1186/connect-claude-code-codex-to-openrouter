@@ -38,6 +38,7 @@ id_ed25519*
 # text of every question asked, so they must never be published.
 # ---------------------------------------------------------------------------
 calls.jsonl
+diagnostics.jsonl*
 threads/
 consultations/
 .cache/

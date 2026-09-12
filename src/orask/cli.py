@@ -23,7 +23,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from . import __version__, core
+from . import __version__, core, diagnostics
 
 SUBCOMMANDS = {
     "ask",
@@ -63,6 +63,16 @@ def _print_result(result: dict[str, Any], show_reasoning: bool) -> None:
             print(f"   note: {note}")
         if result.get("usage"):
             print(f"   billed {_fmt_money(result['usage'].get('cost_usd'))}")
+            usage = result["usage"]
+            print(
+                f"   max_tokens={result.get('max_tokens')} "
+                f"context_window={result.get('context_window')} "
+                f"effort={result.get('effort')} finish_reason={result.get('finish_reason')} "
+                f"in={usage.get('prompt_tokens')} out={usage.get('completion_tokens')} "
+                f"reasoning={usage.get('reasoning_tokens')} latency_s={result.get('latency_s')}"
+            )
+        if result.get("diagnostics"):
+            print("   diagnostics: " + json.dumps(result["diagnostics"]))
         if result.get("answer"):
             print("\nPartial answer:\n" + result["answer"])
         if show_reasoning and result.get("reasoning"):
@@ -81,6 +91,8 @@ def _print_result(result: dict[str, Any], show_reasoning: bool) -> None:
         head += f" (reasoning {usage['reasoning_tokens']})"
     head += f"  {_fmt_money(usage.get('cost_usd'))}"
     print(head)
+    if result.get("diagnostics"):
+        print("   diagnostics: " + json.dumps(result["diagnostics"]))
     for note in result.get("notes") or []:
         print(f"   note: {note}")
     print()
@@ -780,6 +792,7 @@ HANDLERS = {
 
 
 def main(argv: list[str] | None = None) -> int:
+    diagnostics.emit("cli.start", runtime=__version__, python_version=sys.version.split()[0])
     argv = list(sys.argv[1:] if argv is None else argv)
     # `orask "question"` is shorthand for `orask ask "question"`.
     if argv and argv[0] not in SUBCOMMANDS and not argv[0].startswith("-"):
@@ -791,9 +804,16 @@ def main(argv: list[str] | None = None) -> int:
         parser.print_help()
         return 2
     try:
-        return HANDLERS[args.command](args)
+        diagnostics.emit("cli.command", operation=args.command)
+        result = HANDLERS[args.command](args)
+        diagnostics.emit("cli.end", operation=args.command, ok=result == 0)
+        return result
     except core.OpenRouterError as exc:
+        diagnostics.emit("cli.error", error_type=type(exc).__name__)
         print(f"orask: {exc}", file=sys.stderr)
+        details = getattr(exc, "orask_diagnostics", None)
+        if details:
+            print("diagnostics: " + json.dumps(details), file=sys.stderr)
         return 1
     except KeyboardInterrupt:
         print("\norask: interrupted", file=sys.stderr)

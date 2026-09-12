@@ -10,8 +10,10 @@ from __future__ import annotations
 import base64
 import concurrent.futures
 import contextlib
+import contextvars
 import fcntl
 import fnmatch
+import functools
 import hashlib
 import http.client
 import json
@@ -30,6 +32,8 @@ from collections.abc import Callable, Iterable
 from datetime import date
 from pathlib import Path
 from typing import Any
+
+from . import diagnostics
 
 __all__ = [
     "CODING_PANEL",
@@ -436,6 +440,7 @@ RETRY_STATUS_GET = {408, 409, 429, 500, 502, 503, 504, 520, 522, 524}
 RETRY_STATUS_POST = {408, 429}
 
 
+@diagnostics.traced("http")
 def _request(
     method: str,
     path: str,
@@ -445,6 +450,13 @@ def _request(
 ) -> dict[str, Any]:
     url = f"{API_BASE}{path}"
     body = json.dumps(payload).encode("utf-8") if payload is not None else None
+    diagnostics.emit(
+        "http.prepared",
+        method=method,
+        endpoint=path.split("?")[0],
+        request_bytes=len(body or b""),
+        timeout_s=timeout,
+    )
     headers = {
         "Authorization": f"Bearer {get_api_key()}",
         "Content-Type": "application/json",
@@ -458,10 +470,19 @@ def _request(
     retryable = RETRY_STATUS_POST if method == "POST" else RETRY_STATUS_GET
     last_error: Exception | None = None
     for attempt in range(retries + 1):
+        diagnostics.emit(
+            "http.attempt",
+            method=method,
+            endpoint=path.split("?")[0],
+            attempt=attempt + 1,
+            timeout_s=timeout,
+        )
         req = urllib.request.Request(url, data=body, headers=headers, method=method)
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
+                diagnostics.emit("http.connected", http_status=getattr(resp, "status", None))
                 received = resp.read(MAX_RESPONSE_BYTES + 1)
+            diagnostics.emit("http.received", response_bytes=len(received))
             if len(received) > MAX_RESPONSE_BYTES:
                 raise OpenRouterError("OpenRouter response exceeded the 64 MiB read limit")
             raw = received.decode("utf-8", "replace")
@@ -476,6 +497,7 @@ def _request(
                 raise OpenRouterError(
                     f"OpenRouter returned {type(parsed).__name__}, expected a JSON object"
                 )
+            diagnostics.emit("http.decoded", response_bytes=len(received))
             return parsed
         except urllib.error.HTTPError as exc:
             detail = ""
@@ -487,9 +509,17 @@ def _request(
             finally:
                 exc.close()
             message = _http_message(exc.code, detail)
+            diagnostics.emit(
+                "http.status_error",
+                http_status=exc.code,
+                attempt=attempt + 1,
+                retryable=exc.code in retryable and attempt < retries,
+            )
             if exc.code in retryable and attempt < retries:
                 last_error = OpenRouterError(message)
-                time.sleep(min(2**attempt + random.random(), 20))
+                delay = min(2**attempt + random.random(), 20)
+                diagnostics.emit("http.retry", delay_s=delay, reason="http_status")
+                time.sleep(delay)
                 continue
             raise OpenRouterError(message) from exc
         except urllib.error.URLError as exc:
@@ -501,11 +531,19 @@ def _request(
             safe_to_repeat = method != "POST" or isinstance(
                 exc.reason, (ConnectionRefusedError, socket.gaierror)
             )
+            diagnostics.emit(
+                "http.network_error",
+                error_type=type(exc.reason).__name__,
+                retryable=attempt < retries and safe_to_repeat,
+            )
             if attempt < retries and safe_to_repeat:
-                time.sleep(min(2**attempt + random.random(), 20))
+                delay = min(2**attempt + random.random(), 20)
+                diagnostics.emit("http.retry", delay_s=delay, reason="connection_not_sent")
+                time.sleep(delay)
                 continue
             raise last_error from exc
         except TimeoutError as exc:
+            diagnostics.emit("http.timeout", timeout_s=timeout, retryable=False)
             # Deliberately not retried: the provider may already be generating,
             # and a repeat would be billed a second time.
             last_error = OpenRouterError(
@@ -520,6 +558,9 @@ def _request(
                 "choose a smaller finite value. No automatic retry was made."
             ) from exc
         except (OSError, http.client.HTTPException) as exc:
+            diagnostics.emit(
+                "http.connection_error", error_type=type(exc).__name__, retryable=False
+            )
             # A reset or incomplete read can happen after generation starts. It is not
             # evidence that repeating this POST is free, so return an actionable failure.
             raise OpenRouterError(
@@ -686,6 +727,9 @@ def _fetch_catalog(refresh: bool, allow_stale: bool, ttl: float) -> list[dict[st
             cached = None
 
     if cached and not refresh and cache_age < ttl:
+        diagnostics.emit(
+            "catalog.loaded", cache_source="disk", cache_age_s=cache_age, models_count=len(cached)
+        )
         _catalog_cache = cached
         _catalog_fetched_at = time.time() - cache_age
         return cached
@@ -693,6 +737,12 @@ def _fetch_catalog(refresh: bool, allow_stale: bool, ttl: float) -> list[dict[st
     def _fall_back_to_stale() -> list[dict[str, Any]] | None:
         global _catalog_cache, _catalog_fetched_at
         if cached and allow_stale:
+            diagnostics.emit(
+                "catalog.loaded",
+                cache_source="stale",
+                cache_age_s=cache_age,
+                models_count=len(cached),
+            )
             _catalog_cache = cached
             _catalog_fetched_at = time.time() - min(cache_age, ttl)
             return cached
@@ -716,6 +766,7 @@ def _fetch_catalog(refresh: bool, allow_stale: bool, ttl: float) -> list[dict[st
         _catalog_cache = data
         _catalog_fetched_at = time.time()
         _catalog_failed_at = 0.0
+        diagnostics.emit("catalog.loaded", cache_source="provider", models_count=len(data))
         return data
     except OpenRouterError:
         _catalog_failed_at = time.time()
@@ -745,9 +796,11 @@ def _write_json_atomic(
     try:
         encoded = json.dumps(payload, indent=indent, ensure_ascii=False).encode("utf-8")
         if max_bytes is not None and len(encoded) > max_bytes:
+            diagnostics.emit("storage.refused", reason="size_limit", storage="json")
             return False
         target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         if target.is_symlink():
+            diagnostics.emit("storage.refused", reason="symlink", storage="json")
             return False
         fd, filename = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp", dir=target.parent)
         tmp = Path(filename)
@@ -756,8 +809,10 @@ def _write_json_atomic(
             handle.flush()
             os.fsync(handle.fileno())
         tmp.replace(target)
+        diagnostics.emit("storage.saved", storage="json", bytes_written=len(encoded))
         return True
-    except (OSError, ValueError, TypeError):
+    except (OSError, ValueError, TypeError) as exc:
+        diagnostics.emit("storage.error", storage="json", error_type=type(exc).__name__)
         return False
     finally:
         if tmp is not None and tmp.exists():
@@ -1782,6 +1837,7 @@ def _gather_files(
         [] if allow_secret_files else patterns,
     )
     notes.extend(walk_notes)
+    diagnostics.emit("files.expanded", files_count=len(candidates), notes_count=len(walk_notes))
 
     per_file = _setting("max_attachment_bytes", MAX_ATTACHMENT_BYTES)
     total_cap = _setting("max_attachment_total_bytes", MAX_ATTACHMENT_TOTAL_BYTES)
@@ -1793,13 +1849,16 @@ def _gather_files(
     manifest: list[str] = []
     spent = 0
 
-    for candidate in candidates:
+    for index, candidate in enumerate(candidates):
+        diagnostics.emit("file.start", file_index=index)
         if candidate.is_dir():
+            diagnostics.emit("file.skipped", file_index=index, reason="directory")
             notes.append(f"{candidate} is a directory, skipped")
             continue
         if not allow_secret_files:
             matched = denied_by_policy(candidate, patterns)
             if matched:
+                diagnostics.emit("file.skipped", file_index=index, reason="credential_policy")
                 notes.append(
                     f"REFUSED to send {candidate} to a third-party API: it matches the "
                     f"deny pattern '{matched}'. Pass allow_secret_files if this file is "
@@ -1810,6 +1869,13 @@ def _gather_files(
         classified = classify_attachment(candidate)
         if classified is None:
             text, warning = _read_file(candidate, file_limit, deny_key=not allow_secret_files)
+            diagnostics.emit(
+                "file.read",
+                file_index=index,
+                file_kind="text",
+                input_chars=len(text or ""),
+                warning=bool(warning),
+            )
             if warning:
                 notes.append(warning)
             if not text:
@@ -1825,6 +1891,9 @@ def _gather_files(
         # everywhere. An image or a sound file has to be something the model
         # itself takes, and sending one blind is a billed request that fails.
         if family in ("image", "audio") and modalities and family not in modalities:
+            diagnostics.emit(
+                "file.skipped", file_index=index, reason="unsupported_modality", file_kind=family
+            )
             notes.append(
                 f"{candidate} is {family} input, which {model_slug} does not accept "
                 f"(it takes {', '.join(sorted(modalities))}); not sent. "
@@ -1832,23 +1901,28 @@ def _gather_files(
             )
             continue
         if len(attachments) >= ceiling:
+            diagnostics.emit("file.skipped", file_index=index, reason="attachment_limit")
             notes.append(f"{candidate} not attached: already at the {ceiling} attachment limit")
             continue
 
         raw, problem = _slurp(candidate, per_file, deny_key=not allow_secret_files)
         if problem:
+            diagnostics.emit("file.skipped", file_index=index, reason="read_or_size_error")
             notes.append(problem)
             continue
         if not raw:
+            diagnostics.emit("file.skipped", file_index=index, reason="empty")
             notes.append(f"{candidate} is empty")
             continue
         if spent + len(raw) > total_cap:
+            diagnostics.emit("file.skipped", file_index=index, reason="attachment_byte_limit")
             notes.append(
                 f"{candidate} ({_human_bytes(len(raw))}) not attached: it would take this "
                 f"call past the {_human_bytes(total_cap)} total attachment ceiling"
             )
             continue
         spent += len(raw)
+        diagnostics.emit("file.read", file_index=index, file_kind=family, request_bytes=len(raw))
         blob = base64.b64encode(raw).decode("ascii")
         if family == "image":
             attachments.append(
@@ -2539,8 +2613,9 @@ def log_call(entry: dict[str, Any]) -> None:
                 if handle.read(1) != b"\n":
                     handle.write(b"\n")  # preserve a damaged tail without losing this record
             handle.write((json.dumps({"ts": time.time(), **entry}) + "\n").encode("utf-8"))
-    except (OSError, ValueError, TypeError):
-        pass  # metadata logging must not destroy a billed answer
+        diagnostics.emit("accounting.saved")
+    except (OSError, ValueError, TypeError) as exc:
+        diagnostics.emit("accounting.error", error_type=type(exc).__name__)
 
 
 # The log is append-only and never rotated, so reads are bounded: `orask usage` asks for a
@@ -2583,6 +2658,7 @@ def read_log(limit: int = 50) -> list[dict[str, Any]]:
 # --------------------------------------------------------------------------
 
 
+@diagnostics.traced("call")
 def ask(
     question: str | None,
     model: str | None = None,
@@ -2628,6 +2704,13 @@ def ask(
         if effort == "medium" and not (effort_reason and effort_reason.strip()):
             raise OpenRouterError("MCP medium effort requires a non-empty effort_reason.")
     notes: list[str] = []
+    diagnostics.emit(
+        "call.arguments",
+        question_chars=len(question or ""),
+        context_chars=len(context or ""),
+        requested_max_tokens=max_tokens,
+        requested_effort=effort,
+    )
     # Recover a misplaced question here rather than only inside build_messages, so the question
     # that reaches the thread transcript is the real one. Storing the untouched argument wrote
     # a null user turn, and with an attachment on the same turn it put a null text part on the
@@ -2671,6 +2754,7 @@ def ask(
         slug, resolve_note = resolve_model(model or cfg.get("default_model") or "kimi")
     if resolve_note:
         notes.append(resolve_note)
+    diagnostics.emit("call.model", model=slug, notes_count=len(notes))
 
     history = load_thread(thread)
     messages, build_notes = build_messages(
@@ -2685,6 +2769,12 @@ def ask(
         model_slug=slug,
     )
     notes.extend(build_notes)
+    diagnostics.emit(
+        "call.assembled",
+        input_chars=text_chars(messages),
+        attachments_count=attachment_summary(messages)["total"],
+        notes_count=len(build_notes),
+    )
     if history:
         notes.append(f"continuing thread '{thread}' with {len(history)} prior messages")
 
@@ -2738,8 +2828,26 @@ def ask(
         else _tristate(cfg.get("context_compression"))
     )
     # Ahead of the cost guard, so the answer is priced at the cap that is actually sent.
+    output_before_fit = limit
     limit, window, fit_notes = fit_context(slug, billable, limit, wanted_window, compress is True)
     notes.extend(fit_notes)
+    diagnostics.emit(
+        "call.context",
+        model=slug,
+        requested_max_tokens=output_before_fit,
+        max_tokens=limit,
+        context_window=window,
+        estimated_prompt_tokens=int(billable / CHARS_PER_TOKEN) + 1,
+    )
+    if _mcp_call and limit < output_before_fit:
+        diagnostics.emit("call.refused", phase="context", reason="output_budget_reduced")
+        raise OpenRouterError(
+            f"refusing to send: the requested output budget is {output_before_fit} tokens, "
+            f"but the prompt leaves only {limit} in the {window}-token context window. "
+            "No model request was sent. Narrow the source/task or raise max_context_tokens "
+            "if it is below the model's window. Choose a smaller max_tokens only when the "
+            "revised task can finish within it; the bridge will not silently shrink MCP output."
+        )
 
     # Resolved before the guard runs, because which engine reads the PDF changes what the
     # call costs. cloudflare-ai is free, mistral-ocr is not.
@@ -2752,6 +2860,13 @@ def ask(
 
     guard = _float_setting("max_cost_usd_per_call", 1.0)
     estimate, priced = estimate_call_cost(slug, billable, limit)
+    diagnostics.emit(
+        "call.cost_guard",
+        model=slug,
+        estimated_cost_usd=estimate,
+        pricing_known=priced,
+        cost_guard_usd=guard,
+    )
 
     ocr = 0.0
     pdf_bytes = int(attached.get("pdf_bytes") or 0)
@@ -2858,6 +2973,18 @@ def ask(
         payload["plugins"] = plugins
 
     timeout = _float_setting("request_timeout_s", 300.0) or 300.0
+    diagnostics.emit(
+        "call.prepared",
+        model=slug,
+        max_tokens=limit,
+        context_window=window,
+        estimated_prompt_tokens=int(billable / CHARS_PER_TOKEN) + 1,
+        estimated_cost_usd=estimate,
+        pricing_known=priced,
+        effort=final_effort,
+        timeout_s=timeout,
+        notes_count=len(notes),
+    )
     response: dict[str, Any] = {}
     try:
         response = _request("POST", "/chat/completions", payload, timeout=timeout)
@@ -2869,6 +2996,18 @@ def ask(
             code = _nonnegative_number(embedded.get("code")) if isinstance(embedded, dict) else None
             raise OpenRouterError(_http_message(int(code or 200), json.dumps({"error": embedded})))
     except OpenRouterError as exc:
+        error_usage = _clean_usage(response.get("usage"), [])
+        reported_cost = error_usage.get("cost", error_usage.get("total_cost"))
+        diagnostics.emit(
+            "call.provider_error",
+            model=slug,
+            error_type=type(exc).__name__,
+            phase="provider",
+            max_tokens=limit,
+            timeout_s=timeout,
+            cost_known=reported_cost is not None,
+            cost_usd=reported_cost,
+        )
         log_call(
             {
                 "model": slug,
@@ -2876,9 +3015,11 @@ def ask(
                 "ok": False,
                 "error": str(exc)[:500],
                 "chars_in": chars,
-                "cost_usd": actual_cost(slug, _clean_usage(response.get("usage"), []))
-                if response.get("usage")
-                else 0.0,
+                "cost_usd": reported_cost,
+                "max_tokens": limit,
+                "context_window": window,
+                "call_id": diagnostics.current()["call_id"],
+                "consultation_id": diagnostics.current()["consultation_id"],
                 "latency_s": round(time.monotonic() - started, 2),
                 "thread": thread,
             }
@@ -2923,7 +3064,29 @@ def ask(
     usage = _clean_usage(response.get("usage"), notes)
     prompt_detail = usage.get("prompt_tokens_details") or {}
     cost = actual_cost(slug, usage)
+    reported_cost = usage.get("cost", usage.get("total_cost"))
     elapsed = round(time.monotonic() - started, 2)
+    diagnostics.emit(
+        "call.response",
+        model=slug,
+        ok=not incomplete,
+        incomplete=incomplete,
+        finish_reason=finish,
+        max_tokens=limit,
+        context_window=window,
+        effort=final_effort,
+        prompt_tokens=usage.get("prompt_tokens"),
+        completion_tokens=usage.get("completion_tokens"),
+        reasoning_tokens=(usage.get("completion_tokens_details") or {}).get("reasoning_tokens"),
+        cost_usd=reported_cost,
+        cost_known=reported_cost is not None,
+        estimated_cost_usd=cost if reported_cost is None else None,
+        answer_chars=len(answer),
+        reasoning_chars=len(reasoning),
+        elapsed_s=elapsed,
+        provider=response.get("provider"),
+        generation_id=response.get("id"),
+    )
 
     carried: list[dict[str, Any]] | None = None
     if thread and fresh["total"]:
@@ -2970,6 +3133,10 @@ def ask(
             "empty": empty,
             "incomplete": incomplete,
             "finish_reason": finish,
+            "max_tokens": limit,
+            "context_window": window,
+            "call_id": diagnostics.current()["call_id"],
+            "consultation_id": diagnostics.current()["consultation_id"],
             "effort": final_effort,
             "role": role or cfg.get("default_role"),
             "prompt_tokens": usage.get("prompt_tokens"),
@@ -3024,6 +3191,7 @@ def ask(
     }
 
 
+@diagnostics.traced("panel")
 def ask_panel(
     question: str | None,
     models: Iterable[str] | str | None = None,
@@ -3083,10 +3251,14 @@ def ask_panel(
     results: list[dict[str, Any]] = [{"model": spec, "pending": True} for spec in seen]
     if on_result:
         on_result(results)
+    diagnostics.emit("panel.roster", members=len(seen))
     workers = max(1, min(int(max_workers), len(seen)))
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {
-            pool.submit(ask, question, model=spec, **kwargs): index
+            pool.submit(
+                contextvars.copy_context().run,
+                functools.partial(ask, question, model=spec, **kwargs),
+            ): index
             for index, spec in enumerate(seen)
         }
         # `category` chose the roster above; each member is now an explicit
@@ -3103,6 +3275,7 @@ def ask_panel(
                     "ok": False,
                     "requested": spec,
                     "model": spec,
+                    "diagnostics": getattr(exc, "orask_diagnostics", None),
                     "error": str(exc),
                     "notes": [],
                 }

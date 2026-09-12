@@ -20,7 +20,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from . import core
+from . import core, diagnostics
 
 WORKER_COMMAND = [sys.executable, "-m", "orask.consultations"]
 MAX_RECORD_BYTES = 128 * 1024 * 1024
@@ -175,6 +175,7 @@ def recent() -> list[dict[str, Any]]:
 
 
 def start(kind: str, kwargs: dict[str, Any], notes: list[str]) -> str:
+    diagnostics.emit("consultation.admission", operation=kind)
     if kind not in {"ask_llm", "ask_panel"}:
         raise core.OpenRouterError("Unknown consultation kind")
     encoded = json.dumps(kwargs).encode("utf-8")
@@ -252,10 +253,18 @@ def start(kind: str, kwargs: dict[str, Any], notes: list[str]) -> str:
                     spawned_id = consultation_id
                     with _children_lock:
                         _children.append(child)
+                    diagnostics.emit(
+                        "consultation.started",
+                        consultation_id=consultation_id,
+                        operation=kind,
+                        worker_pid=child.pid,
+                        timeout_s=timeout,
+                    )
             finally:
                 os.close(lock)
             return consultation_id
     except OSError as exc:
+        diagnostics.emit("consultation.start_error", error_type=type(exc).__name__)
         if spawned_id is not None:
             # The worker can already be billing. Losing its ID during local handle
             # cleanup would invite a duplicate consultation instead of recovery.
@@ -266,6 +275,8 @@ def start(kind: str, kwargs: dict[str, Any], notes: list[str]) -> str:
 
 
 def worker_main(consultation_id: str, lock_fd: int) -> None:
+    diagnostics.set_consultation(consultation_id)
+    diagnostics.emit("worker.start")
     directory = _directory(consultation_id)
     record = get(consultation_id)
     state_lock = threading.RLock()
@@ -299,6 +310,12 @@ def worker_main(consultation_id: str, lock_fd: int) -> None:
             record["results"] = list(results)
             try:
                 save()
+                diagnostics.emit(
+                    "worker.progress",
+                    members=len(results),
+                    answered=sum(bool(r.get("ok")) for r in results),
+                    pending=sum(bool(r.get("pending")) for r in results),
+                )
             except core.OpenRouterError:
                 if all(r.get("pending") for r in results):
                     raise  # establish the recoverable roster before submitting paid requests
@@ -311,6 +328,9 @@ def worker_main(consultation_id: str, lock_fd: int) -> None:
             if record["status"] != "running":
                 return
             try:
+                diagnostics.emit(
+                    "worker.timeout", consultation_id=consultation_id, timeout_s=timeout
+                )
                 record["status"] = "timed_out"
                 record["error"] = (
                     f"Consultation exceeded its {timeout:g}s wall-clock limit. Completed members "
@@ -352,7 +372,13 @@ def worker_main(consultation_id: str, lock_fd: int) -> None:
             record["results"] = results
             record["status"] = "completed"
             save()
+            diagnostics.emit(
+                "worker.completed",
+                members=len(results),
+                answered=sum(bool(r.get("ok")) for r in results),
+            )
     except Exception as exc:
+        diagnostics.emit("worker.error", error_type=type(exc).__name__)
         with state_lock:
             record["status"] = "failed"
             record["error"] = (
@@ -364,10 +390,14 @@ def worker_main(consultation_id: str, lock_fd: int) -> None:
                     "No automatic retry was made."
                 )
             )
+            details = getattr(exc, "orask_diagnostics", None)
+            if details:
+                record["notes"].append("diagnostics: " + json.dumps(details))
             with contextlib.suppress(core.OpenRouterError):
                 save()
     finally:
         timer.cancel()
+        diagnostics.emit("worker.end", status=record["status"])
         os.close(lock_fd)
 
 

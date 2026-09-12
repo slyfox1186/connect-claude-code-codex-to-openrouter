@@ -12,12 +12,13 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import sys
 from typing import Any
 
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 
-from . import __version__, consultations, core
+from . import __version__, consultations, core, diagnostics
 
 CODING_PANEL_GUIDANCE = (
     'For "Ask all of coding LLMs to ...", "all coding models", or "the coding LLMs", '
@@ -104,10 +105,17 @@ material intact; context_compression drops text from the middle and is unsuitabl
 when the review requires every file. Ask for final findings, evidence, fixes and
 unresolved gaps; do not request an exhaustive narration of the review process.
 
+Lifecycle metadata is written under /tmp/orask-<uid>/diagnostics.jsonl by default.
+Results include diagnostic paths, call IDs and consultation IDs. Before a paid retry,
+inspect the failed call's diagnostics and saved consultation to identify the limiting
+stage. Logs contain timing, budgets and usage, not prompt bodies or source contents.
+Polling get_consultation recovers existing work without a new paid request.
+
 Check finish_reason, completion and reasoning usage, notes and the final answer.
 INCOMPLETE or NO ANSWER is a failed consultation even if it contains useful partial
-findings, and may still cost money. Inspect the actual output cap: the bridge may
-have lowered it to fit the remaining context. For a retry, change the limiting
+findings, and may still cost money. Inspect the actual output cap: it is capped by
+the model's output ceiling. MCP refuses before sending if context fitting would
+reduce that allowance further. For a retry, change the limiting
 factor: raise max_tokens within the model/window/cost limits, split the task while
 preserving relevant evidence, or use justified medium when appropriate. Do not retry
 unchanged, retry successful panel members, automatically bypass guards, or claim
@@ -225,6 +233,28 @@ def _render(result: dict[str, Any], include_reasoning: bool = False) -> str:
         billed = usage.get("cost_usd") or 0.0
         if billed:
             lines += ["", f"`billed ${billed:.4f} anyway`"]
+        if usage:
+            lines += [
+                "",
+                "`"
+                + " | ".join(
+                    f"{key}: {value}"
+                    for key, value in {
+                        "finish_reason": result.get("finish_reason"),
+                        "max_tokens": result.get("max_tokens"),
+                        "context_window": result.get("context_window"),
+                        "effort": result.get("effort"),
+                        "prompt_tokens": usage.get("prompt_tokens"),
+                        "completion_tokens": usage.get("completion_tokens"),
+                        "reasoning_tokens": usage.get("reasoning_tokens"),
+                        "latency_s": result.get("latency_s"),
+                    }.items()
+                    if value is not None
+                )
+                + "`",
+            ]
+        if result.get("diagnostics"):
+            lines.append("`diagnostics: " + json.dumps(result["diagnostics"]) + "`")
         for note in result.get("notes") or []:
             lines.append(f"> note: {note}")
         if result.get("answer"):
@@ -252,6 +282,8 @@ def _render(result: dict[str, Any], include_reasoning: bool = False) -> str:
     bits.append(f"cost: ${usage.get('cost_usd') or 0.0:.4f}")
 
     lines = [f"### {result['model']}", "", "`" + " | ".join(bits) + "`", ""]
+    if result.get("diagnostics"):
+        lines.append("`diagnostics: " + json.dumps(result["diagnostics"]) + "`")
     for note in result.get("notes") or []:
         lines.append(f"> note: {note}")
     if result.get("notes"):
@@ -324,9 +356,18 @@ async def _run(func, /, **kwargs):
     reach the agent as a bare "Error executing tool", hiding the message that
     tells it how to fix the call.
     """
+    operation = func.__name__
+    # Internal polling runs ten times a second. Log each returned receipt instead.
+    record_operation = func is not consultations.get
+    if record_operation:
+        diagnostics.emit("mcp.operation_start", operation=operation)
     try:
-        return await asyncio.to_thread(lambda: func(**kwargs))
+        result = await asyncio.to_thread(lambda: func(**kwargs))
+        if record_operation:
+            diagnostics.emit("mcp.operation_end", operation=operation)
+        return result
     except core.OpenRouterError as exc:
+        diagnostics.emit("mcp.operation_error", operation=operation, error_type=type(exc).__name__)
         raise ToolError(str(exc)) from exc
 
 
@@ -345,6 +386,12 @@ async def _wait_consultation(consultation_id: str, wait_seconds: float) -> str:
     while True:
         record = await _run(consultations.get, consultation_id=consultation_id)
         if record["status"] != "running" or asyncio.get_running_loop().time() >= deadline:
+            diagnostics.emit(
+                "consultation.receipt",
+                consultation_id=consultation_id,
+                status=record["status"],
+                members=len(record["results"]),
+            )
             rendered = await _render_consultation(record)
             if record["status"] == "failed":
                 raise ToolError(rendered)
@@ -356,7 +403,10 @@ async def _render_consultation(record: dict[str, Any]) -> str:
     status = record["status"]
     consultation_id = record["consultation_id"]
     results = record["results"]
-    lines = [f"`consultation_id: {consultation_id} | status: {status}`"]
+    lines = [
+        f"`consultation_id: {consultation_id} | status: {status}`",
+        f"`diagnostic log: {diagnostics.log_path()}`",
+    ]
     if status == "running":
         lines += [
             (
@@ -495,7 +545,8 @@ async def ask_llm(
         max_context_tokens: Budget prompt and answer together into this many
             tokens. A model's context window is fixed and cannot be raised from
             here, so a number above it is clamped back down to what the model
-            takes; below it, max_tokens is lowered to leave room for the reply.
+            takes. If the input would reduce the output allowance, MCP refuses
+            before billing so you can narrow the task or revise the budget.
             Leave unset to use the whole window the model publishes.
         context_compression: What to do when the prompt does not fit the window.
             true lets OpenRouter drop text from the middle until it does, false
@@ -896,6 +947,7 @@ async def read_guide(
 
 
 def main() -> None:
+    diagnostics.emit("mcp.start", runtime=__version__, python_version=sys.version.split()[0])
     mcp.run()  # stdio
 
 

@@ -18,6 +18,7 @@ FAILED=()
 SCRATCH="$(mktemp -d)" || { echo "check: cannot allocate scratch directory" >&2; exit 1; }
 [[ -n $SCRATCH && -d $SCRATCH ]] || exit 1
 trap 'rm -rf "$SCRATCH"' EXIT
+export ORASK_DIAGNOSTIC_DIR="$SCRATCH/diagnostics"
 run() {
     local label="$1"; shift
     printf '\n== %s\n' "$label"
@@ -46,6 +47,7 @@ run "offline tests" env \
     "$PYTHON" "$PROJECT/tests/test_core.py"
 run "offline MCP protocol" "$PYTHON" "$PROJECT/tests/test_mcp_offline.py"
 run "four-member coding group" "$PYTHON" "$PROJECT/tests/test_coding_panel.py"
+run "private lifecycle diagnostics" "$PYTHON" "$PROJECT/tests/test_diagnostics.py"
 run "detached consultation lifecycle" "$PYTHON" "$PROJECT/tests/test_consultations.py"
 run "CLI subprocess tests" "$PYTHON" "$PROJECT/tests/test_cli.py"
 run "provider and config boundaries" "$PYTHON" "$PROJECT/tests/test_boundaries.py"

@@ -112,6 +112,7 @@ async def check_protocol():
             "ORASK_CONFIG_DIR": tmp + "/config",
             "ORASK_STATE_DIR": tmp + "/state",
             "ORASK_CACHE_DIR": tmp + "/cache",
+            "ORASK_DIAGNOSTIC_DIR": tmp + "/logs",
             "OPENROUTER_API_KEY": "",
             "ORASK_PYTHON": sys.executable,
         }
@@ -173,6 +174,8 @@ async def check_protocol():
             text = "".join(getattr(c, "text", "") for c in result.content)
             assert "0/2 answered" in text and "INCOMPLETE" in text and "partial" in text, text
             assert "private reasoning" not in text and "$0.0400" in text, text
+            for needle in ("max_tokens: 32000", "completion_tokens: 100", "reasoning_tokens: 50"):
+                assert needle in text, text
             result = await client.call_tool("read_guide", {"topic": "bash", "section": "Quoting"})
             text = "".join(getattr(c, "text", "") for c in result.content)
             assert "Quoting" in text, text
@@ -223,6 +226,31 @@ async def check_protocol():
             assert "status: completed" in text and "FINISHED" in text and "1/1 answered" in text, (
                 text
             )
+            events = [
+                json.loads(line)
+                for line in (Path(tmp) / "logs/diagnostics.jsonl").read_text().splitlines()
+            ]
+            assert {
+                "mcp.start",
+                "worker.start",
+                "call.prepared",
+                "worker.completed",
+                "consultation.receipt",
+            } <= {e["event"] for e in events}
+            correlated = [e for e in events if e.get("consultation_id") == consultation_id]
+            assert len({e["pid"] for e in correlated}) >= 2, (
+                "server and detached worker must correlate"
+            )
+            assert len({e["call_id"] for e in correlated if e.get("call_id")}) == 2
+            assert "private reasoning" not in json.dumps(events)
+            assert "force-slow" not in json.dumps(events)
+            before = log_path.read_bytes()
+            result = await client.call_tool(
+                "ask_llm", {"question": "q", "max_tokens": 32000, "max_context_tokens": 1000}
+            )
+            text = "".join(getattr(c, "text", "") for c in result.content)
+            assert result.is_error and "output budget" in text and "diagnostics.jsonl" in text, text
+            assert log_path.read_bytes() == before, "refused budget must never bill"
     print("all offline MCP protocol checks passed")
 
 
