@@ -193,7 +193,7 @@ async def ask_llm(
     category: str | None = None,
     context: str | None = None,
     files: list[str] | str | None = None,
-    role: str = "advisor",
+    role: str | None = None,
     effort: str | None = None,
     system: str | None = None,
     max_tokens: int | None = None,
@@ -231,9 +231,10 @@ async def ask_llm(
             it, skipping build output and .git. Relative paths resolve against
             `cwd`. Images and audio need a model that accepts them; PDFs work
             on every model.
-        role: advisor (blunt second opinion, default), reviewer (hunt for
-            defects), debugger (rank root causes), architect (assess a design),
-            redteam (attack the plan).
+        role: advisor (blunt second opinion), reviewer (hunt for defects),
+            debugger (rank root causes), architect (assess a design), redteam
+            (attack the plan). Left unset it follows default_role in the config,
+            which is advisor unless it has been changed.
         effort: Reasoning effort - low, medium, high (default), xhigh, max, or
             'none'. Automatically snapped to what the target model supports.
         system: Replace the role prompt entirely with your own system prompt.
@@ -284,13 +285,16 @@ async def ask_panel(
     category: str | None = None,
     context: str | None = None,
     files: list[str] | str | None = None,
-    role: str = "advisor",
+    role: str | None = None,
     effort: str | None = None,
     system: str | None = None,
     max_tokens: int | None = None,
+    temperature: float | None = None,
     cwd: str | None = None,
     pdf_engine: str | None = None,
+    show_reasoning: bool = False,
     allow_expensive: bool = False,
+    allow_secret_files: bool = False,
 ) -> str:
     """Ask several models the same question at once.
 
@@ -308,26 +312,34 @@ async def ask_panel(
         files: A JSON array of paths, sent to every model. Source goes in as
             text, a PDF or image is attached directly, and a directory sends
             the files inside it. Never paste a file into `question` instead.
-        role: advisor, reviewer, debugger, architect or redteam.
+        role: advisor, reviewer, debugger, architect or redteam. Left unset it
+            follows default_role in the config.
         effort: Reasoning effort, snapped per model to what each supports.
         system: Replace the role prompt with your own.
         max_tokens: Cap each answer.
+        temperature: Sampling temperature. Leave unset for the model default.
         cwd: Directory that relative `files` paths resolve against.
         pdf_engine: How an attached PDF is read: 'cloudflare-ai' (default, free),
             'mistral-ocr' (reads scans, billed per 1,000 pages) or 'native'.
+        show_reasoning: Also return each model's reasoning trace.
         allow_expensive: Bypass the per-call cost guard.
+        allow_secret_files: Permit a file that matches the secrets denylist
+            (ssh keys, .env, credentials). Leave false unless the user has
+            explicitly asked for that specific file to be sent.
     """
     question, context, files, shape_note = _question("ask_panel", question, context, files)
     results = await _run(
         core.ask_panel,
         question=question, models=models, category=category, context=context, files=files,
-        role=role, effort=effort, system=system, max_tokens=max_tokens, cwd=cwd,
-        pdf_engine=pdf_engine, allow_expensive=allow_expensive,
+        role=role, effort=effort, system=system, max_tokens=max_tokens,
+        temperature=temperature, cwd=cwd, pdf_engine=pdf_engine,
+        allow_expensive=allow_expensive, allow_secret_files=allow_secret_files,
+        include_reasoning=show_reasoning,
     )
     # Every result, not just the ones that answered: an empty completion is ok: False and is
     # still billed, so filtering on ok reports a total lower than the invoice.
     total = sum(float((r.get("usage") or {}).get("cost_usd") or 0) for r in results)
-    body = "\n\n".join(_render(r) for r in results)
+    body = "\n\n".join(_render(r, show_reasoning) for r in results)
     agreed = [r["model"] for r in results if r.get("ok")]
     footer = (
         f"\n\n---\n`panel: {len(agreed)}/{len(results)} answered "

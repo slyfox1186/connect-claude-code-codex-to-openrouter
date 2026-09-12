@@ -16,7 +16,7 @@ PROJECT="$(cd -P "$(dirname "$SELF")/.." && pwd)"
 source "$PROJECT/bin/_python-env.sh"
 
 if ! orask_find_python "$PROJECT"; then
-    echo "openrouter-mcp: no usable Python interpreter found; run install.sh" >&2
+    echo "openrouter-mcp: no Python >= $ORASK_MIN_PYTHON_MAJOR.$ORASK_MIN_PYTHON_MINOR found; run install.sh" >&2
     exit 1
 fi
 

@@ -16,7 +16,7 @@ PROJECT="$(cd -P "$(dirname "$SELF")/.." && pwd)"
 source "$PROJECT/bin/_python-env.sh"
 
 if ! orask_find_python "$PROJECT"; then
-    echo "orask: no usable Python interpreter found." >&2
+    echo "orask: no Python >= $ORASK_MIN_PYTHON_MAJOR.$ORASK_MIN_PYTHON_MINOR found." >&2
     echo "orask: run $PROJECT/install.sh, or set ORASK_PYTHON to an interpreter." >&2
     exit 1
 fi

@@ -5,6 +5,16 @@
 
 ORASK_CONDA_ENV_NAME="openrouter-mcp"
 ORASK_CONDA_PYTHON="3.13"
+ORASK_MIN_PYTHON_MAJOR=3
+ORASK_MIN_PYTHON_MINOR=10
+
+# A version floor and nothing else. Deliberately NOT an "import mcp" check: the CLI is
+# standard library only, and it has to keep working on a machine that has never installed the
+# SDK. Whether mcp is importable is an install-time question, answered in install.sh.
+orask_python_new_enough() {
+    [[ -n ${1:-} && -x ${1:-} ]] || return 1
+    "$1" -c "import sys; raise SystemExit(0 if sys.version_info[:2] >= ($ORASK_MIN_PYTHON_MAJOR, $ORASK_MIN_PYTHON_MINOR) else 1)" 2>/dev/null
+}
 
 # readlink -f is GNU; BSD and older macOS do not have it, so walk the symlinks.
 orask_project_root() {
@@ -37,14 +47,17 @@ orask_conda_roots() {
     return 0
 }
 
-# Sets PYTHON to the first usable interpreter, or empties it and returns 1.
-# Priority: explicit override, the pin install.sh wrote, this project's conda
-# env under any conda root, a project venv, then whatever python3 is on PATH
-# so a fresh clone still runs on a machine that has never seen conda.
+# Sets PYTHON to the first interpreter new enough to run this project, or empties it and
+# returns 1. Priority: explicit override, the pin install.sh wrote, this project's conda env
+# under any conda root, a project venv, then whatever python3 is on PATH so a fresh clone
+# still runs on a machine that has never seen conda. The PATH fallback is why the version
+# floor matters: a system python can easily be older than this code needs.
 orask_find_python() {
     local root="$1" candidate conda_root
     local -a candidates=()
 
+    # An explicit override is honoured as given: if someone points ORASK_PYTHON at an
+    # interpreter, second-guessing it helps nobody.
     PYTHON="${ORASK_PYTHON:-}"
     if [[ -n $PYTHON && -x $PYTHON ]]; then
         return 0
@@ -62,7 +75,7 @@ orask_find_python() {
     candidates+=("$(command -v python3 2>/dev/null || true)")
 
     for candidate in "${candidates[@]}"; do
-        if [[ -n $candidate && -x $candidate ]]; then
+        if orask_python_new_enough "$candidate"; then
             PYTHON="$candidate"
             return 0
         fi

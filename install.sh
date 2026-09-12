@@ -19,7 +19,8 @@ KEY_FILE="$CONFIG_DIR/env"
 PIN_FILE="$PROJECT/.orask-python"
 STAMP="$(date +%Y-%m-%d_%H%M%S)"
 CHANGED=0
-MIN_PYTHON="3.10"
+# From the shared helper, so the installer's floor and the launchers' floor cannot drift.
+MIN_PYTHON="$ORASK_MIN_PYTHON_MAJOR.$ORASK_MIN_PYTHON_MINOR"
 
 say()  { printf '  %s\n' "$*"; }
 step() { printf '\n== %s\n' "$*"; }

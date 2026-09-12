@@ -423,7 +423,9 @@ def _cmd_doctor(_args: argparse.Namespace) -> int:
 
     try:
         key = core.get_api_key()
-        check("API key found", bool(key), f"{key[:11]}...{key[-4:]} ({len(key)} chars)")
+        # Enough to tell one key from another, not enough to be worth shoulder-surfing:
+        # doctor output gets pasted into issues and chat windows.
+        check("API key found", bool(key), f"{key[:8]}... ({len(key)} chars)")
     except core.OpenRouterError as exc:
         check("API key found", False, str(exc))
         return 1
