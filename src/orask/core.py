@@ -20,11 +20,11 @@ import random
 import re
 import socket
 import stat
+import tempfile
 import threading
 import time
 import urllib.error
 import urllib.request
-import uuid
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
@@ -564,9 +564,15 @@ def _write_json_atomic(
     """
     tmp: Path | None = None
     try:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        tmp = target.with_name(f"{target.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
-        tmp.write_text(json.dumps(payload, indent=indent), encoding="utf-8")
+        target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if target.is_symlink():
+            return False
+        fd, filename = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp", dir=target.parent)
+        tmp = Path(filename)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=indent)
+            handle.flush()
+            os.fsync(handle.fileno())
         tmp.replace(target)
         return True
     except OSError:
@@ -1013,6 +1019,38 @@ def denied_by_policy(path: Path, patterns: list[str]) -> str | None:
     return None
 
 
+def _open_regular_fd(path: Path, flags: int = os.O_RDONLY) -> int:
+    """Open a regular file without following a swapped leaf or ancestor symlink.
+
+    Walk the already chosen path using directory descriptors without re-resolving it.
+    Callers own the returned descriptor; every intermediate descriptor closes here.
+    """
+    parent = path.absolute().parent
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    directory = os.open(parent.anchor, directory_flags)
+    try:
+        for part in parent.parts[1:]:
+            child = os.open(part, directory_flags, dir_fd=directory)
+            os.close(directory)
+            directory = child
+        fd = os.open(path.name, flags | os.O_NONBLOCK | os.O_NOFOLLOW, 0o600,
+                     dir_fd=directory)
+    finally:
+        os.close(directory)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise OSError(f"{path} is not a regular file (fifo, device or socket); skipped")
+        if flags & (os.O_WRONLY | os.O_RDWR):
+            if info.st_nlink != 1:
+                raise OSError(f"refusing to write a hardlinked state file: {path}")
+            os.fchmod(fd, 0o600)
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
 def _slurp(path: Path, ceiling: int) -> tuple[bytes, str | None]:
     """Read a regular file up to `ceiling` bytes, or say why it was skipped.
 
@@ -1022,9 +1060,8 @@ def _slurp(path: Path, ceiling: int) -> tuple[bytes, str | None]:
     the check and the open. O_NOFOLLOW is safe because the caller passes an
     already-resolved path, and it closes the last symlink race.
     """
-    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
-        fd = os.open(path, flags)
+        fd = _open_regular_fd(path)
     except OSError as exc:
         return b"", f"could not open {path}: {exc.strerror or exc}"
     try:
@@ -1044,6 +1081,8 @@ def _slurp(path: Path, ceiling: int) -> tuple[bytes, str | None]:
                 break
             chunks.append(block)
             remaining -= len(block)
+        if remaining == 0:
+            return b"", f"{path} grew beyond the {_human_bytes(ceiling)} read ceiling; skipped"
         return b"".join(chunks), None
     except OSError as exc:
         return b"", f"could not read {path}: {exc.strerror or exc}"
@@ -1053,9 +1092,8 @@ def _slurp(path: Path, ceiling: int) -> tuple[bytes, str | None]:
 
 def _peek(path: Path, count: int = 16) -> bytes:
     """First few bytes, for sniffing the real type. Never raises."""
-    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
-        fd = os.open(path, flags)
+        fd = _open_regular_fd(path)
     except OSError:
         return b""
     try:
@@ -1969,7 +2007,7 @@ def usable_turns(messages: Iterable[Any]) -> list[dict[str, Any]]:
     """
     out: list[dict[str, Any]] = []
     for message in messages:
-        if not isinstance(message, dict):
+        if not isinstance(message, dict) or message.get("role") not in ("user", "assistant"):
             continue
         content = message.get("content")
         if isinstance(content, list):
@@ -1986,17 +2024,37 @@ def usable_turns(messages: Iterable[Any]) -> list[dict[str, Any]]:
     return out
 
 
+def _read_thread_blob(path: Path) -> dict[str, Any] | None:
+    raw, error = _slurp(path, MAX_FILE_BYTES)
+    if error:
+        return None
+    try:
+        blob = json.loads(raw)
+    except (ValueError, UnicodeError):
+        return None
+    if not isinstance(blob, dict) or not isinstance(blob.get("messages"), list):
+        return None
+    return blob
+
+
 def load_thread(name: str | None) -> list[dict[str, Any]]:
     if not name:
         return []
-    path = _thread_path(name)
-    if not path.is_file():
-        return []
-    try:
-        blob = json.loads(path.read_text(encoding="utf-8"))
-        return usable_turns(blob.get("messages") or [])
-    except (OSError, json.JSONDecodeError):
-        return []
+    blob = _read_thread_blob(_thread_path(name))
+    return usable_turns(blob["messages"]) if blob else []
+
+
+def _lock_exclusive(fd: int) -> None:
+    """Bound contention without proceeding unlocked or losing ordinary concurrent writes."""
+    deadline = time.monotonic() + 10.0
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                raise TimeoutError("state-file lock remained busy for 10 seconds") from None
+            time.sleep(0.02)
 
 
 def save_thread(
@@ -2016,31 +2074,22 @@ def save_thread(
     if not name:
         return True
     path = _thread_path(name)
-    lock_handle = None
+    lock_fd = None
     try:
-        THREAD_DIR.mkdir(parents=True, exist_ok=True)
-        # Not a context manager: the handle has to stay open for the whole read-modify-write
-        # below, and it is closed in the finally block after the lock is released.
-        lock_handle = open(path.with_suffix(".lock"), "a+")  # noqa: SIM115
-        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
-    except OSError:
-        if lock_handle is not None:
-            lock_handle.close()
-        lock_handle = None  # proceed unlocked rather than lose the answer
-    try:
-        return _save_thread_locked(
-            path, name, question, answer, slug, annotations, attachments
-        )
+        THREAD_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+        lock_fd = _open_regular_fd(path.with_suffix(".lock"), os.O_WRONLY | os.O_CREAT)
+        # A stalled writer must not hold a paid response indefinitely. Ordinary concurrent
+        # turns wait briefly for the same stable lock inode, then merge the latest history.
+        _lock_exclusive(lock_fd)
+        return _save_thread_locked(path, name, question, answer, slug, annotations, attachments)
     except Exception:
-        # This runs after the call has been billed. No transcript problem, of any kind, may
-        # be allowed to destroy an answer the user has already paid for.
+        # Persistence follows billing. Return failure so ask() keeps the paid answer and
+        # reports that it was not saved; never continue a read-modify-write without a lock.
         return False
     finally:
-        if lock_handle is not None:
-            try:
-                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
-            finally:
-                lock_handle.close()
+        if lock_fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(lock_fd)  # closing releases the lock, including on failure
 
 
 def _save_thread_locked(
@@ -2052,7 +2101,10 @@ def _save_thread_locked(
     annotations: list[dict[str, Any]] | None = None,
     attachments: list[dict[str, Any]] | None = None,
 ) -> bool:
-    history = load_thread(name)
+    blob = _read_thread_blob(path)
+    if blob is None and (path.exists() or path.is_symlink()):
+        return False  # preserve an unreadable/corrupt transcript for recovery
+    history = usable_turns(blob["messages"]) if blob else []
     # The attachments ride on the user turn, which is where they were sent, so
     # a follow-up still has the document in front of it. Annotations alone do
     # not carry content: they only tell OpenRouter it has already parsed this
@@ -2085,9 +2137,8 @@ def list_threads() -> list[dict[str, Any]]:
         return []
     out = []
     for path in sorted(THREAD_DIR.glob("*.json")):
-        try:
-            blob = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+        blob = _read_thread_blob(path)
+        if blob is None:
             continue
         out.append(
             {
@@ -2106,11 +2157,13 @@ def list_threads() -> list[dict[str, Any]]:
 
 def log_call(entry: dict[str, Any]) -> None:
     try:
-        STATE_DIR.mkdir(parents=True, exist_ok=True)
-        with CALL_LOG.open("a", encoding="utf-8") as handle:
+        CALL_LOG.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        fd = _open_regular_fd(CALL_LOG, os.O_WRONLY | os.O_APPEND | os.O_CREAT)
+        with os.fdopen(fd, "a", encoding="utf-8") as handle:
+            _lock_exclusive(handle.fileno())
             handle.write(json.dumps({"ts": time.time(), **entry}) + "\n")
-    except OSError:
-        pass  # never fail a call because the log is unwritable
+    except (OSError, ValueError, TypeError):
+        pass  # metadata logging must not destroy a billed answer
 
 
 # The log is append-only and never rotated, so reads are bounded: `orask usage` asks for a
@@ -2119,29 +2172,33 @@ MAX_LOG_WINDOW_BYTES = 4 * 1024 * 1024
 
 
 def read_log(limit: int = 50) -> list[dict[str, Any]]:
-    """Most recent `limit` entries, read from the tail rather than the whole file."""
-    if not CALL_LOG.is_file() or limit <= 0:
+    """Recent object records, bounded to the last 4 MiB even for a huge log."""
+    if limit <= 0:
         return []
     try:
-        size = CALL_LOG.stat().st_size
-        window = min(size, max(int(limit) * 512, 65536), MAX_LOG_WINDOW_BYTES)
-        with CALL_LOG.open("rb") as handle:
-            handle.seek(size - window)
-            blob = handle.read(window)
-        text = blob.decode("utf-8", "replace")
-        if window < size:
-            # The first line is probably a fragment of an earlier record.
-            text = text.partition("\n")[2]
-        lines = text.splitlines()
+        fd = _open_regular_fd(CALL_LOG)
+        with os.fdopen(fd, "rb") as handle:
+            size = os.fstat(handle.fileno()).st_size
+            window = min(size, max(int(limit) * 512, 65536), MAX_LOG_WINDOW_BYTES)
+            while True:
+                handle.seek(size - window)
+                raw = handle.read(window)
+                if window < size:
+                    raw = raw.partition(b"\n")[2]
+                lines = raw.decode("utf-8", "replace").splitlines()
+                out = []
+                for line in lines:
+                    try:
+                        record = json.loads(line)
+                        if isinstance(record, dict):
+                            out.append(record)
+                    except ValueError:
+                        continue
+                if len(out) >= limit or window >= min(size, MAX_LOG_WINDOW_BYTES):
+                    return out[-limit:]
+                window = min(size, window * 2, MAX_LOG_WINDOW_BYTES)
     except OSError:
         return []
-    out = []
-    for line in lines[-limit:]:
-        try:
-            out.append(json.loads(line))
-        except json.JSONDecodeError:
-            continue
-    return out
 
 
 # --------------------------------------------------------------------------

@@ -573,3 +573,11 @@ as `"false"` cannot grant permission. Non-finite numeric settings fall back to
 safe defaults. File policy checks both the requested name and resolved target,
 including the API key file when `ORASK_CONFIG_DIR` relocates it. Provider-reported
 zero cost is authoritative and is not replaced with an estimated charge.
+
+Thread and call-log files are created with owner-only permissions. Transcript
+writes require a lock; if locking or persistence fails, the paid answer is
+returned with a save-failure note and existing history is preserved. Lock waits
+are bounded to ten seconds. Malformed transcripts are readable as empty history
+but are not overwritten until repaired. State reads refuse symlinks, and log
+writes also refuse hardlinks. Regular file reads check the descriptor and enforce
+the byte ceiling even if a file grows while it is being read.

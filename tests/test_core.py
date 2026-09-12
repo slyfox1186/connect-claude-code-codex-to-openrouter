@@ -1639,6 +1639,79 @@ try:
 except TypeError:
     check("justified medium never maps down to low", False)
 
+# ---- audit: private, recoverable thread persistence ------------------------
+
+with tempfile.TemporaryDirectory() as tmp:
+    saved_thread_dir, core.THREAD_DIR = core.THREAD_DIR, Path(tmp) / "threads"
+    old_umask = os.umask(0)
+    try:
+        core.save_thread("private name", "q", "a", "m")
+    finally:
+        os.umask(old_umask)
+    path = core._thread_path("private name")
+    check("new transcripts are private regardless of umask", path.stat().st_mode & 0o777 == 0o600)
+    listed_name = core.list_threads()[0]["name"]
+    check("listed thread names resume the same conversation",
+          core.load_thread(listed_name) == core.load_thread("private name"))
+    before = path.read_bytes()
+    with patch.object(core.fcntl, "flock", side_effect=OSError("lock unavailable")):
+        wrote = core.save_thread("private name", "q2", "a2", "m")
+    check("failed lock cannot cause an unlocked write",
+          wrote is False and path.read_bytes() == before)
+    for blob in ([], {"messages": 3}, {"messages": [None, {}, {"content": "x"}]}):
+        path.write_text(json.dumps(blob))
+        try:
+            check(f"corrupt thread shape is safely handled ({blob})",
+                  core.load_thread("private name") == [])
+        except (AttributeError, TypeError):
+            check(f"corrupt thread shape is safely handled ({blob})", False)
+    outside = Path(tmp) / "outside.json"
+    outside.write_text(json.dumps({"messages": [{"role": "user", "content": "PRIVATE"}]}))
+    path.unlink()
+    path.symlink_to(outside)
+    check("thread reads do not follow symlinks", core.load_thread("private name") == [])
+    core.THREAD_DIR = saved_thread_dir
+with tempfile.TemporaryDirectory() as tmp:
+    saved_log, core.CALL_LOG = core.CALL_LOG, Path(tmp) / "calls.jsonl"
+    old_umask = os.umask(0)
+    try:
+        core.log_call({"ok": True})
+    finally:
+        os.umask(old_umask)
+    check("call logs are private regardless of umask",
+          core.CALL_LOG.stat().st_mode & 0o777 == 0o600)
+    core.CALL_LOG.write_text('[]\n42\n{"ok": true}\n')
+    check("non-object log records are ignored", core.read_log() == [{"ok": True}])
+    core.CALL_LOG = saved_log
+
+
+# Persistence failure must leave the old bytes intact and remove temporary output.
+with tempfile.TemporaryDirectory() as tmp:
+    target = Path(tmp) / "record.json"
+    target.write_text('{"original": true}')
+    with patch.object(Path, "replace", side_effect=OSError("disk unavailable")):
+        check("atomic replacement failure is reported",
+              not core._write_json_atomic(target, {"new": True}))
+    check("atomic failure preserves old data and removes temp files",
+          target.read_text() == '{"original": true}' and list(Path(tmp).iterdir()) == [target])
+    symlink = Path(tmp) / "link.json"
+    symlink.symlink_to(target)
+    check("atomic writes refuse symlink destinations",
+          not core._write_json_atomic(symlink, {}) and target.read_text() == '{"original": true}')
+    core.CALL_LOG = symlink
+    core.log_call({"ok": True})
+    check("logging cannot follow a planted symlink", target.read_text() == '{"original": true}')
+    core.CALL_LOG = saved_log
+    small = Path(tmp) / "small"
+    small.write_bytes(b"a")
+    with patch.object(core.os, "read", return_value=b"abc"):
+        check("a growing file cannot exceed its read ceiling", core._slurp(small, 2)[1] is not None)
+    directory = Path(tmp) / "alias"
+    directory.symlink_to(Path(tmp), target_is_directory=True)
+    check("reads refuse symlink ancestors after path selection",
+          core._slurp(directory / "small", 20)[1] is not None)
+
+
 print()
 if FAILS:
     print(f"{len(FAILS)} of {CHECKS} checks failed: {', '.join(FAILS)}")

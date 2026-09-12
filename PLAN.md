@@ -49,7 +49,7 @@ trees and fake external commands. Offline tests must never reach OpenRouter.
   being treated as free, relocated key files and denied symlink names escaping
   policy. Validate at input boundaries; preserve true zero pricing and explicit
   CLI overrides. Test the actual ask path with a captured offline transport.
-- [ ] Persistence (`core.py`, offline tests): test permissive umask, lock failure,
+- [x] Persistence (`core.py`, offline tests): test permissive umask, lock failure,
   corrupt JSON shapes, thread-list names usable for follow-ups, atomic temporary
   cleanup and symlink handling. Keep paid answers even if persistence fails;
   never continue read-modify-write without its lock. Do not silently migrate or
@@ -162,3 +162,15 @@ no isolated controlled quality comparison; do not claim measured reviewer gains.
 Gate: ./check.sh passes 339 engine assertions, real offline MCP protocol tests,
 Ruff, mypy and Bash syntax. Earlier red runs reproduced 10 incomplete-response
 and 8 effort-policy failures before fixes. Live protocol suite now uses max effort.
+
+Persistence regression: 8 failures reproduced before fixes. New transcripts/logs
+are private under umask 000; failed locks never permit writes, corrupt transcript
+shapes and symlinks are handled safely, temporary replacement cleanup preserves
+old data, and growth/ancestor-symlink reads are refused. Existing six-worker
+concurrent transcript test still passes. Full gate passes after this change.
+The thread-name concern was rejected: listed legacy-compatible names already
+resume the same stored conversation, confirmed by the regression.
+
+Live protocol validation after budget changes passed every check: real max-effort
+single calls, complete and partial panels, discovery, malformed-argument recovery,
+and a PDF codeword returned from the attachment. No low-effort calls were used.
