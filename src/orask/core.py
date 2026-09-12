@@ -16,6 +16,7 @@ import json
 import os
 import socket
 import stat
+import threading
 import uuid
 import random
 import re
@@ -381,6 +382,14 @@ def _http_message(code: int, detail: str) -> str:
 
 _catalog_cache: list[dict[str, Any]] | None = None
 _catalog_fetched_at: float = 0.0
+_catalog_failed_at: float = 0.0
+# One fetch at a time. A panel fans out into threads that all miss an empty cache at the same
+# moment, and without this each of them issues its own /models request.
+_catalog_lock = threading.Lock()
+# A single ask() looks the catalogue up five or six times. With the network down and nothing
+# cached, every one of those was a full retry cycle, so the call stalled for tens of seconds
+# before failing. One attempt per cooldown is enough to notice the network came back.
+CATALOG_FAILURE_COOLDOWN_S = 60.0
 
 
 def _valid_catalog(data: Any) -> bool:
@@ -397,18 +406,35 @@ def get_catalog(refresh: bool = False, allow_stale: bool = True) -> list[dict[st
     Never raises on a network failure when a cached copy exists: model lookup
     degrading to a stale catalogue beats the whole tool going down.
     """
-    global _catalog_cache, _catalog_fetched_at
+    global _catalog_cache, _catalog_fetched_at, _catalog_failed_at
     ttl = _float_setting("catalog_ttl_s", 21600.0)
 
     # The MCP server is long-lived: without a TTL on the in-memory copy it would
     # serve the catalogue it started with for as long as the process lives, and
     # silently use stale prices, efforts and model lists.
-    if (
-        _catalog_cache is not None
-        and not refresh
-        and (time.time() - _catalog_fetched_at) < ttl
-    ):
-        return _catalog_cache
+    def _fresh() -> list[dict[str, Any]] | None:
+        if _catalog_cache is not None and not refresh:
+            if (time.time() - _catalog_fetched_at) < ttl:
+                return _catalog_cache
+        return None
+
+    hit = _fresh()
+    if hit is not None:
+        return hit
+
+    with _catalog_lock:
+        # Checked again inside the lock: another thread may have fetched while this one waited.
+        hit = _fresh()
+        if hit is not None:
+            return hit
+        return _fetch_catalog(refresh, allow_stale, ttl)
+
+
+def _fetch_catalog(
+    refresh: bool, allow_stale: bool, ttl: float
+) -> list[dict[str, Any]]:
+    """The slow half of get_catalog. Only ever called with _catalog_lock held."""
+    global _catalog_cache, _catalog_fetched_at, _catalog_failed_at
     cached: list[dict[str, Any]] | None = None
     cache_age = float("inf")
 
@@ -428,6 +454,24 @@ def get_catalog(refresh: bool = False, allow_stale: bool = True) -> list[dict[st
         _catalog_fetched_at = time.time() - cache_age
         return cached
 
+    def _fall_back_to_stale() -> list[dict[str, Any]] | None:
+        global _catalog_cache, _catalog_fetched_at
+        if cached and allow_stale:
+            _catalog_cache = cached
+            _catalog_fetched_at = time.time() - min(cache_age, ttl)
+            return cached
+        return None
+
+    if not refresh and (time.time() - _catalog_failed_at) < CATALOG_FAILURE_COOLDOWN_S:
+        stale = _fall_back_to_stale()
+        if stale is not None:
+            return stale
+        raise OpenRouterError(
+            "the OpenRouter model catalogue is unreachable; the last attempt failed less than "
+            f"{int(CATALOG_FAILURE_COOLDOWN_S)}s ago, so this one was not retried. Check the "
+            "network, then try again."
+        )
+
     try:
         data = _request("GET", "/models", timeout=45.0, retries=2).get("data") or []
         if not _valid_catalog(data):
@@ -435,12 +479,13 @@ def get_catalog(refresh: bool = False, allow_stale: bool = True) -> list[dict[st
         _write_json_atomic(CATALOG_CACHE, {"fetched_at": time.time(), "data": data})
         _catalog_cache = data
         _catalog_fetched_at = time.time()
+        _catalog_failed_at = 0.0
         return data
     except OpenRouterError:
-        if cached and allow_stale:
-            _catalog_cache = cached
-            _catalog_fetched_at = time.time() - min(cache_age, ttl)
-            return cached
+        _catalog_failed_at = time.time()
+        stale = _fall_back_to_stale()
+        if stale is not None:
+            return stale
         raise
 
 
@@ -807,11 +852,23 @@ def _fuzzy(term: str, catalog: list[dict[str, Any]]) -> tuple[str | None, str | 
     return best.get("id"), note
 
 
+_index_source: list[dict[str, Any]] | None = None
+_index: dict[str, dict[str, Any]] = {}
+
+
 def _find(slug: str) -> dict[str, Any]:
-    for model in _catalog_or_empty():
-        if model.get("id") == slug:
-            return model
-    return {}
+    """The catalogue entry for a slug, or an empty dict.
+
+    Indexed rather than scanned: ask() looks a model up four to six times per call. The index
+    is keyed to the identity of the list it was built from, so replacing _catalog_cache - which
+    the test suite does directly - rebuilds it instead of serving a stale answer.
+    """
+    global _index_source, _index
+    catalog = _catalog_or_empty()
+    if catalog is not _index_source:
+        _index = {str(m.get("id")): m for m in catalog if m.get("id")}
+        _index_source = catalog
+    return _index.get(slug) or {}
 
 
 def clamp_effort(slug: str, effort: str | None) -> tuple[str | None, str | None]:
@@ -1820,14 +1877,18 @@ def log_call(entry: dict[str, Any]) -> None:
         pass  # never fail a call because the log is unwritable
 
 
+# The log is append-only and never rotated, so reads are bounded: `orask usage` asks for a
+# hundred thousand entries, which at 512 bytes apiece would be a 51 MB read on every call.
+MAX_LOG_WINDOW_BYTES = 4 * 1024 * 1024
+
+
 def read_log(limit: int = 50) -> list[dict[str, Any]]:
-    """Most recent `limit` entries. The log is append-only and never rotated,
-    so only the tail is read rather than the whole file."""
+    """Most recent `limit` entries, read from the tail rather than the whole file."""
     if not CALL_LOG.is_file() or limit <= 0:
         return []
     try:
         size = CALL_LOG.stat().st_size
-        window = min(size, max(int(limit) * 512, 65536))
+        window = min(size, max(int(limit) * 512, 65536), MAX_LOG_WINDOW_BYTES)
         with CALL_LOG.open("rb") as handle:
             handle.seek(size - window)
             blob = handle.read(window)
@@ -2351,5 +2412,12 @@ def account_usage() -> dict[str, Any]:
         "bridge_calls_billed": len([e for e in entries if _num(e, "cost_usd") > 0]),
         "bridge_spend_usd": round(spend, 4),
         "bridge_spend_last_24h_usd": round(spend_day, 4),
+        # Said out loud, because the read is bounded: a log past the window would otherwise
+        # report a total that quietly stops being the whole story.
+        "bridge_spend_covers": (
+            f"the most recent {MAX_LOG_WINDOW_BYTES // (1024 * 1024)} MB of the call log"
+            if CALL_LOG.is_file() and CALL_LOG.stat().st_size > MAX_LOG_WINDOW_BYTES
+            else "every logged call"
+        ),
         "log_file": str(CALL_LOG),
     }

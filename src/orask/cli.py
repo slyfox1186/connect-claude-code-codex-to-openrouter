@@ -66,6 +66,11 @@ def _print_result(result: dict[str, Any], show_reasoning: bool) -> None:
 
 # How long to wait for data on a stdin we cannot trust to ever close.
 STDIN_WAIT_S = float(os.environ.get("ORASK_STDIN_WAIT", "0.5"))
+# Hard ceilings for every shape of stdin. Generous enough that a real `git diff | orask` goes
+# through untouched, small enough that a producer which never stops - `yes | orask ask ...` -
+# cannot hold the CLI open or grow the buffer without bound.
+STDIN_MAX_BYTES = 32 * 1024 * 1024
+STDIN_DEADLINE_S = float(os.environ.get("ORASK_STDIN_DEADLINE", "30"))
 
 
 def read_stdin_safely(wait: float = STDIN_WAIT_S) -> str:
@@ -75,9 +80,10 @@ def read_stdin_safely(wait: float = STDIN_WAIT_S) -> str:
     background job, daemon or agent shell tool, fd 0 is often a socket whose
     write end is never closed, and the read blocks forever.
 
-    A regular file or a real pipe is safe to drain (a redirect has an EOF, and a
-    pipe's writer closes it on exit). Anything else - a socket, a character
-    device - is read only while data keeps arriving, then abandoned.
+    Every shape goes through select, so nothing can block indefinitely. A regular file or a
+    real pipe is waited on until the deadline, because a slow producer is normal and a
+    redirect has a genuine EOF. Anything else - a socket, a character device - is read only
+    while data keeps arriving. Both are bounded by the byte ceiling and the deadline.
     """
     if sys.stdin is None or sys.stdin.isatty():
         return ""
@@ -87,16 +93,16 @@ def read_stdin_safely(wait: float = STDIN_WAIT_S) -> str:
     except (OSError, ValueError, AttributeError):
         return ""
 
-    if stat.S_ISREG(mode) or stat.S_ISFIFO(mode):
-        try:
-            return sys.stdin.read()
-        except (OSError, UnicodeDecodeError):
-            return ""
-
+    drainable = stat.S_ISREG(mode) or stat.S_ISFIFO(mode)
+    deadline = time.monotonic() + STDIN_DEADLINE_S
     chunks: list[bytes] = []
-    while True:
+    total = 0
+    while total < STDIN_MAX_BYTES:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
         try:
-            ready, _, _ = select.select([fd], [], [], wait)
+            ready, _, _ = select.select([fd], [], [], remaining if drainable else wait)
         except (OSError, ValueError):
             break
         if not ready:
@@ -108,7 +114,8 @@ def read_stdin_safely(wait: float = STDIN_WAIT_S) -> str:
         if not data:  # EOF
             break
         chunks.append(data)
-    return b"".join(chunks).decode("utf-8", "replace")
+        total += len(data)
+    return b"".join(chunks)[:STDIN_MAX_BYTES].decode("utf-8", "replace")
 
 
 def _gather_context(args: argparse.Namespace) -> str | None:

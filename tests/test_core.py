@@ -13,6 +13,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -86,6 +87,7 @@ FAKE = [
     },
 ]
 
+REAL_GET_CATALOG = core.get_catalog
 core._catalog_cache = FAKE
 core.get_catalog = lambda refresh=False, allow_stale=True: FAKE  # type: ignore[assignment]
 core._config_cache = None
@@ -1092,6 +1094,88 @@ check("an unresolvable model keeps its own slot", len(_mixed) == 2, str(len(_mix
 check("and is reported there rather than killing the panel",
       any("cannot resolve model" in str(r.get("error") or "").lower() for r in _mixed),
       str([r.get("error") for r in _mixed])[:90])
+
+
+# --------------------------------------------------------------------------
+# an outage must not cost a retry cycle per lookup, and stdin must stay bounded
+# --------------------------------------------------------------------------
+
+_attempts = {"n": 0}
+
+
+def _failing_request(method, path, payload=None, timeout=60.0, retries=3):
+    _attempts["n"] += 1
+    raise core.OpenRouterError("network error calling OpenRouter: unreachable")
+
+
+core.get_catalog = REAL_GET_CATALOG
+core._catalog_cache = None
+core._catalog_fetched_at = 0.0
+core._catalog_failed_at = 0.0
+core._request = _failing_request
+_refusals = []
+for _ in range(4):
+    try:
+        core.get_catalog()
+    except core.OpenRouterError as exc:
+        _refusals.append(str(exc))
+check("a catalogue outage is attempted once per cooldown, not once per lookup",
+      _attempts["n"] == 1, f"{_attempts['n']} network attempts for 4 lookups")
+check("and the later refusals say the retry was skipped on purpose",
+      len(_refusals) == 4 and "not retried" in _refusals[-1], _refusals[-1][:80])
+core._request = _no_network
+core._catalog_failed_at = 0.0
+core._catalog_cache = FAKE
+core._catalog_fetched_at = time.time()
+core.get_catalog = lambda refresh=False, allow_stale=True: FAKE
+check("the catalogue index follows a replaced cache rather than going stale",
+      core._find("z-ai/glm-5.3").get("name") == "Z.AI: GLM 5.3")
+
+from orask import cli as _cli  # noqa: E402
+
+
+class _FakeStdin:
+    def __init__(self, fd):
+        self._fd = fd
+
+    def isatty(self):
+        return False
+
+    def fileno(self):
+        return self._fd
+
+
+_saved_stdin = sys.stdin
+_saved_deadline = _cli.STDIN_DEADLINE_S
+_saved_max = _cli.STDIN_MAX_BYTES
+_cli.STDIN_DEADLINE_S = 1.0
+
+# a pipe whose writer never closes is what `yes | orask ask ...` is: the old code called
+# sys.stdin.read() on it and never came back
+_read_fd, _write_fd = os.pipe()
+os.write(_write_fd, b"y\n" * 2000)
+sys.stdin = _FakeStdin(_read_fd)
+_started = time.monotonic()
+_got = _cli.read_stdin_safely(wait=0.05)
+_elapsed = time.monotonic() - _started
+check("a pipe that never closes is drained and then let go",
+      len(_got) == 4000 and _elapsed < 5, f"{len(_got)} chars in {_elapsed:.1f}s")
+os.close(_read_fd)
+os.close(_write_fd)
+
+# and the byte ceiling holds
+_read_fd, _write_fd = os.pipe()
+os.write(_write_fd, b"z" * 4000)
+sys.stdin = _FakeStdin(_read_fd)
+_cli.STDIN_MAX_BYTES = 100
+_got = _cli.read_stdin_safely(wait=0.05)
+check("the stdin byte ceiling holds", len(_got) == 100, f"{len(_got)} chars")
+os.close(_read_fd)
+os.close(_write_fd)
+
+sys.stdin = _saved_stdin
+_cli.STDIN_DEADLINE_S = _saved_deadline
+_cli.STDIN_MAX_BYTES = _saved_max
 
 
 print()
