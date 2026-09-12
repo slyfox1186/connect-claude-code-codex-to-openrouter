@@ -27,7 +27,7 @@ bin/openrouter-mcp        MCP stdio launcher
 install.sh                idempotent registration for both agents
 check.sh                  the gate: lint, types, shell syntax, offline tests
 pyproject.toml            ruff and mypy config (no [project] table, on purpose)
-tests/test_core.py        227 offline checks, no network or key needed
+tests/test_core.py        231 offline checks, no network or key needed
 tests/test_mcp_stdio.py   end-to-end MCP protocol test (spends a few cents)
 ```
 
@@ -262,6 +262,13 @@ the full retry set. Read timeouts are never retried, for the same reason.
 different fix, so `image_too_large`, `unsupported_image_format`, `invalid_image`
 and the rest are turned into the sentence that says what to do instead of a bare
 HTTP 400. An unrecognised type is still printed rather than swallowed.
+
+**The OCR page charge is inside the guard, not outside it.** `mistral-ocr` bills per
+1,000 pages on top of tokens, which a token-only estimate cannot see: a long scan
+could pass the $1.00 guard and then bill separately. There is no way to count pages
+before the parse, so they are inferred from the file size at a deliberately small
+bytes-per-page figure, priced from `mistral_ocr_usd_per_1k_pages`, and folded into
+the estimate. The answer says the count is inferred rather than parsed.
 
 **The cost guard estimates attachments, and says that it is estimating.**
 OpenRouter has no preflight token-counting endpoint and does not publish how a

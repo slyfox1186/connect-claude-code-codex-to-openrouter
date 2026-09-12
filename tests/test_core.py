@@ -1220,6 +1220,43 @@ for _path in ("/proc/cpuinfo", "/proc/meminfo", "/home/u/project/config.py"):
           core.denied_by_policy(Path(_path), core.DEFAULT_DENY_PATTERNS) is None)
 
 
+# ---- the OCR page charge is part of the estimate, not a surprise afterwards ----
+_big_pdf = {"type": "file", "file": {"file_data": "data:application/pdf;base64,"
+                                     + "A" * 8_000_000, "filename": "scan.pdf"}}
+_summary = core.summarize_parts([_big_pdf])
+check("the attachment summary reports pdf bytes", _summary["pdf_bytes"] > 5_000_000,
+      str(_summary["pdf_bytes"]))
+
+with tempfile.TemporaryDirectory() as tmp:
+    _scan = Path(tmp) / "scan.pdf"
+    _scan.write_bytes(PDF_TINY + b"\x00" * 3_000_000)
+    core._config_cache = dict(cfg, max_cost_usd_per_call=1.0,
+                              mistral_ocr_usd_per_1k_pages=200.0)
+    try:
+        core.ask("q", model="kimi", files=[str(_scan)], pdf_engine="mistral-ocr",
+                 max_tokens=100)
+        check("an ocr page charge is counted by the cost guard", False, "guard did not fire")
+    except core.OpenRouterError as exc:
+        check("an ocr page charge is counted by the cost guard",
+              "over the" in str(exc), str(exc)[:80])
+    except AssertionError:
+        check("an ocr page charge is counted by the cost guard", False,
+              "reached the network, so the charge was not priced")
+    # the same file on the free engine must not be charged for pages
+    core._request = lambda method, path, payload=None, timeout=60.0, retries=3: _answered
+    _res = core.ask("q", model="kimi", files=[str(_scan)], pdf_engine="cloudflare-ai",
+                    max_tokens=100)
+    check("the free engine adds no page charge",
+          not any("bills per page" in n for n in _res["notes"]), str(_res["notes"])[:90])
+    core._config_cache = cfg  # back to the real per-page rate
+    _res = core.ask("q", model="kimi", files=[str(_scan)], pdf_engine="mistral-ocr",
+                    max_tokens=100)
+    check("and the ocr estimate says it is inferred from the file size",
+          any("upper bound" in n for n in _res["notes"]), str(_res["notes"])[:90])
+    core._request = _no_network
+    core._config_cache = cfg
+
+
 print()
 if FAILS:
     print(f"{len(FAILS)} of {CHECKS} checks failed: {', '.join(FAILS)}")

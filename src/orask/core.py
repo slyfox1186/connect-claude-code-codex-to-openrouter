@@ -117,6 +117,14 @@ MAGIC_SIGNATURES = (
 
 PDF_ENGINES = ("cloudflare-ai", "mistral-ocr", "native")
 
+# mistral-ocr bills per 1,000 pages on top of tokens, and that charge is invisible to a
+# token-only estimate: a long scan can pass a $1.00 guard and then bill separately. There is
+# no page count before the parse, so pages are estimated from the file size. A scanned page is
+# usually 100-500 KB, so 50 KB counts more pages than there really are and the guard errs
+# toward refusing rather than toward a surprise invoice.
+PDF_BYTES_PER_PAGE = 50_000
+MISTRAL_OCR_USD_PER_1K_PAGES = 2.0
+
 # Directories that are never what someone means by "send this folder".
 SKIP_DIRS = {
     ".git", ".hg", ".svn", "node_modules", "__pycache__", ".venv", "venv",
@@ -196,6 +204,7 @@ _DEFAULTS: Config = {
     "max_dir_files": 50,
     "thread_attachment_bytes": 4 * 1024 * 1024,
     "pdf_engine": "cloudflare-ai",
+    "mistral_ocr_usd_per_1k_pages": MISTRAL_OCR_USD_PER_1K_PAGES,
     "max_cost_usd_per_call": 1.0,
     "catalog_ttl_s": 21600,
     "thread_max_messages": 20,
@@ -1666,6 +1675,7 @@ def summarize_parts(parts: Iterable[dict[str, Any]]) -> dict[str, Any]:
     """
     counts = {"image": 0, "pdf": 0, "audio": 0}
     tokens = 0.0
+    pdf_bytes = 0.0
     for part in parts:
         if not isinstance(part, dict):
             continue
@@ -1680,8 +1690,11 @@ def summarize_parts(parts: Iterable[dict[str, Any]]) -> dict[str, Any]:
         elif kind == "file":
             counts["pdf"] += 1
             blob = ((part.get("file") or {}).get("file_data")) or ""
+            # base64 carries three bytes in every four characters
+            pdf_bytes += len(blob) * 0.75
             tokens += len(blob) * 0.75 * TOKENS_PER_PDF_BYTE
     counts["tokens"] = int(tokens)
+    counts["pdf_bytes"] = int(pdf_bytes)
     counts["total"] = counts["image"] + counts["pdf"] + counts["audio"]
     return counts
 
@@ -2074,8 +2087,30 @@ def ask(
             "or pass max_tokens to choose your own."
         )
 
+    # Resolved before the guard runs, because which engine reads the PDF changes what the
+    # call costs. cloudflare-ai is free, mistral-ocr is not.
+    engine = str(pdf_engine or cfg.get("pdf_engine") or "cloudflare-ai").strip().lower()
+    if engine not in PDF_ENGINES:
+        notes.append(
+            f"pdf_engine '{engine}' is not one of {', '.join(PDF_ENGINES)}; used cloudflare-ai"
+        )
+        engine = "cloudflare-ai"
+
     guard = _float_setting("max_cost_usd_per_call", 1.0)
     estimate, priced = estimate_call_cost(slug, billable, limit)
+
+    pdf_bytes = int(attached.get("pdf_bytes") or 0)
+    if engine == "mistral-ocr" and pdf_bytes:
+        rate = _float_setting("mistral_ocr_usd_per_1k_pages", MISTRAL_OCR_USD_PER_1K_PAGES)
+        pages = max(1, (pdf_bytes + PDF_BYTES_PER_PAGE - 1) // PDF_BYTES_PER_PAGE)
+        ocr = (pages / 1000.0) * rate
+        estimate += ocr
+        notes.append(
+            f"mistral-ocr bills per page on top of tokens. About {pages} page(s) estimated "
+            f"from {_human_bytes(pdf_bytes)} of PDF, roughly {fmt_usd(ocr)}, which is included "
+            "in the cost guard. That page count is inferred from the file size, not from "
+            "parsing the document, so treat it as an upper bound rather than an invoice."
+        )
     if guard and not allow_expensive:
         if not priced:
             policy = str(cfg.get("cost_guard_on_unknown_pricing") or "warn").lower()
@@ -2119,16 +2154,8 @@ def ask(
 
     if fresh["pdf"] or attached["pdf"]:
         # OpenRouter parses the PDF before the model sees it, which is why a PDF
-        # attaches to any model at all. The engine decides what that costs:
-        # cloudflare-ai is free and fine for a text PDF, mistral-ocr bills per
-        # 1,000 pages and is the one that can read a scan.
-        engine = str(pdf_engine or cfg.get("pdf_engine") or "cloudflare-ai").strip().lower()
-        if engine not in PDF_ENGINES:
-            notes.append(
-                f"pdf_engine '{engine}' is not one of {', '.join(PDF_ENGINES)}; "
-                "used cloudflare-ai"
-            )
-            engine = "cloudflare-ai"
+        # attaches to any model at all. The engine was resolved above, since it
+        # changes what the call costs.
         payload["plugins"] = [{"id": "file-parser", "pdf": {"engine": engine}}]
         if fresh["pdf"]:
             notes.append(
