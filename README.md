@@ -27,7 +27,7 @@ bin/openrouter-mcp        MCP stdio launcher
 install.sh                idempotent registration for both agents
 check.sh                  the gate: lint, types, shell syntax, offline tests
 pyproject.toml            ruff and mypy config (no [project] table, on purpose)
-tests/test_core.py        231 offline checks, no network or key needed
+tests/test_core.py        232 offline checks, no network or key needed
 tests/test_mcp_stdio.py   end-to-end MCP protocol test (spends a few cents)
 ```
 
