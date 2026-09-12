@@ -2,7 +2,7 @@
 topic: typescript
 triggers: writing or reviewing TypeScript, tsconfig choices, API response typing, async code, React state and effects, a type error that is hard to read
 source: written from scratch
-verified: 2026-09-11
+verified: 2026-09-12
 ---
 
 # TypeScript
@@ -29,11 +29,12 @@ lies to it. Most TypeScript bugs are one of those two failing.
 
 `strict` alone leaves the biggest hole open: without
 `noUncheckedIndexedAccess`, `arr[i]` is typed `T` even when the array is empty,
-so every out-of-range read is invisible to the compiler. Turn it on early; on an
-existing codebase it produces a lot of findings and every one is real.
+so out-of-range indexed reads can pass type checking. Turn it on early; handle
+`undefined` or restructure iteration so the compiler can establish safety.
 
-`skipLibCheck` is the one pragmatic loosening — it skips `.d.ts` files you did
-not write and cannot fix.
+`skipLibCheck` skips checking declaration files, including your own `.d.ts`
+files. It can speed builds, but can hide inconsistent declarations. See the
+[compiler option documentation](https://www.typescriptlang.org/tsconfig/skipLibCheck.html).
 
 ## Lying to the compiler
 
@@ -64,9 +65,9 @@ branch cost nothing.
 
 ## Data from outside the program
 
-Anything from `fetch`, `JSON.parse`, `localStorage`, a query string, a form or a
-database driver is `unknown` no matter what the annotation says. An interface
-does not validate at runtime.
+Treat external data as unvalidated until its shape is checked. Assign parsed
+JSON to `unknown` at the boundary even when an API returns `any`; an interface
+or generic return annotation does not validate a runtime response.
 
 Parse at the boundary with a schema validator (zod, valibot, typebox) and derive
 the type from the schema so the two cannot drift:
@@ -109,27 +110,37 @@ switch (r.status) {
 }
 ```
 
-Prefer a const union to an enum. `const enum` breaks under `isolatedModules`,
-and a numeric enum accepts any number.
+Prefer a literal union or an `as const` object when no enum runtime object is
+needed. `isolatedModules` rejects references to ambient `const enum` members;
+locally declared const enums are allowed. Since TypeScript 5.0, numeric enums
+reject out-of-domain numeric literals, although number-typed values can still
+be assigned. See [isolatedModules](https://www.typescriptlang.org/tsconfig/isolatedModules.html)
+and the [5.0 enum changes](https://www.typescriptlang.org/docs/handbook/release-notes/typescript-5-0.html#enum-overhaul).
 
-`satisfies` checks a value against a type without widening it away:
+`satisfies` checks compatibility without replacing the expression's inferred
+type. Mutable string properties can still widen to `string`; use `as const`
+when you need literal property types:
 
 ```ts
-const routes = { home: "/", about: "/about" } satisfies Record<string, string>;
+const routes = { home: "/", about: "/about" } as const satisfies Record<string, string>;
 // routes.home is "/" here, not string
 ```
 
 ## Async
 
-A floating promise loses its rejection. `await` it, `void` it deliberately, or
-`.catch()` it. Turn on `@typescript-eslint/no-floating-promises`.
+Await a promise or attach a rejection handler. `void promise` may satisfy
+`@typescript-eslint/no-floating-promises`, but does not handle rejection; use
+`void work().catch(reportError)` for background work with an error handler.
+See the [rule's void guidance](https://typescript-eslint.io/rules/no-floating-promises/#ignorevoid).
 
 `array.forEach(async ...)` does not wait for anything. Use `for...of` with
 `await` for sequential work, or `Promise.all(array.map(async ...))` for
 parallel.
 
-`Promise.all` rejects on the first failure and abandons the rest.
-`Promise.allSettled` when partial success is the point.
+`Promise.all` rejects on the first failure; it does not cancel the other work.
+Use `Promise.allSettled` to await every outcome, or implement cancellation in
+the operations themselves when that is required. See the
+[Promise.all algorithm](https://tc39.es/ecma262/multipage/control-abstraction-objects.html#sec-promise.all).
 
 Always give a network call a timeout — `fetch` has none by default:
 
@@ -168,8 +179,9 @@ Every effect that subscribes, opens a socket, or starts a timer returns a
 cleanup function. Without it, strict-mode double-invocation and every unmount
 leak.
 
-Type props explicitly rather than inferring from `defaultProps`, and avoid
-`React.FC` — it adds an implicit `children` you may not want.
+Type props explicitly. `React.FC` does not add implicit `children` with React
+18+ types; declare `children?: React.ReactNode` or use `PropsWithChildren` when
+the component accepts children. See the [React 18 type changes](https://react.dev/blog/2022/03/08/react-18-upgrade-guide#updates-to-typescript-definitions).
 
 Derive state during render instead of syncing it in an effect. An effect that
 only calls `setState` from other state is a rerender loop waiting to happen.

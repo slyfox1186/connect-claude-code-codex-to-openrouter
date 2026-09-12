@@ -2,7 +2,7 @@
 topic: python
 triggers: writing or reviewing Python, async code, subprocess calls, file and path handling, config parsing, retries against an API, anything handling money or credentials
 source: written from scratch, with defects verified in this repository
-verified: 2026-09-11
+verified: 2026-09-12
 ---
 
 # Python
@@ -28,13 +28,14 @@ while saving the transcript, losing the answer it had just paid for.
 def _setting(key, default):
     try:
         return int(load_config().get(key, default))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return default
 ```
 
-Every numeric setting read from user-controlled config goes through a coercer
-like this. The rule generalises: work that happens *after* an irreversible
-action must not be able to raise.
+Integer settings need a coercer like this; floating-point settings also need
+`math.isfinite` and domain checks. Parsing a number does not establish that it
+is a valid timeout or price. Work after an irreversible action must preserve
+the result even when optional bookkeeping fails.
 
 **Persistence after a paid or irreversible operation is best effort.**
 
@@ -46,10 +47,11 @@ except Exception:
     return False
 ```
 
-**Never retry a non-idempotent POST on 5xx.** A 502 from a completions endpoint
-often arrives *after* the provider generated and billed the tokens; retrying
-buys the same answer twice. Retry `408` and `429` only. Read timeouts are not
-retryable for the same reason.
+**Do not retry a non-idempotent POST after an ambiguous failure.** A 502 from a
+completions endpoint can arrive after generation and billing. This bridge's
+POST retry policy permits only `408` and `429`, and excludes read timeouts.
+For another API, establish its idempotency and retry contract before choosing
+statuses; this bridge's policy is not a universal HTTP guarantee.
 
 ## Exceptions
 
@@ -57,7 +59,7 @@ retryable for the same reason.
 want a catch-all, write the reason beside it:
 
 ```python
-except Exception:  # noqa: BLE001
+except Exception as exc:
     # A panel slot swallows its own failure so one bad model cannot drop the rest.
     return {"ok": False, "error": str(exc)}
 ```
@@ -65,19 +67,21 @@ except Exception:  # noqa: BLE001
 Catch the narrowest type that can actually occur. `except (TypeError, ValueError)`
 beats `except Exception` every time you can name the failures.
 
-Never catch `BaseException` — you will swallow `KeyboardInterrupt` and
-`SystemExit`.
+Do not suppress `BaseException`: it includes `KeyboardInterrupt`, `SystemExit`
+and `asyncio.CancelledError`. Cleanup code that catches it must re-raise.
 
-Raise the exception type the caller's framework forwards. In an MCP server only
-`ToolError` reaches the calling agent intact; anything else becomes a useless
-"Error executing tool".
+Raise the exception type the caller's framework forwards. This repository's
+MCP 2.x server uses `ToolError` for actionable failures; unexpected exceptions
+are hidden behind the SDK's generic error message.
 
 ## Mutable defaults and late binding
 
 ```python
-def f(items=[]):        # shared across every call, forever
-def f(items=None):      # correct
-    items = items or []
+# A default of [] would be shared across calls.
+def f(items=None):
+    if items is None:
+        items = []
+    return items
 ```
 
 ```python
@@ -135,12 +139,15 @@ result = await asyncio.to_thread(blocking_call, arg)
 
 Never call `time.sleep`, `requests`, or a synchronous DB driver in a coroutine.
 
-A bare `asyncio.create_task(...)` whose result nobody awaits is a floating task:
-exceptions vanish and it can be garbage collected mid-flight. Hold a reference
-or await it.
+A bare `asyncio.create_task(...)` whose result nobody awaits can leave an
+exception unhandled, and the task can be garbage collected mid-flight. Keep a
+reference and retrieve its result or exception, or await it.
 
-`asyncio.gather` cancels siblings on the first exception. Use
-`return_exceptions=True` when one failure must not drop the rest.
+`asyncio.gather` normally propagates the first exception immediately; the other
+awaitables keep running. `return_exceptions=True` waits for all outcomes and
+returns exceptions alongside successful values. `TaskGroup` (Python 3.11+)
+cancels remaining tasks when a task raises a non-cancellation exception.
+See the [asyncio task documentation](https://docs.python.org/3/library/asyncio-task.html#running-tasks-concurrently).
 
 ## Typing
 
@@ -166,8 +173,9 @@ usually pointing at a real crash, not being pedantic.
 - Mutating a list while iterating it skips elements. Iterate a copy.
 - `logging` takes lazy args: `log.info("got %s", x)`, not an f-string, so the
   formatting cost is skipped when the level is off.
-- `functools.lru_cache` on a method keeps `self` alive forever.
-- Module-level state in a long-lived server never refreshes. If a cache needs to
+- `functools.lru_cache` on a method keeps `self` alive until its entries are
+  evicted or the cache is cleared; see the [cache lifetime documentation](https://docs.python.org/3/library/functools.html#functools.lru_cache).
+- Module-level state in a long-lived server does not refresh itself. If a cache needs to
   notice a changed file, give it a TTL or an mtime check, or document that a
   restart is required.
 
