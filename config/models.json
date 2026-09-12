@@ -31,13 +31,15 @@
   "default_model": "kimi",
   "default_panel": [
     "kimi",
-    "glm"
+    "glm",
+    "grok"
   ],
   "default_effort": "high",
   "default_role": "advisor",
   "aliases": {
     "kimi": "moonshotai/kimi-k3",
-    "glm": "z-ai/glm-5.3"
+    "glm": "z-ai/glm-5.3",
+    "grok": "x-ai/grok-4.6"
   },
   "allowed_models": [],
   "default_max_tokens": 32000,

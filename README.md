@@ -28,7 +28,7 @@ install.sh                idempotent registration for both agents
 check.sh                  the gate: lint, types, shell syntax, offline tests
 pyproject.toml            ruff and mypy config (no [project] table, on purpose)
 guides/                   local best-practice cheat sheets, served by read_guide
-tests/test_core.py        269 offline checks, no network or key needed
+tests/test_core.py        273 offline checks, no network or key needed
 tests/test_mcp_stdio.py   end-to-end MCP protocol test (spends a few cents)
 ```
 
@@ -292,8 +292,9 @@ actually arrived, and every recovery is reported back in the response so the nex
 call is made correctly.
 
 
-**Per-model reasoning efforts.** Kimi K3 and GLM 5.3 accept only
-`max`/`high`/`low`, so sending `medium` is invalid. `clamp_effort()` snaps any
+**Per-model reasoning efforts.** They genuinely differ: Kimi K3 and GLM 5.3
+accept `max`/`high`/`low` and reject `medium`, while Grok 4.6 accepts
+`xhigh`/`high`/`medium`/`low` and has no `max`. `clamp_effort()` snaps any
 requested effort onto what the target model actually advertises, rounding up on a
 tie, and says so in the response notes. Verified against the live catalogue.
 
@@ -482,6 +483,9 @@ Edit `aliases` in `config/models.json`:
 "aliases": { "kimi": "moonshotai/kimi-k3", "glm": "z-ai/glm-5.3",
              "grok": "x-ai/grok-4.6" }
 ```
+
+`default_panel` decides who answers a bare `orask panel`, and every alias there
+is one more billed call per panel.
 
 Find exact slugs with `orask models --search grok`. A user copy at
 `~/.config/openrouter/config.json` overrides the packaged file, and `aliases` and

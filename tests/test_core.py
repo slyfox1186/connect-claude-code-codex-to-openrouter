@@ -1262,6 +1262,22 @@ with tempfile.TemporaryDirectory() as tmp:
     core._config_cache = cfg
 
 
+# ---- the packaged roster has to be internally consistent ------------------
+# A default_panel entry that is not a real alias costs a failed billed call to
+# discover, and only for whoever runs a bare `orask panel` first.
+_packaged = json.loads(core.PACKAGED_CONFIG.read_text())
+_aliases = _packaged["aliases"]
+check("every default_panel entry is a configured alias or a full slug",
+      all(m in _aliases or "/" in m for m in _packaged["default_panel"]),
+      str([m for m in _packaged["default_panel"] if m not in _aliases and "/" not in m]))
+check("the default model is one of them",
+      _packaged["default_model"] in _aliases or "/" in _packaged["default_model"])
+check("every alias points at a full slug, not another alias",
+      all("/" in v for v in _aliases.values()), str(_aliases))
+check("the packaged aliases are the three in service",
+      set(_aliases) == {"kimi", "glm", "grok"}, str(sorted(_aliases)))
+
+
 # ---- the tool list cannot drift from the tools that exist -----------------
 # mcp_server cannot be imported here (that would need the mcp SDK, and the point
 # of this suite is that it does not). The decorators are read as text instead.

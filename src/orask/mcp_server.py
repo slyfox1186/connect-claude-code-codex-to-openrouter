@@ -44,9 +44,8 @@ Category picks never return an OpenAI, Anthropic or Google model: this bridge
 exists to fetch a view from outside the agent asking. Ask for one of those by
 full slug if you specifically want it.
 
-Configured aliases: kimi (Moonshot Kimi K3), glm (Z.ai GLM 5.3). Any other
-OpenRouter model can be reached by passing its full slug; use list_llm_models
-to find one.
+Any OpenRouter model can be reached by passing its full slug; use
+list_llm_models to find one. Short aliases are configured for these:
 
 Arguments are flat JSON, one plain string per argument, and `question` is
 always its own argument:
@@ -63,6 +62,23 @@ the per-call cost guard). Passing either is refused with a note unless the
 user has turned it on in their config. Relay that note rather than retrying:
 the user has to make that decision, not you.\
 """
+
+
+def _alias_index() -> str:
+    """The configured aliases, generated rather than written out.
+
+    This list used to be prose inside INSTRUCTIONS, so adding an alias to
+    config/models.json left the calling agent being told the old pair. Reading
+    it from config is the only way the two cannot disagree.
+    """
+    try:
+        aliases = core.load_config().get("aliases") or {}
+    except Exception:
+        # A bad config must never stop the server starting.
+        return ""
+    if not aliases:
+        return ""
+    return "\n" + "\n".join(f"  {k:<10} {v}" for k, v in sorted(aliases.items()))
 
 
 def _clean(value: str, limit: int) -> str:
@@ -106,6 +122,7 @@ def _guide_index() -> str:
     return "\n".join(lines)
 
 
+INSTRUCTIONS += _alias_index()
 INSTRUCTIONS += _guide_index()
 
 mcp = MCPServer(
