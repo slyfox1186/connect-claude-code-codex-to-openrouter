@@ -491,6 +491,78 @@ try:
 except core.OpenRouterError as exc:
     check("max_tokens=0 is rejected", "must be 1 or more" in str(exc))
 
+# ---- context window ------------------------------------------------------
+# kimi-k3 is 1048576 in FAKE; mistral-large is 262144 with an 8000 output ceiling.
+check(
+    "the published context window is read from the catalogue",
+    core.context_window("moonshotai/kimi-k3") == 1048576,
+    str(core.context_window("moonshotai/kimi-k3")),
+)
+check("an unknown model has no window", core.context_window("who/knows") == 0)
+
+_fit, _win, _notes = core.fit_context("moonshotai/kimi-k3", 1000, 32000)
+check("a prompt that fits leaves max_tokens alone", (_fit, _win, _notes) == (32000, 1048576, []))
+
+# 900k chars is about 250k tokens, so a 262144 window has ~11k left for the answer.
+_fit, _win, _notes = core.fit_context("mistralai/mistral-large-2512", 900000, 32000)
+check(
+    "max_tokens is lowered to the room left in the window",
+    _fit < 32000 and _fit >= core.MIN_ANSWER_TOKENS and _win == 262144,
+    f"{_fit} of {_win}",
+)
+check("lowering max_tokens is reported",
+      any("lowered max_tokens" in n for n in _notes), str(_notes))
+
+_fit, _win, _notes = core.fit_context("moonshotai/kimi-k3", 1000, 32000, requested_window=99999999)
+check(
+    "a requested window above the model's is clamped to the model's",
+    _win == 1048576 and any("cannot be raised" in n for n in _notes),
+    f"{_win} {_notes}",
+)
+
+_fit, _win, _notes = core.fit_context("moonshotai/kimi-k3", 1000, 32000, requested_window=4000)
+check(
+    "a smaller requested window budgets the answer down",
+    _win == 4000 and _fit < 32000,
+    f"{_fit} of {_win}",
+)
+
+try:
+    core.fit_context("mistralai/mistral-large-2512", 4000000, 32000)
+    check("a prompt that fills the window is refused", False, "no error raised")
+except core.OpenRouterError as exc:
+    check(
+        "a prompt that fills the window is refused",
+        "no room left to reply" in str(exc),
+        str(exc)[:80],
+    )
+
+_fit, _win, _notes = core.fit_context(
+    "mistralai/mistral-large-2512", 4000000, 32000, compress=True
+)
+check(
+    "context_compression turns that refusal into a capped answer",
+    _fit <= _win // 2 and _fit >= core.MIN_ANSWER_TOKENS
+    and any("compression" in n for n in _notes),
+    f"{_fit} {_notes}",
+)
+
+try:
+    core.ask("q", model="kimi", max_context_tokens=10)
+    check("an unusably small max_context_tokens is rejected", False, "no error raised")
+except core.OpenRouterError as exc:
+    check(
+        "an unusably small max_context_tokens is rejected",
+        "at least" in str(exc),
+        str(exc)[:80],
+    )
+
+check(
+    "context_compression only sends a plugin when someone decided",
+    core._tristate(None) is None and core._tristate("yes") is None
+    and core._tristate(False) is False and core._tristate(True) is True,
+)
+
 # ---- an unwritable state directory must not break anything ---------------
 with tempfile.TemporaryDirectory() as tmp:
     locked = Path(tmp) / "locked"

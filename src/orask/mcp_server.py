@@ -65,6 +65,14 @@ always its own argument:
 Never wrap a value in XML tags, and never fold the question into `context`.
 A long `context` is fine and expected; length is not what breaks a call.
 
+Prompt and answer share the model's context window, and no argument makes it
+bigger. `max_context_tokens` budgets below it (anything above is clamped down),
+`max_tokens` is lowered automatically to whatever room the prompt leaves, and a
+prompt with no room left for a reply is refused before it is billed. Pass
+`context_compression: true` on that refusal only when a partial view of the
+material is acceptable: OpenRouter then drops text from the middle of the prompt
+until it fits, so the model answers without having read all of it.
+
 Two safety overrides exist but are off for tool calls: `allow_secret_files`
 (send a file matching the credential denylist) and `allow_expensive` (bypass
 the per-call cost guard). Passing either is refused with a note unless the
@@ -189,6 +197,12 @@ def _render(result: dict[str, Any], include_reasoning: bool = False) -> str:
         )
     if usage.get("reasoning_tokens"):
         bits.append(f"reasoning: {usage['reasoning_tokens']}")
+    window = result.get("context_window") or 0
+    if window:
+        # How much of the window this call used, so the next one can be budgeted
+        # rather than guessed at.
+        used = usage.get("prompt_tokens")
+        bits.append(f"context: {used}/{window}" if used is not None else f"context: {window}")
     # A missing or null figure must not crash the formatter and lose the answer.
     bits.append(f"cost: ${usage.get('cost_usd') or 0.0:.4f}")
 
@@ -297,6 +311,8 @@ async def ask_llm(
     effort: str | None = None,
     system: str | None = None,
     max_tokens: int | None = None,
+    max_context_tokens: int | None = None,
+    context_compression: bool | None = None,
     temperature: float | None = None,
     thread: str | None = None,
     cwd: str | None = None,
@@ -340,6 +356,15 @@ async def ask_llm(
         system: Replace the role prompt entirely with your own system prompt.
         max_tokens: Cap the answer. Leave unset unless you need a short reply;
             reasoning models spend this budget thinking before answering.
+        max_context_tokens: Budget prompt and answer together into this many
+            tokens. A model's context window is fixed and cannot be raised from
+            here, so a number above it is clamped back down to what the model
+            takes; below it, max_tokens is lowered to leave room for the reply.
+            Leave unset to use the whole window the model publishes.
+        context_compression: What to do when the prompt does not fit the window.
+            true lets OpenRouter drop text from the middle until it does, false
+            refuses instead. Left unset the prompt is refused with the numbers,
+            except on the small endpoints OpenRouter already compresses for you.
         temperature: Sampling temperature. Leave unset for the model default.
         thread: Name a conversation to keep, so a later call with the same name
             is a follow-up the model remembers.
@@ -362,7 +387,9 @@ async def ask_llm(
     result = await _run(
         core.ask,
         question=question, model=model, category=category, context=context, files=files,
-        role=role, effort=effort, system=system, max_tokens=max_tokens, temperature=temperature,
+        role=role, effort=effort, system=system, max_tokens=max_tokens,
+        max_context_tokens=max_context_tokens, context_compression=context_compression,
+        temperature=temperature,
         thread=thread, cwd=cwd, pdf_engine=pdf_engine, allow_expensive=allow_expensive,
         allow_secret_files=allow_secret_files, include_reasoning=show_reasoning,
     )
@@ -395,6 +422,8 @@ async def ask_panel(
     effort: str | None = None,
     system: str | None = None,
     max_tokens: int | None = None,
+    max_context_tokens: int | None = None,
+    context_compression: bool | None = None,
     temperature: float | None = None,
     cwd: str | None = None,
     pdf_engine: str | None = None,
@@ -423,6 +452,11 @@ async def ask_panel(
         effort: Reasoning effort, snapped per model to what each supports.
         system: Replace the role prompt with your own.
         max_tokens: Cap each answer.
+        max_context_tokens: Budget prompt and answer together into this many
+            tokens per model, clamped down to each model's own window.
+        context_compression: true lets OpenRouter drop text from the middle of a
+            prompt that does not fit; false refuses it. Unset refuses with the
+            numbers, except where OpenRouter compresses by default.
         temperature: Sampling temperature. Leave unset for the model default.
         cwd: Directory that relative `files` paths resolve against.
         pdf_engine: How an attached PDF is read: 'cloudflare-ai' (default, free),
@@ -441,6 +475,7 @@ async def ask_panel(
         core.ask_panel,
         question=question, models=models, category=category, context=context, files=files,
         role=role, effort=effort, system=system, max_tokens=max_tokens,
+        max_context_tokens=max_context_tokens, context_compression=context_compression,
         temperature=temperature, cwd=cwd, pdf_engine=pdf_engine,
         allow_expensive=allow_expensive, allow_secret_files=allow_secret_files,
         include_reasoning=show_reasoning,

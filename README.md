@@ -98,6 +98,33 @@ flat JSON, one plain string per argument:
 The question is always its own argument. It does not go inside `context`, and no
 value is ever wrapped in XML tags.
 
+## Context window
+
+Prompt and answer share one window, and how big it is belongs to the model: no
+OpenRouter request parameter raises it. What a caller sets is a budget inside it.
+
+`max_context_tokens` (tool argument, `--max-context-tokens` on the CLI, or
+`max_context_tokens` in the config for a standing default) budgets prompt plus
+answer into that many tokens. A number above what the model takes is clamped back
+down to the model's own window and the answer says so. Left unset, the whole
+published window is used.
+
+Whatever the budget, the prompt is measured against it before the call goes out:
+
+- room left over, and `max_tokens` is lowered to fit it, with a note saying so
+- no room left, and the call is refused before it is billed, naming the estimate
+  and the window
+
+`context_compression` decides that second case instead. `true` sends OpenRouter's
+context-compression plugin, which drops text from the middle of the prompt until
+it fits and caps the answer at half the window to leave room for what survives.
+`false` refuses even on the endpoints of 8k or less that OpenRouter compresses by
+default. Unset leaves that default alone.
+
+The window in force, and how much of it the prompt used, comes back on every
+answer: `context: 41231/200000` in the header line, and `context_window` in the
+JSON.
+
 ## Guides
 
 `guides/` holds best-practice cheat sheets as plain markdown, one per topic.
@@ -381,6 +408,14 @@ into asking for a credential can be talked into passing the override alongside i
 the same call. For tool calls both are refused unless the config opts in with
 `mcp_allow_secret_files` or `mcp_allow_expensive`, and the refusal names the key that
 would permit it. The CLI flags are a person typing them and are unchanged.
+
+**A context window is fitted, never set.** OpenRouter has no parameter that changes a
+model's context length, so `max_context_tokens` can only budget below it and is clamped
+to the published window otherwise. The fit runs before the cost guard, so the guard
+prices the cap that is really sent, and a prompt with no room left for a reply is refused
+without being billed rather than answered in half a sentence. `context_compression` is
+tri-state on purpose: unset sends no plugin at all, because `enabled: false` is itself a
+decision and it turns off the compression an endpoint of 8k or less applies for you.
 
 **An output cap is always chosen and always sent.** With no `max_tokens`, no
 `default_max_tokens` and no published provider ceiling, the old code sent no cap and

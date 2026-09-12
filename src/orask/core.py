@@ -100,6 +100,10 @@ EFFORT_LADDER = ["minimal", "low", "medium", "high", "xhigh", "max"]
 # Rough chars-per-token used only for the pre-flight cost estimate.
 CHARS_PER_TOKEN = 3.6
 
+# Floor on the room left for an answer inside the context window. Below this the prompt has
+# eaten the window and the call would buy a truncated sentence, so it is refused instead.
+MIN_ANSWER_TOKENS = 256
+
 BINARY_HINT = re.compile(rb"[\x00-\x08\x0e-\x1f]")
 
 # Read ceiling applied before the file is opened, so a huge file is never
@@ -217,6 +221,8 @@ _DEFAULTS: Config = {
     "aliases": {"kimi": "moonshotai/kimi-k3", "glm": "z-ai/glm-5.3"},
     "allowed_models": [],
     "default_max_tokens": 32000,
+    "max_context_tokens": 0,
+    "context_compression": None,
     "request_timeout_s": 300,
     "max_input_chars": 600000,
     "max_file_chars": 200000,
@@ -1386,6 +1392,16 @@ def _setting(key: str, default: int) -> int:
         return default
 
 
+def _tristate(value: Any) -> bool | None:
+    """A real true/false, or None for "leave the decision to OpenRouter".
+
+    A missing key, a null and a string all read as None rather than as False: sending
+    `enabled: false` is itself a decision, and it turns off the compression an 8k endpoint
+    would otherwise apply for you.
+    """
+    return value if isinstance(value, bool) else None
+
+
 def override_allowed(key: str, requested: bool) -> tuple[bool, str | None]:
     """Whether a caller-supplied safety override may be honoured, and why not.
 
@@ -1760,6 +1776,85 @@ def _price(model: dict[str, Any], field: str) -> float:
         return 0.0
 
 
+def context_window(slug: str) -> int:
+    """Tokens the model takes for prompt and answer together, 0 when nothing is published.
+
+    top_provider is the endpoint a request actually lands on, so its window wins over the
+    model-wide number when both are there.
+    """
+    model = _find(slug)
+    top = model.get("top_provider") or {}
+    try:
+        return int(top.get("context_length") or model.get("context_length") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def fit_context(
+    slug: str,
+    prompt_chars: int,
+    max_tokens: int,
+    requested_window: int | None = None,
+    compress: bool = False,
+) -> tuple[int, int, list[str]]:
+    """Fit prompt and answer inside the context window, and refuse when they do not.
+
+    Returns the output cap to send, the window it was fitted to (0 when the catalogue
+    publishes none) and the notes worth reporting. OpenRouter has no request parameter that
+    sets a context window - a model's is fixed - so `requested_window` can only budget below
+    it, and anything above is clamped back down to what the model actually accepts.
+    """
+    notes: list[str] = []
+    published = context_window(slug)
+    window = published
+    if requested_window:
+        window = int(requested_window)
+        if published and window > published:
+            notes.append(
+                f"max_context_tokens of {window} is more than {slug} accepts; used its "
+                f"published window of {published}. A context window is a property of the "
+                "model, not a request parameter, so it cannot be raised from here."
+            )
+            window = published
+        elif published:
+            notes.append(
+                f"context budgeted to {window} tokens of the {published} {slug} allows"
+            )
+    if window <= 0:
+        return max_tokens, 0, notes
+
+    prompt_tokens = int(prompt_chars / CHARS_PER_TOKEN) + 1
+    room = window - prompt_tokens
+    if room < MIN_ANSWER_TOKENS:
+        if compress:
+            # OpenRouter drops from the middle until the prompt fits, which it can only do
+            # if the answer is not itself claiming the whole window.
+            budget = min(max_tokens, max(MIN_ANSWER_TOKENS, window // 2))
+            notes.append(
+                f"the prompt is about {prompt_tokens} tokens against a {window} token "
+                f"window, so OpenRouter's context-compression plugin will drop text from "
+                f"the middle before the model reads it; the answer is capped at {budget} "
+                "tokens to leave room for what survives"
+            )
+            return budget, window, notes
+        raise OpenRouterError(
+            f"refusing to send: the prompt is about {prompt_tokens} tokens and {slug} takes "
+            f"{window} for prompt and answer together, so there is no room left to reply. "
+            "Send fewer files, pick a model with a larger context window (list_llm_models "
+            "shows it), raise max_context_tokens if you set it below the model's own, or "
+            "pass context_compression=true to let OpenRouter drop text from the middle of "
+            "the prompt until it fits."
+        )
+    if max_tokens > room:
+        notes.append(
+            f"lowered max_tokens from {max_tokens} to {room}: the prompt is about "
+            f"{prompt_tokens} tokens of the {window} token context window and the answer "
+            "has to fit in what is left"
+        )
+        max_tokens = room
+    return max_tokens, window, notes
+
+
 def estimate_call_cost(slug: str, chars: int, max_tokens: int | None) -> tuple[float, bool]:
     """Worst-case cost of a call: whole prompt in, max_tokens out.
 
@@ -2018,6 +2113,8 @@ def ask(
     role: str | None = None,
     system: str | None = None,
     max_tokens: int | None = None,
+    max_context_tokens: int | None = None,
+    context_compression: bool | None = None,
     temperature: float | None = None,
     thread: str | None = None,
     cwd: str | None = None,
@@ -2109,6 +2206,25 @@ def ask(
             "or pass max_tokens to choose your own."
         )
 
+    wanted_window = (
+        int(max_context_tokens) if max_context_tokens is not None
+        else _setting("max_context_tokens", 0)
+    )
+    if wanted_window and wanted_window < MIN_ANSWER_TOKENS:
+        raise OpenRouterError(
+            f"max_context_tokens must be at least {MIN_ANSWER_TOKENS}; omit it to use the "
+            "model's own context window"
+        )
+    compress = (
+        context_compression if context_compression is not None
+        else _tristate(cfg.get("context_compression"))
+    )
+    # Ahead of the cost guard, so the answer is priced at the cap that is actually sent.
+    limit, window, fit_notes = fit_context(
+        slug, billable, limit, wanted_window, compress is True
+    )
+    notes.extend(fit_notes)
+
     # Resolved before the guard runs, because which engine reads the PDF changes what the
     # call costs. cloudflare-ai is free, mistral-ocr is not.
     engine = str(pdf_engine or cfg.get("pdf_engine") or "cloudflare-ai").strip().lower()
@@ -2188,11 +2304,12 @@ def ask(
     if temperature is not None:
         payload["temperature"] = float(temperature)
 
+    plugins: list[dict[str, Any]] = []
     if fresh["pdf"] or attached["pdf"]:
         # OpenRouter parses the PDF before the model sees it, which is why a PDF
         # attaches to any model at all. The engine was resolved above, since it
         # changes what the call costs.
-        payload["plugins"] = [{"id": "file-parser", "pdf": {"engine": engine}}]
+        plugins.append({"id": "file-parser", "pdf": {"engine": engine}})
         if fresh["pdf"]:
             notes.append(
                 f"PDF parsed by '{engine}'"
@@ -2203,6 +2320,13 @@ def ask(
                          "needs OCR"
                 )
             )
+    if compress is not None:
+        # Only sent when someone actually decided: left out, an endpoint under 8k keeps the
+        # compression OpenRouter applies to it by default, and a larger one keeps refusing an
+        # overflow instead of quietly answering from a prompt with a hole in the middle.
+        plugins.append({"id": "context-compression", "enabled": bool(compress)})
+    if plugins:
+        payload["plugins"] = plugins
 
     timeout = _float_setting("request_timeout_s", 300.0) or 300.0
     try:
@@ -2327,6 +2451,10 @@ def ask(
         "effort": final_effort,
         "finish_reason": finish,
         "provider": response.get("provider"),
+        # What the prompt and answer were actually fitted into, so a caller that set a
+        # budget can see what it got, and one that did not can see the model's own.
+        "context_window": window,
+        "max_tokens": limit,
         "usage": {
             # prompt_tokens already includes images, audio and video; the detail
             # block is what says how much of it they were.

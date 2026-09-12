@@ -149,6 +149,18 @@ def _shared_ask_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("-s", "--system", help="override the system prompt entirely")
     parser.add_argument("--max-tokens", type=int, help="cap the answer length")
+    parser.add_argument(
+        "--max-context-tokens", type=int, metavar="N",
+        help="budget prompt plus answer into N tokens; capped at the model's own window",
+    )
+    parser.add_argument(
+        "--compress", dest="compress", action="store_true", default=None,
+        help="let OpenRouter drop text from the middle of an oversized prompt",
+    )
+    parser.add_argument(
+        "--no-compress", dest="compress", action="store_false",
+        help="refuse an oversized prompt instead, even on an endpoint that compresses by default",
+    )
     parser.add_argument("--temperature", type=float)
     parser.add_argument("--show-reasoning", action="store_true", help="print reasoning too")
     parser.add_argument("--allow-expensive", action="store_true",
@@ -274,6 +286,8 @@ def _cmd_ask(args: argparse.Namespace) -> int:
         role=args.role,
         system=args.system,
         max_tokens=args.max_tokens,
+        max_context_tokens=args.max_context_tokens,
+        context_compression=args.compress,
         temperature=args.temperature,
         thread=args.thread,
         pdf_engine=args.pdf_engine,
@@ -308,6 +322,8 @@ def _cmd_panel(args: argparse.Namespace) -> int:
         role=args.role,
         system=args.system,
         max_tokens=args.max_tokens,
+        max_context_tokens=args.max_context_tokens,
+        context_compression=args.compress,
         temperature=args.temperature,
         pdf_engine=args.pdf_engine,
         allow_expensive=args.allow_expensive,
