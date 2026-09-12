@@ -191,3 +191,11 @@ All pass in tests/test_boundaries.py and the full gate. Historical attachment
 overflow now refuses before billing; fresh-file skip behavior remains documented.
 Known-key inode checks occur on the open descriptor. Arbitrary copied credential
 content cannot be guaranteed safe by a filename denylist and is explicitly deferred.
+
+Minimum-version execution: created an isolated Conda environment at
+/home/jman/miniconda3/envs/orask-audit-py310, Python3.10.21/MCP2.0.0 with the same
+Ruff/mypy versions. Initial run exposed a test-client constructor API difference
+and five tests assuming stdlib tomllib. Explicit stdio_client transport fixes
+SDK compatibility; tests verify the explicit unavailable doctor result on3.10.
+Full gate passes on both3.10/MCP2.0 and3.13/MCP2.2. No dependency range changed;
+full semantic doctor validation on3.10 is deliberately unavailable, documented.

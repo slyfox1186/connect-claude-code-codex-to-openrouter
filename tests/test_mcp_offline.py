@@ -49,6 +49,7 @@ def serve():
 
 async def check_protocol():
     from mcp import Client, StdioServerParameters
+    from mcp.client.stdio import stdio_client
 
     with tempfile.TemporaryDirectory(prefix="orask-stdio-") as tmp:
         env = {"ORASK_CONFIG_DIR": tmp + "/config", "ORASK_STATE_DIR": tmp + "/state",
@@ -56,7 +57,7 @@ async def check_protocol():
                "ORASK_PYTHON": sys.executable}
         params = StdioServerParameters(command=sys.executable,
                                        args=[str(Path(__file__).resolve()), "--serve"], env=env)
-        async with Client(params, read_timeout_seconds=30) as client:
+        async with Client(stdio_client(params), read_timeout_seconds=30) as client:
             tools = await client.list_tools()
             ask = next(t for t in tools.tools if t.name == "ask_llm")
             assert "effort_reason" in ask.input_schema["properties"]

@@ -11,6 +11,7 @@ import tempfile
 from pathlib import Path
 
 from mcp import Client, StdioServerParameters
+from mcp.client.stdio import stdio_client
 
 LAUNCHER = str(Path(__file__).resolve().parents[1] / "bin" / "openrouter-mcp")
 
@@ -44,7 +45,7 @@ async def main() -> int:
             failures.append(label)
 
     params = StdioServerParameters(command=LAUNCHER, args=[])
-    async with Client(params, read_timeout_seconds=420) as client:
+    async with Client(stdio_client(params), read_timeout_seconds=420) as client:
         info = client.server_info
         check("handshake", info is not None, f"{info.name} v{info.version}" if info else "")
         check("instructions advertised", bool(client.instructions))

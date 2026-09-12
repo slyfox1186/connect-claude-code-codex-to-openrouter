@@ -262,8 +262,17 @@ CLAUDE_CONFIG = json.dumps({"mcpServers": {"openrouter": SERVER}})
 CODEX_CONFIG = ("[mcp_servers.openrouter]\n"
                 f"command = {json.dumps(SERVER['command'])}\nargs = []\n"
                 f"env = {{ ORASK_PYTHON = {json.dumps(sys.executable)} }}\n")
+def doctor_ready(proc):
+    # Full TOML parsing is stdlib-only on 3.11+. The 3.10 contract is an explicit
+    # unavailable result, never a false claim that its registration was verified.
+    if sys.version_info < (3, 11):
+        return proc.returncode == 1 and "TOML validation is unavailable" in proc.stdout
+    return proc.returncode == 0
+
+
 proc = doctor_fixture(CLAUDE_CONFIG, CODEX_CONFIG)
-check("Codex omitted allowlist permits all bridge tools", proc.returncode == 0, proc.stdout[-100:])
+check("Codex allowlist check succeeds or explicitly requires a TOML parser",
+      doctor_ready(proc), proc.stdout[-100:])
 
 for name, body in (("quoted header", CODEX_CONFIG.replace("mcp_servers.openrouter",
                                                        '\"mcp_servers\".\"openrouter\"')),
@@ -273,7 +282,8 @@ for name, body in (("quoted header", CODEX_CONFIG.replace("mcp_servers.openroute
                                 ("ask_llm", "ask_panel", "list_llm_categories", "list_llm_models",
                                  "llm_model_info", "openrouter_usage", "read_guide")) + "\n]\n")):
     proc = doctor_fixture(CLAUDE_CONFIG, body)
-    check(f"doctor accepts semantic Codex {name}", proc.returncode == 0, proc.stdout[-100:])
+    check(f"doctor validates Codex {name} or reports unavailable parser",
+          doctor_ready(proc), proc.stdout[-100:])
 
 CODEX_WITH_TOOLS = CODEX_CONFIG + "enabled_tools = " + json.dumps([
     "ask_llm", "ask_panel", "list_llm_categories", "list_llm_models", "llm_model_info",
@@ -321,7 +331,7 @@ with tempfile.TemporaryDirectory() as scratch:
     (codex_dir / "config.toml").write_text(CODEX_WITH_TOOLS)
     proc = run_cli(["doctor"], data="", scratch=scratch, setup=DOCTOR_SETUP,
                    extra_env={"CLAUDE_CONFIG_DIR": str(claude_dir), "CODEX_HOME": str(codex_dir)})
-check("doctor inspects relocated client config paths", proc.returncode == 0)
+check("doctor inspects relocated paths or reports unavailable TOML parser", doctor_ready(proc))
 
 print(f"\n{CHECKS - len(FAILURES)}/{CHECKS} CLI checks passed")
 raise SystemExit(bool(FAILURES))

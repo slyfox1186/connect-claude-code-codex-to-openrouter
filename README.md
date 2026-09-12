@@ -611,3 +611,10 @@ the files they choose to send. Iterable file lists are consumed once per panel.
 Guide reads use the same descriptor safety checks as attachments. Section lookup
 respects longer code fences and valid closing fences, and impossible or future
 verification dates are marked as needing verification.
+
+The offline gate has been exercised with Python 3.10.21/MCP 2.0.0 and Python
+3.13.15/MCP 2.2.0 on Linux. The test client uses an explicit stdio transport
+compatible with both SDK versions. Python 3.10 has no stdlib TOML parser:
+`doctor` therefore reports Codex registration validation unavailable on that
+interpreter; use Python 3.11+ for that check. CLI consultations and MCP serving
+retain Python 3.10 support. macOS execution remains unverified.
