@@ -130,6 +130,10 @@ scratchpad/
 # Local only: personal setup notes, never published.
 JEFF_START_HERE.md
 
+# Agent guidance for working ON this repo. Local by choice: it names this
+# machine's conventions, and a clone elsewhere should not inherit them.
+CLAUDE.md
+
 # Raw source material for the cheat sheets in guides/. Local only: large,
 # machine-specific, and not this project's to publish.
 docs/

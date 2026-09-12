@@ -15,6 +15,7 @@ import argparse
 import datetime as dt
 import json
 import os
+import re
 import select
 import stat
 import sys
@@ -487,11 +488,21 @@ def _cmd_doctor(_args: argparse.Namespace) -> int:
     if os.path.isfile(codex_toml):
         with open(codex_toml, encoding="utf-8") as handle:
             body = handle.read()
-        check(
-            "registered as an MCP server in Codex",
-            "[mcp_servers.openrouter]" in body,
-            "run install.sh if missing",
-        )
+        registered = "[mcp_servers.openrouter]" in body
+        check("registered as an MCP server in Codex", registered, "run install.sh if missing")
+        if registered:
+            # Codex enforces enabled_tools, so a block written by an older install
+            # lists fewer tools than the server now has and those tools simply do
+            # not exist there. Nothing reports it, which is why doctor does.
+            block = body.split("[mcp_servers.openrouter]", 1)[1].split("\n[", 1)[0]
+            listed = set(re.findall(r'"([a-z_]+)"', block.split("enabled_tools", 1)[-1]))
+            missing = [t for t in core.MCP_TOOLS if t not in listed]
+            check(
+                "Codex registration lists every tool this server has",
+                not missing,
+                f"missing {', '.join(missing)} - run install.sh, then restart Codex"
+                if missing else f"{len(core.MCP_TOOLS)} tools",
+            )
 
     print("\n" + ("all checks passed" if ok else "some checks failed - see above"))
     return 0 if ok else 1

@@ -28,7 +28,7 @@ install.sh                idempotent registration for both agents
 check.sh                  the gate: lint, types, shell syntax, offline tests
 pyproject.toml            ruff and mypy config (no [project] table, on purpose)
 guides/                   local best-practice cheat sheets, served by read_guide
-tests/test_core.py        266 offline checks, no network or key needed
+tests/test_core.py        269 offline checks, no network or key needed
 tests/test_mcp_stdio.py   end-to-end MCP protocol test (spends a few cents)
 ```
 

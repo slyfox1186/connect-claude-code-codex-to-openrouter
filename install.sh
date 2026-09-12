@@ -255,13 +255,16 @@ else
     # An existing block is rewritten in place rather than left alone. A block
     # written by an older install can name a stale project path, or list fewer
     # tools than the server now has, and Codex would go on believing it.
-    CODEX_STATE="$("$PYTHON" - "$CODEX_TOML" "$PROJECT/bin/openrouter-mcp" "$PYTHON" <<'PY' || echo failed
+    CODEX_STATE="$("$PYTHON" - "$CODEX_TOML" "$PROJECT/bin/openrouter-mcp" "$PYTHON" "$PROJECT/src" <<'PY' || echo failed
 import json, os, sys, tempfile
 
-path, command, interpreter = sys.argv[1], sys.argv[2], sys.argv[3]
+path, command, interpreter, PROJECT_SRC = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 HEADER = "[mcp_servers.openrouter]"
-TOOLS = ["ask_llm", "ask_panel", "list_llm_models", "list_llm_categories",
-         "llm_model_info", "openrouter_usage", "read_guide"]
+# The list lives in core so the installer, doctor and the offline suite cannot
+# drift from each other. core is stdlib-only, so importing it here is free.
+sys.path.insert(0, PROJECT_SRC)
+from orask.core import MCP_TOOLS  # noqa: E402
+TOOLS = list(MCP_TOOLS)
 block = f"""{HEADER}
 command = {json.dumps(command)}
 args = []

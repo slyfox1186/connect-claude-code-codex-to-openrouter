@@ -12,12 +12,14 @@ real model call.
 import contextlib
 import json
 import os
+import re
 import sys
 import tempfile
 import time
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
 
 # core reads these into module-level constants at import time, so they have to be set first.
 # Without this a run reads the real API key and appends fabricated entries to the real call
@@ -1258,6 +1260,23 @@ with tempfile.TemporaryDirectory() as tmp:
           any("upper bound" in n for n in _res["notes"]), str(_res["notes"])[:90])
     core._request = _no_network
     core._config_cache = cfg
+
+
+# ---- the tool list cannot drift from the tools that exist -----------------
+# mcp_server cannot be imported here (that would need the mcp SDK, and the point
+# of this suite is that it does not). The decorators are read as text instead.
+_server_src = (ROOT / "src" / "orask" / "mcp_server.py").read_text()
+_declared = re.findall(r'@mcp\.tool\(\s*\n\s*name="([a-z_]+)"', _server_src)
+check("every @mcp.tool is in core.MCP_TOOLS",
+      sorted(_declared) == sorted(core.MCP_TOOLS),
+      f"decorators {sorted(_declared)} vs constant {sorted(core.MCP_TOOLS)}")
+_install_src = (ROOT / "install.sh").read_text()
+check("the installer derives the Codex tool list instead of repeating it",
+      "from orask.core import MCP_TOOLS" in _install_src)
+check("the live MCP protocol test expects the same set",
+      sorted(re.findall(r'"([a-z_]+)"',
+             (ROOT / "tests" / "test_mcp_stdio.py").read_text()
+             .split("EXPECTED_TOOLS = {")[1].split("}")[0])) == sorted(core.MCP_TOOLS))
 
 
 # ---- guides are local files, and the topic name is not to be trusted ------

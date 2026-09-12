@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Any
 
 __all__ = [
+    "MCP_TOOLS",
     "Config",
     "OpenRouterError",
     "account_usage",
@@ -62,6 +63,22 @@ __all__ = [
     "usable_turns",
     "verify_categories",
 ]
+
+# The tools the MCP front-end exposes. Declared here, in the stdlib-only engine,
+# because three things outside mcp_server.py need the list and none of them can
+# import the mcp SDK to ask: install.sh writes it into Codex's enabled_tools,
+# `orask doctor` compares it against what is registered, and the offline suite
+# checks it against the decorators. A tool missing from a Codex registration
+# fails silently, which is how list_llm_categories was dead there for a week.
+MCP_TOOLS = (
+    "ask_llm",
+    "ask_panel",
+    "list_llm_models",
+    "list_llm_categories",
+    "llm_model_info",
+    "openrouter_usage",
+    "read_guide",
+)
 
 API_BASE = "https://openrouter.ai/api/v1"
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
