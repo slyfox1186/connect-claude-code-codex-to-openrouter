@@ -1274,8 +1274,43 @@ check("the default model is one of them",
       _packaged["default_model"] in _aliases or "/" in _packaged["default_model"])
 check("every alias points at a full slug, not another alias",
       all("/" in v for v in _aliases.values()), str(_aliases))
-check("the packaged aliases are the three in service",
-      set(_aliases) == {"kimi", "glm", "grok"}, str(sorted(_aliases)))
+check("the packaged aliases are the four in service",
+      set(_aliases) == {"kimi", "glm", "grok", "gemini"}, str(sorted(_aliases)))
+# category_exclude_vendors governs automatic category picks only. An alias is a
+# deliberate choice and is not filtered by it, or the README's "a full slug still
+# reaches those" would be false. The two lists are meant to overlap.
+_excluded = tuple(f"{v}/" for v in core.excluded_vendors())
+check("an alias may name a vendor the categories exclude",
+      any(v.startswith(_excluded) for v in _aliases.values()),
+      f"aliases {sorted(_aliases.values())} vs excluded {_excluded}")
+check("and no category pins a model from an excluded vendor",
+      not [m for row in core.list_categories() for m in row["models"]
+           if m.startswith(_excluded)],
+      str([m for row in core.list_categories() for m in row["models"]
+           if m.startswith(_excluded)]))
+
+
+# ---- plain English has to reach a category -------------------------------
+# "Use the coding LLMs to ..." is how this is actually asked for. The whole
+# phrase is passed through, so it has to resolve without the agent parsing it.
+for _phrase, _want in [
+    ("coding", "coding"),
+    ("the coding LLMs", "coding"),
+    ("Use the coding LLMs to refactor this module", "coding"),
+    ("use the debugging llms", "debugging"),
+    ("ask the reasoning models", "reasoning"),
+    ("the math ones", "math"),
+    ("something strong at long context", "long_context"),
+    ("use the budget llms", "budget"),
+]:
+    _got = core.resolve_category(_phrase)
+    check(f"'{_phrase}' resolves to {_want}", _got is not None and _got[0] == _want,
+          str(_got[0] if _got else None))
+check("a phrase matching no category is refused, not guessed",
+      core.resolve_category("use the underwater basket weaving llms") is None)
+check("every category names the evidence behind its pick",
+      all(row["why"] and row["measured"] for row in core.list_categories()),
+      str([r["category"] for r in core.list_categories() if not r["why"]]))
 
 
 # ---- the tool list cannot drift from the tools that exist -----------------

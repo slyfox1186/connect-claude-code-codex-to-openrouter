@@ -32,14 +32,16 @@
   "default_panel": [
     "kimi",
     "glm",
-    "grok"
+    "grok",
+    "gemini"
   ],
   "default_effort": "high",
   "default_role": "advisor",
   "aliases": {
     "kimi": "moonshotai/kimi-k3",
     "glm": "z-ai/glm-5.3",
-    "grok": "x-ai/grok-4.6"
+    "grok": "x-ai/grok-4.6",
+    "gemini": "google/gemini-3.8-flash"
   },
   "allowed_models": [],
   "default_max_tokens": 32000,

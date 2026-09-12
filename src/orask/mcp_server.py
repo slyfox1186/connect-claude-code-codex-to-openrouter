@@ -33,12 +33,21 @@ Never paste a file's contents into `question` or `context`. Put its path in
 while a PDF, screenshot, diagram or sound file is attached to the message as
 a real attachment. A directory path in `files` sends the files inside it.
 
-When the user asks for a model that is good at something ("ask an LLM that is
-good at coding", "get advice from one that's good at chatting", "something
-strong at math"), pass that capability as `category` and leave `model` unset.
-Categories: coding, debugging, reasoning, math, chat, agentic, research,
-long_context, creative, budget, general. Each one resolves to the two current
-benchmark leaders for it; list_llm_categories shows the evidence behind each.
+When the user names a capability instead of a model, pass it as `category` and
+leave `model` and `models` unset. Which tool depends on how they said it:
+
+  singular - "ask an LLM that is good at coding", "something strong at math"
+             -> ask_llm with category
+  plural   - "use the coding LLMs", "ask the reasoning models", "what do the
+             debugging ones say" -> ask_panel with category
+
+Pass the user's own words as `category`. It is matched against the category
+names, their synonyms, and any phrase containing one, so "use the coding LLMs
+to review this" resolves on its own. A phrase matching nothing is refused
+rather than guessed at, so you do not need to map it yourself first.
+
+Each category resolves to the current benchmark leaders for it, two different
+vendors on purpose; list_llm_categories shows the evidence behind each pick.
 
 Category picks never return an OpenAI, Anthropic or Google model: this bridge
 exists to fetch a view from outside the agent asking. Ask for one of those by
@@ -122,6 +131,21 @@ def _guide_index() -> str:
     return "\n".join(lines)
 
 
+def _category_index() -> str:
+    """The configured categories, generated rather than written out.
+
+    The list used to be prose, so a category added to config left the agent
+    being told an older set and never asking for the new one.
+    """
+    try:
+        cats = core.load_config().get("categories") or {}
+    except Exception:
+        # A bad config must never stop the server starting.
+        return ""
+    return f"\n\nCategories: {', '.join(sorted(cats))}." if cats else ""
+
+
+INSTRUCTIONS += _category_index()
 INSTRUCTIONS += _alias_index()
 INSTRUCTIONS += _guide_index()
 
@@ -250,9 +274,11 @@ async def _run(func, /, **kwargs):
         "Ask a different frontier model for its independent take on the problem at hand. "
         "Use for 'ask Kimi', 'what does GLM think', 'get a second opinion', or when you are stuck. "
         "When the user asks for a model good at something ('one that's good at coding', "
-        "'strong at math'), pass that as `category` and leave `model` unset: coding, debugging, "
-        "reasoning, math, chat, agentic, research, long_context, creative, budget, general. "
-        "Otherwise pass `model` ('kimi', 'glm', or any OpenRouter slug). "
+        "'strong at math'), pass their words as `category` and leave `model` unset: coding, "
+        "debugging, reasoning, math, chat, agentic, research, long_context, creative, budget, "
+        "general. If they said it in the plural ('the coding LLMs', 'the reasoning models') "
+        "use ask_panel with the same `category` instead, so they get every leader rather than "
+        "the first. Otherwise pass `model` ('kimi', 'glm', 'grok', 'gemini', or any slug). "
         "The other model has no access to this machine or repo: pass the relevant source "
         "with `files` and the situation with `context`, or the answer will be generic. "
         "Never paste a file's contents into the question: put its path in `files` and the "
@@ -347,13 +373,14 @@ async def ask_llm(
     name="ask_panel",
     title="Ask several LLMs at once and compare",
     description=(
-        "Ask the same question of several models in parallel (default: Kimi K3 and GLM 5.3) "
-        "and get every answer back side by side. Use when the user wants more than one "
-        "outside view, when a decision is contested, or to see whether independent models "
-        "agree. Pass `category` instead of `models` to put the two current leaders for a "
-        "capability against each other (coding, debugging, reasoning, math, chat, agentic, "
-        "research, long_context, creative, budget, general); each category pairs two "
-        "different vendors, so the panel is two independent houses. "
+        "Ask the same question of several models in parallel and get every answer back "
+        "side by side. Use when the user wants more than one outside view, when a decision "
+        "is contested, or to see whether independent models agree. This is the tool for a "
+        "plural request: 'use the coding LLMs', 'ask the reasoning models', 'what do the "
+        "debugging ones think' - pass the user's own words as `category` instead of "
+        "`models`, and the current leaders for that capability answer side by side. Each "
+        "category pairs different vendors, so the panel is independent houses rather than "
+        "one lab asked twice. "
         "Costs one call per model; one model failing does not lose the others.\n\n"
         + CALL_SHAPE + " `models` is a JSON array of aliases or slugs."
     ),
@@ -421,7 +448,19 @@ async def ask_panel(
     # Every result, not just the ones that answered: an empty completion is ok: False and is
     # still billed, so filtering on ok reports a total lower than the invoice.
     total = sum(float((r.get("usage") or {}).get("cost_usd") or 0) for r in results)
-    body = "\n\n".join(_render(r, show_reasoning) for r in results)
+    # When a capability chose the panel rather than the caller, say which category
+    # that resolved to and why. Otherwise "use the coding LLMs" returns answers
+    # from two models with nothing saying they were the ones meant.
+    header = ""
+    if category and not models:
+        match = await _run(core.resolve_category, term=category)
+        if match:
+            name, spec = match
+            header = f"`category: {name}`"
+            if spec.get("why"):
+                header += f" - {spec['why']}"
+            header += "\n\n"
+    body = header + "\n\n".join(_render(r, show_reasoning) for r in results)
     agreed = [r["model"] for r in results if r.get("ok")]
     footer = (
         f"\n\n---\n`panel: {len(agreed)}/{len(results)} answered "

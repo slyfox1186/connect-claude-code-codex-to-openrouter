@@ -28,7 +28,7 @@ install.sh                idempotent registration for both agents
 check.sh                  the gate: lint, types, shell syntax, offline tests
 pyproject.toml            ruff and mypy config (no [project] table, on purpose)
 guides/                   local best-practice cheat sheets, served by read_guide
-tests/test_core.py        273 offline checks, no network or key needed
+tests/test_core.py        285 offline checks, no network or key needed
 tests/test_mcp_stdio.py   end-to-end MCP protocol test (spends a few cents)
 ```
 
@@ -238,7 +238,11 @@ of `model`, and the agent picks:
 | `budget` | GLM 5.3 Flash, DeepSeek V4.1 Flash | $0.24 and $0.52 per million blended |
 | `general` | GLM 5.3, Grok 4.6 | highest published intelligence index |
 
-`ask_llm` takes the first; `ask_panel` puts both against each other. Synonyms
+`ask_llm` takes the first; `ask_panel` puts both against each other, which is
+what a plural request means. "Use the coding LLMs to review this" is passed
+through as `category` verbatim: `resolve_category()` matches the name, the
+synonyms, or any phrase containing one, and refuses rather than guesses when
+nothing matches. Synonyms
 resolve too, so "programming", "whole codebase" and "cheap" all land somewhere
 sensible, and a capability that matches nothing is refused rather than guessed.
 
@@ -293,8 +297,9 @@ call is made correctly.
 
 
 **Per-model reasoning efforts.** They genuinely differ: Kimi K3 and GLM 5.3
-accept `max`/`high`/`low` and reject `medium`, while Grok 4.6 accepts
-`xhigh`/`high`/`medium`/`low` and has no `max`. `clamp_effort()` snaps any
+accept `max`/`high`/`low` and reject `medium`, Grok 4.6 accepts
+`xhigh`/`high`/`medium`/`low` and has no `max`, and Gemini 3.8 Flash accepts only
+`high`/`medium`/`low`. `clamp_effort()` snaps any
 requested effort onto what the target model actually advertises, rounding up on a
 tie, and says so in the response notes. Verified against the live catalogue.
 

@@ -291,6 +291,13 @@ def _cmd_ask(args: argparse.Namespace) -> int:
 def _cmd_panel(args: argparse.Namespace) -> int:
     models = [m.strip() for m in (args.models or "").split(",") if m.strip()] or None
     started = time.monotonic()
+    if getattr(args, "category", None) and not getattr(args, "models", None):
+        match = core.resolve_category(args.category)
+        if match:
+            name, spec = match
+            print(f"category: {name}" + (f" - {spec['why']}" if spec.get("why") else ""))
+            print()
+
     results = core.ask_panel(
         " ".join(args.question),
         models=models,
