@@ -60,10 +60,10 @@ orask_find_python() {
     # interpreter must never silently select another environment.
     PYTHON="${ORASK_PYTHON:-}"
     if [[ -n $PYTHON ]]; then
-        if orask_python_new_enough "$PYTHON"; then
+        if [[ $PYTHON == /* ]] && orask_python_new_enough "$PYTHON"; then
             return 0
         fi
-        printf 'orask: ORASK_PYTHON must name an executable Python >= %s.%s: %s\n' \
+        printf 'orask: ORASK_PYTHON must be an absolute executable Python >= %s.%s: %s\n' \
             "$ORASK_MIN_PYTHON_MAJOR" "$ORASK_MIN_PYTHON_MINOR" "$PYTHON" >&2
         PYTHON=""
         return 1

@@ -26,6 +26,11 @@ except ModuleNotFoundError:
     _toml = None
 
 TARGET = ("mcp_servers", "openrouter")
+MAX_CONFIG_BYTES = 32 * 1024 * 1024
+
+
+class ConfigLimitError(ValueError):
+    """A structural error safe to report without including configuration values."""
 
 
 def _statements(text: str) -> list[tuple[int, int, str]]:
@@ -233,7 +238,13 @@ def read_config(path: Path) -> bytes | None:
             info.st_dev, info.st_ino
         ):
             raise ValueError("configuration changed while opening it; retry installation")
-        return handle.read()
+        limit_error = f"configuration exceeds the {MAX_CONFIG_BYTES // (1024 * 1024)} MiB limit"
+        if opened.st_size > MAX_CONFIG_BYTES:
+            raise ConfigLimitError(limit_error)
+        contents = handle.read(MAX_CONFIG_BYTES + 1)
+        if len(contents) > MAX_CONFIG_BYTES:
+            raise ConfigLimitError(limit_error)
+        return contents
 
 
 def _write_backup(path: Path, contents: bytes) -> None:
@@ -257,12 +268,7 @@ def backup_config(source: Path, destination: Path) -> None:
     _write_backup(destination, contents)
 
 
-def _register_codex(path: Path, command: str, interpreter: str, backup: Path) -> str:
-    original = read_config(path)
-    updated = update_codex_text((original or b"").decode("utf-8"), command, interpreter)
-    encoded = updated.encode("utf-8")
-    if original == encoded:
-        return "unchanged"
+def _replace_config(path: Path, original: bytes | None, encoded: bytes, backup: Path) -> str:
     temporary = None
     try:
         descriptor, temporary = tempfile.mkstemp(prefix=".orask-", dir=path.parent)
@@ -284,6 +290,25 @@ def _register_codex(path: Path, command: str, interpreter: str, backup: Path) ->
     return "updated" if original is not None else "added"
 
 
+def register_python_pin(path: Path, interpreter: str, backup: Path) -> str:
+    if not Path(interpreter).is_absolute():
+        raise ValueError("interpreter pin requires an absolute path")
+    original = read_config(path)
+    encoded = (interpreter + "\n").encode("utf-8")
+    if original == encoded and stat.S_IMODE(path.stat().st_mode) == 0o600:
+        return "unchanged"
+    return _replace_config(path, original, encoded, backup)
+
+
+def _register_codex(path: Path, command: str, interpreter: str, backup: Path) -> str:
+    original = read_config(path)
+    updated = update_codex_text((original or b"").decode("utf-8"), command, interpreter)
+    encoded = updated.encode("utf-8")
+    if original == encoded:
+        return "unchanged"
+    return _replace_config(path, original, encoded, backup)
+
+
 def register_codex(path: Path, command: str, interpreter: str, backup: Path) -> str:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     # A stable sidecar serializes installers across atomic replacement of the
@@ -298,7 +323,11 @@ def register_codex(path: Path, command: str, interpreter: str, backup: Path) -> 
 
 
 def main() -> int:
+    pin = len(sys.argv) == 5 and sys.argv[1] == "pin"
     try:
+        if pin:
+            print(register_python_pin(Path(sys.argv[2]), sys.argv[3], Path(sys.argv[4])))
+            return 0
         if len(sys.argv) == 4 and sys.argv[1] == "backup":
             backup_config(Path(sys.argv[2]), Path(sys.argv[3]))
             return 0
@@ -306,6 +335,14 @@ def main() -> int:
         print(register_codex(Path(path), command, interpreter, Path(backup)))
     except (OSError, ValueError) as exc:
         # Parser errors may include private config values. Keep diagnostics structural.
+        if isinstance(exc, ConfigLimitError):
+            print(f"Update refused: {exc}. The original file was not replaced.", file=sys.stderr)
+            return 1
+        if pin:
+            print(f"Interpreter pin update refused ({type(exc).__name__}); "
+                  "use an absolute interpreter path and a writable regular pin file. "
+                  "The previous pin was not replaced.", file=sys.stderr)
+            return 1
         print(f"Configuration update refused ({type(exc).__name__}); "
               "check file access and TOML syntax; inline/dotted managed definitions "
               "must be migrated manually. Original config was not replaced.", file=sys.stderr)

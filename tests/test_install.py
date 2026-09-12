@@ -65,7 +65,7 @@ def guarded_replace(source, destination):
 os.replace = guarded_replace
 original_os_open = os.open
 def guarded_backup_open(path, flags, *args, **kwargs):
-    if os.environ.get("FAIL_BACKUP") and ".bak." in str(path):
+    if os.environ.get("FAIL_BACKUP") and (".bak." in str(path) or str(path).endswith(".bak")):
         raise PermissionError("injected backup failure")
     return original_os_open(path, flags, *args, **kwargs)
 os.open = guarded_backup_open
@@ -271,6 +271,59 @@ with tempfile.TemporaryDirectory(prefix="orask-installer-tests-") as temporary:
           and not (fixture.project / ".orask-python").exists()
           and not (fixture.home / ".local/bin").exists())
 
+    fixture = Fixture(scratch, "relative-explicit-install")
+    result = fixture.run({"ORASK_PYTHON": "../tools/python3"})
+    check("relative explicit interpreter is refused before writes", result.returncode != 0
+          and not (fixture.project / ".orask-python").exists()
+          and not (fixture.home / ".local/bin").exists())
+
+    for kind in ("symlink", "hardlink"):
+        fixture = Fixture(scratch, "pin-" + kind)
+        unrelated = fixture.base / "unrelated-file"
+        unrelated.write_text("unrelated content must survive")
+        pin = fixture.project / ".orask-python"
+        if kind == "symlink":
+            pin.symlink_to(unrelated)
+        else:
+            pin.hardlink_to(unrelated)
+        result = fixture.run()
+        check(f"interpreter pin {kind} cannot overwrite another file",
+              unrelated.read_text() == "unrelated content must survive"
+              and (result.returncode != 0 if kind == "symlink" else result.returncode == 0))
+
+    fixture = Fixture(scratch, "pin-backup")
+    pin = fixture.project / ".orask-python"
+    pin.write_text("/previous/python\n")
+    pin.chmod(0o644)
+    result = fixture.run()
+    backups = list(fixture.project.glob(".orask-python.*.bak"))
+    check("interpreter pin replacement is private and backs up the old bytes",
+          result.returncode == 0 and pin.read_text() == sys.executable + "\n"
+          and pin.stat().st_mode & 0o777 == 0o600 and len(backups) == 1
+          and backups[0].read_text() == "/previous/python\n"
+          and backups[0].stat().st_mode & 0o777 == 0o600)
+    result = fixture.run()
+    check("unchanged interpreter pin does not create extra backups", result.returncode == 0
+          and len(list(fixture.project.glob(".orask-python.*.bak"))) == 1)
+
+    fixture = Fixture(scratch, "pin-backup-failure")
+    pin = fixture.project / ".orask-python"
+    pin.write_text("/previous/python\n")
+    result = fixture.run({"FAIL_BACKUP": "1"})
+    check("pin backup failure preserves pin and stops before registrations",
+          result.returncode != 0 and pin.read_text() == "/previous/python\n"
+          and not fixture.calls() and not (fixture.home / ".local/bin").exists())
+
+    fixture = Fixture(scratch, "oversized-config")
+    with fixture.codex.open("wb") as handle:
+        handle.truncate(32 * 1024 * 1024 + 1)
+    result = fixture.run()
+    check("oversized config reports the installer limit without replacement",
+          result.returncode != 0 and "32 MiB" in result.stderr
+          and fixture.codex.stat().st_size == 32 * 1024 * 1024 + 1)
+
+    fixture = Fixture(scratch, "launcher-checks")
+
     for launcher in ("orask", "openrouter-mcp"):
         shutil.copy2(ROOT / "bin" / launcher, fixture.project / "bin" / launcher)
         result = subprocess.run(
@@ -393,6 +446,21 @@ builtins.__import__ = without_mcp
         refused = True
     check("existing backup cannot be replaced", refused
           and existing_backup.read_text() == "keep backup" and locked_config.read_text() == prefix)
+
+    bounded_config = scratch / "bounded-config"
+    bounded_config.write_bytes(b"123456789")
+    for grew in (False, True):
+        info = bounded_config.stat()
+        reported = mock.Mock(st_mode=info.st_mode, st_ino=info.st_ino, st_dev=info.st_dev,
+                             st_size=0 if grew else info.st_size)
+        with mock.patch.object(install_config, "MAX_CONFIG_BYTES", 8, create=True), \
+                mock.patch.object(os, "fstat", return_value=reported):
+            try:
+                install_config.read_config(bounded_config)
+                refused = False
+            except ValueError:
+                refused = True
+        check(f"configuration read is bounded even if fstat is stale (grew={grew})", refused)
 
 if FAILS:
     print(f"\n{len(FAILS)} of {CHECKS} installer checks failed")

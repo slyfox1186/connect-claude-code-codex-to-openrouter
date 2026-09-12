@@ -2,7 +2,8 @@
 # Register the OpenRouter second-opinion bridge with Claude Code and Codex.
 # Safe to re-run, and re-running is how an existing install is brought up to
 # date: every step converges on the current project rather than skipping when
-# it finds an older registration. Every edited file is backed up first.
+# it finds an older registration. Changed client configs and interpreter pins
+# are backed up first; existing launcher symlinks are updated in place.
 # Nothing here is specific to one machine: paths come from $HOME and from where
 # this file sits, so a clone installs the same way on any Linux or macOS box.
 set -euo pipefail
@@ -149,12 +150,17 @@ else
     say "interpreter ready: $PYTHON ($(python_report "$PYTHON"))"
 fi
 
-# Both launchers read this pin first, so the CLI and the MCP server run on the
-# interpreter that was verified here rather than re-guessing at start-up.
-if printf '%s\n' "$PYTHON" > "$PIN_FILE" 2>/dev/null; then
-    say "pinned the interpreter for the launchers ($PIN_FILE)"
-else
-    say "NOTE: could not write $PIN_FILE; the launchers will search for an interpreter"
+# Write by atomic replacement: a pin symlink must never truncate another file,
+# and an interrupted write must not leave the launchers reading a partial path.
+# The .bak suffix keeps machine-specific backups under the existing gitignore.
+PIN_BACKUP="$PIN_FILE.$STAMP.bak"
+if ! PIN_STATE="$(PYTHONPATH="$PROJECT/src${PYTHONPATH:+:$PYTHONPATH}" \
+    "$PYTHON" -m orask.install_config pin "$PIN_FILE" "$PYTHON" "$PIN_BACKUP")"; then
+    die "FAILED: could not safely pin the interpreter; no registration attempted."
+fi
+say "pinned the interpreter for the launchers ($PIN_FILE)"
+if [[ $PIN_STATE == updated ]]; then
+    say "backed up the previous pin -> $PIN_BACKUP"
 fi
 
 # A tarball or zip download loses the executable bit that git tracks.
@@ -210,7 +216,7 @@ else
         "$PYTHON" - "$CLAUDE_JSON" "$SERVER_JSON" <<'PY'
 import json, sys
 from pathlib import Path
-from orask.install_config import read_config
+from orask.install_config import ConfigLimitError, read_config
 try:
     contents = read_config(Path(sys.argv[1]))
     config = json.loads(contents.decode("utf-8")) if contents is not None else {}
@@ -222,6 +228,9 @@ try:
     current = servers.get("openrouter")
     if current is not None and not isinstance(current, dict):
         raise ValueError("openrouter must be an object")
+except ConfigLimitError as exc:
+    print(f"Claude config update refused: {exc}.", file=sys.stderr)
+    raise SystemExit(1) from None
 except (OSError, ValueError):
     print("Claude config is unreadable or invalid; no registration attempted.", file=sys.stderr)
     raise SystemExit(1) from None
