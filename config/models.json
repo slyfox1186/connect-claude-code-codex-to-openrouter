@@ -50,6 +50,8 @@
   "_context_compression": "null leaves it to OpenRouter, which compresses endpoints of 8k or less and refuses an overflow on larger ones. true drops text from the middle of an oversized prompt instead of refusing it; false refuses everywhere.",
   "context_compression": null,
   "request_timeout_s": 300,
+  "consultation_timeout_s": 3600,
+  "max_active_consultations": 8,
   "max_input_chars": 600000,
   "max_file_chars": 200000,
   "max_attachment_bytes": 16777216,

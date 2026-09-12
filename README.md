@@ -7,7 +7,7 @@ Lets an AI coding agent consult other frontier models mid-task:
 Two front-ends over one engine:
 
 - **MCP server** (`bin/openrouter-mcp`), registered with Claude Code and Codex,
-  exposing seven tools so the agent can consult another model on its own.
+  exposing eight tools so the agent can consult another model on its own.
 - **CLI** (`bin/orask`), the same engine from any shell, and the fallback if the
   MCP layer ever breaks.
 
@@ -22,6 +22,7 @@ config/models.json        aliases, roles, limits          (user-editable)
 src/orask/core.py         engine: HTTP, resolution, cost, threads, logging
 src/orask/cli.py          CLI front-end
 src/orask/mcp_server.py   MCP front-end (mcp SDK)
+src/orask/consultations.py detached workers and private recoverable MCP results
 src/orask/install_config.py safe configuration and interpreter-pin updates
 bin/orask                 CLI launcher
 bin/openrouter-mcp        MCP stdio launcher
@@ -31,6 +32,7 @@ pyproject.toml            ruff and mypy config (no [project] table, on purpose)
 guides/                   local best-practice cheat sheets, served by read_guide
 tests/test_core.py        offline engine checks, no network or key needed
 tests/test_mcp_offline.py offline MCP protocol and safety checks
+tests/test_consultations.py detached-worker lifecycle, deadlines and storage checks
 tests/test_cli.py         CLI subprocess and doctor checks
 tests/test_boundaries.py provider/configuration boundary checks
 tests/test_install.py    isolated installer and launcher checks
@@ -99,6 +101,7 @@ search the saved pin, known environments and available Python installations.
 |---|---|
 | `ask_llm` | One model. Takes `question`, `model`, `context`, `files`, `role`, `effort`, `thread`. |
 | `ask_panel` | Several models in parallel, answers side by side. |
+| `get_consultation` | Recover an existing call by ID, or list recent IDs. No model request. |
 | `list_llm_categories` | The capability categories, the models each resolves to, and the evidence. |
 | `list_llm_models` | Search the live catalogue for slugs, prices, context, reasoning efforts. |
 | `llm_model_info` | Full detail for one model. |
@@ -118,6 +121,53 @@ budgets and boolean switches. For example:
 
 The question is always its own argument. It does not go inside `context`, and no
 value is ever wrapped in XML tags.
+
+### Long calls and recovery
+
+`ask_llm` and `ask_panel` wait up to 20 seconds for an answer. If generation is
+still running, they return `status: running`, a `consultation_id`, and any panel
+members already finished. Continue with:
+
+```json
+{"consultation_id": "ID_FROM_THE_REPLY", "wait_seconds": 20}
+```
+
+Pass those arguments to `get_consultation`, repeating while the status is
+`running`. Polling reads the original work; it never submits another completion.
+Do not repeat the original ask call to check its status. Omit `consultation_id`
+to list the 20 most recent IDs if the initial reply was lost. `wait_seconds`
+accepts 0 through 30; 0 reads immediately. A completed consultation can contain
+failed or incomplete model replies: inspect each member and the answered count.
+
+Each consultation uses a detached local worker, so closing or restarting the
+MCP client does not terminate generation. Results are saved after each panel
+member finishes. Workers do not inherit the MCP protocol streams, and the
+request goes through an anonymous private file rather than command arguments or
+a retained request file. Saved results can include source quoted by a model;
+they are private local data, not safe to publish automatically.
+
+Records live under `~/.local/state/orask/consultations/<id>/`: `result.json`
+holds status and `member-<index>.json` holds each saved model result, so a panel
+has no combined response-size cap. `ORASK_STATE_DIR` relocates the parent.
+Directories use mode 700 and files
+mode 600. Results remain until you remove their consultation directories; keep
+active directories in place. No recovery mechanism can guarantee saving an
+answer when the filesystem stops accepting writes. An intermediate save failure
+is reported and final persistence is attempted again.
+
+The default `max_active_consultations` is 8 across MCP instances sharing the
+same state directory. Busy or unwritable storage refuses a new worker before
+any model request. `consultation_timeout_s` bounds a worker's whole lifetime,
+defaulting to 3600 seconds and permitting at most 86400. Its timeout or an
+unexpected worker exit preserves saved members and marks unfinished work.
+Unfinished provider requests may have been billed; no automatic paid retry is
+made, and closing the connection cannot guarantee that a provider stops billing.
+Cancelling an MCP wait also leaves the already-started consultation running.
+
+`request_timeout_s` remains the HTTP socket timeout, independent of the whole
+consultation limit. The CLI's existing synchronous `ask` and `panel` behavior is
+unchanged. Re-run `./install.sh` and restart both clients after updating: Codex's
+enabled-tool list must include `get_consultation` for recovery to work.
 
 ## Context window
 
@@ -322,6 +372,36 @@ design), `redteam` (attack the plan). Full text in `config/models.json`; `system
 replaces it outright.
 
 ## Design decisions worth knowing
+
+**Provider latency is separate from the MCP reply deadline.** The old adapter
+waited for all panel futures before returning, while Codex's registration had a
+600-second tool deadline. Python's [`urlopen` timeout](https://docs.python.org/3/library/urllib.request.html)
+bounds blocking operations rather than the whole consultation. A slow response,
+successive operations, or permitted retries could outlive the client deadline.
+Cancelling `asyncio.to_thread` did not stop the blocking HTTP work, and metadata
+logs did not retain the answers. This could lose paid work at the client boundary.
+
+We compared the practical alternatives before choosing detached workers:
+
+| Approach | Tradeoff for this bridge |
+|---|---|
+| Raise the client timeout | Moves the failure point; cannot recover an answer after disconnect. |
+| Progress notifications | Useful feedback, but timeout-reset behavior depends on the client. |
+| Stream provider output | Makes partial text available; still needs a recoverable MCP lifecycle and changes the HTTP parser. |
+| End the provider call before 600 seconds | Bounds waiting but may discard a review already being billed. |
+| Split prompts or redirect the CLI | Useful caller choices; do not repair the MCP result-loss path. |
+| Native MCP tasks | Require client capability negotiation; this bridge retains ordinary tool-call compatibility. |
+| In-process background tasks | Survive a tool wait, but die with the MCP process. |
+| Detached workers with saved results | Survive client restarts and preserve completed members, at the cost of local result storage and worker management. |
+
+The selected design keeps provider requests and budgets unchanged, waits briefly
+for fast answers, and polls existing work when it runs longer. It uses ordinary
+MCP tools, avoiding a requirement for clients to support the protocol's
+[task extension](https://modelcontextprotocol.io/specification/2025-11-25/basic/utilities/tasks).
+An inherited `flock` identifies a live worker without relying on PID reuse or
+the parent process. A separate whole-worker deadline and admission limit bound
+resource use. This choice addresses the bridge's current failure; it does not
+promise that any model will finish any review within its output or time budget.
 
 **Malformed calls are recovered, not bounced.** A calling agent assembles these
 arguments as JSON and sometimes gets the shape wrong. The case seen in the wild:

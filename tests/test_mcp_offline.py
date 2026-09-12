@@ -3,6 +3,7 @@
 import asyncio
 import json
 import os
+import re
 import sys
 import tempfile
 import time
@@ -12,8 +13,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 
-def serve():
-    from orask import core, mcp_server
+def provider_fixture():
+    from orask import core
 
     def deny_network(event, _args):
         if event == "socket.connect":
@@ -41,11 +42,27 @@ def serve():
         if effort not in {"medium", "high", "xhigh", "max"}:
             raise AssertionError("weak effort reached provider")
         partial = "force-incomplete" in json.dumps(payload["messages"])
+        answer = "partial" if partial else "FINISHED"
+        if "force-wide" in json.dumps(payload["messages"]):
+            answer = "x" * 6000
+        if "force-slow" in json.dumps(payload["messages"]):
+            time.sleep(1.2 if payload["model"] == "z-ai/glm-5.3" else 0.01)
+        if "force-worker-crash" in json.dumps(payload["messages"]):
+            os._exit(7)
+        if "force-storage-failure" in json.dumps(payload["messages"]):
+            # Fail exactly one progress save, then allow final persistence to recover.
+            original_write = core._write_json_atomic
+
+            def fail_once(*args, **kwargs):
+                core._write_json_atomic = original_write
+                return False
+
+            core._write_json_atomic = fail_once
         return {
             "choices": [
                 {
                     "message": {
-                        "content": "partial" if partial else "FINISHED",
+                        "content": answer,
                         "reasoning": "private reasoning",
                     },
                     "finish_reason": "length" if partial else "stop",
@@ -59,6 +76,20 @@ def serve():
         }
 
     core._request = request
+
+
+def serve():
+    from orask import mcp_server
+
+    provider_fixture()
+    mcp_server.CONSULTATION_WAIT_S = 0.3
+    # The fixture is injected only by this test process, never through production config.
+    try:
+        from orask import consultations
+    except ImportError:
+        pass  # run the latency regression against the original adapter too
+    else:
+        consultations.WORKER_COMMAND = [sys.executable, str(Path(__file__).resolve()), "--worker"]
     mcp_server.main()
 
 
@@ -85,7 +116,7 @@ async def check_protocol():
             for effort in ("low", "minimal", "off", "none", "medium"):
                 result = await client.call_tool("ask_llm", {"question": "q", "effort": effort})
                 text = "".join(getattr(c, "text", "") for c in result.content)
-                assert "FINISHED" not in text and ("require" in text or "requires" in text), text
+                assert result.is_error and "\nFINISHED" not in text and "require" in text, text
             for args in ({}, {"effort": "medium", "effort_reason": "Bounded syntax check"}):
                 result = await client.call_tool("ask_llm", {"question": "q", **args})
                 text = "".join(getattr(c, "text", "") for c in result.content)
@@ -99,11 +130,63 @@ async def check_protocol():
             result = await client.call_tool("read_guide", {"topic": "bash", "section": "Quoting"})
             text = "".join(getattr(c, "text", "") for c in result.content)
             assert "Quoting" in text, text
+            started = time.monotonic()
+            result = await client.call_tool(
+                "ask_panel", {"question": "force-slow", "models": ["kimi", "glm"]}
+            )
+            text = "".join(getattr(c, "text", "") for c in result.content)
+            elapsed = time.monotonic() - started
+            assert elapsed < 0.9, f"slow provider blocked MCP response for {elapsed:.2f}s"
+            assert "get_consultation" in text, text
+            consultation_id = re.search(r"consultation_id: ([0-9a-f]{32})", text)[1]
+            assert "1/2 answered" in text and "known cost so far $0.0200" in text, text
+            assert "FINISHED" in text and "private reasoning" not in text, text
+        # Closing the client must close its server's pipes promptly while the worker lives.
+        async with Client(stdio_client(params), read_timeout_seconds=30) as client:
+            result = await client.call_tool("get_consultation", {})
+            text = "".join(getattr(c, "text", "") for c in result.content)
+            assert consultation_id in text, text
+            result = await client.call_tool(
+                "get_consultation", {"consultation_id": consultation_id, "wait_seconds": 3}
+            )
+            text = "".join(getattr(c, "text", "") for c in result.content)
+            assert "status: completed" in text and "2/2 answered" in text, text
+            assert "$0.0400" in text and "private reasoning" not in text, text
+            log_path = Path(tmp) / "state/calls.jsonl"
+            before = log_path.read_bytes()
+            for _ in range(3):
+                result = await client.call_tool(
+                    "get_consultation", {"consultation_id": consultation_id, "wait_seconds": 0}
+                )
+                assert "2/2 answered" in "".join(getattr(c, "text", "") for c in result.content)
+            assert log_path.read_bytes() == before, "polling must not bill another call"
+            for args in (
+                {"consultation_id": "../../env"},
+                {"consultation_id": consultation_id, "wait_seconds": 31},
+                {"consultation_id": consultation_id, "wait_seconds": -1},
+            ):
+                result = await client.call_tool("get_consultation", args)
+                assert result.is_error, result
+            result = await client.call_tool("ask_llm", {"question": "force-worker-crash"})
+            text = "".join(getattr(c, "text", "") for c in result.content)
+            assert "status: interrupted" in text and "may have been billed" in text, text
+            result = await client.call_tool(
+                "ask_panel", {"question": "force-storage-failure", "models": ["kimi"]}
+            )
+            text = "".join(getattr(c, "text", "") for c in result.content)
+            assert "status: completed" in text and "FINISHED" in text and "1/1 answered" in text, (
+                text
+            )
     print("all offline MCP protocol checks passed")
 
 
 if __name__ == "__main__":
-    if "--serve" in sys.argv:
+    if "--worker" in sys.argv:
+        from orask import consultations
+
+        provider_fixture()
+        consultations.worker_main(sys.argv[-2], int(sys.argv[-1]))
+    elif "--serve" in sys.argv:
         serve()
     else:
         os.environ.pop("OPENROUTER_API_KEY", None)

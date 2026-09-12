@@ -26,7 +26,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from datetime import date
 from pathlib import Path
 from typing import Any
@@ -76,6 +76,7 @@ __all__ = [
 MCP_TOOLS = (
     "ask_llm",
     "ask_panel",
+    "get_consultation",
     "list_llm_models",
     "list_llm_categories",
     "llm_model_info",
@@ -298,6 +299,8 @@ _DEFAULTS: Config = {
     "max_context_tokens": 0,
     "context_compression": None,
     "request_timeout_s": 300,
+    "consultation_timeout_s": 3600,
+    "max_active_consultations": 8,
     "max_input_chars": 600000,
     "max_file_chars": 200000,
     "max_attachment_bytes": MAX_ATTACHMENT_BYTES,
@@ -2985,6 +2988,7 @@ def ask_panel(
     models: Iterable[str] | str | None = None,
     max_workers: int = 6,
     category: str | None = None,
+    on_result: Callable[[list[dict[str, Any]]], None] | None = None,
     **kwargs: Any,
 ) -> list[dict[str, Any]]:
     """Ask several models the same question in parallel.
@@ -3033,7 +3037,9 @@ def ask_panel(
             "transcript would interleave. Use ask() per model with its own thread."
         )
 
-    results: list[dict[str, Any]] = [{} for _ in seen]
+    results: list[dict[str, Any]] = [{"model": spec, "pending": True} for spec in seen]
+    if on_result:
+        on_result(results)
     workers = max(1, min(int(max_workers), len(seen)))
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {
@@ -3057,6 +3063,8 @@ def ask_panel(
                     "error": str(exc),
                     "notes": [],
                 }
+            if on_result:
+                on_result(results)
     for note in panel_notes:
         if results:
             results[0].setdefault("notes", []).insert(0, note)

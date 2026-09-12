@@ -6,6 +6,7 @@ Makes five billed completions at max effort; needs a live API key.
 
 import asyncio
 import base64
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -33,6 +34,7 @@ PROOF_PDF_B64 = (
 EXPECTED_TOOLS = {
     "ask_llm",
     "ask_panel",
+    "get_consultation",
     "list_llm_models",
     "llm_model_info",
     "openrouter_usage",
@@ -51,6 +53,22 @@ async def main() -> int:
 
     params = StdioServerParameters(command=LAUNCHER, args=[])
     async with Client(stdio_client(params), read_timeout_seconds=420) as client:
+
+        async def call(name, arguments):
+            result = await client.call_tool(name, arguments)
+            deadline = asyncio.get_running_loop().time() + 420
+            while name in {"ask_llm", "ask_panel"}:
+                text = "".join(getattr(c, "text", "") for c in result.content)
+                if "status: running" not in text:
+                    break
+                consultation_id = re.search(r"consultation_id: ([0-9a-f]{32})", text)[1]
+                if asyncio.get_running_loop().time() >= deadline:
+                    raise TimeoutError(f"Live check exceeded 420s; recover {consultation_id}")
+                result = await client.call_tool(
+                    "get_consultation", {"consultation_id": consultation_id, "wait_seconds": 20}
+                )
+            return result
+
         info = client.server_info
         check("handshake", info is not None, f"{info.name} v{info.version}" if info else "")
         check("instructions advertised", bool(client.instructions))
@@ -90,7 +108,7 @@ async def main() -> int:
         # Pointing at an unresolvable model proves recovery without paying for
         # a model call: getting as far as model resolution means the question
         # was accepted.
-        res = await client.call_tool(
+        res = await call(
             "ask_llm",
             {
                 "model": "no-such-model-xyz",
@@ -109,7 +127,7 @@ async def main() -> int:
 
         # A call with nothing usable must explain the shape, not hand back a
         # pydantic traceback for the model to decode.
-        res = await client.call_tool("ask_llm", {"context": "background only, no question"})
+        res = await call("ask_llm", {"context": "background only, no question"})
         text = "".join(getattr(c, "text", "") for c in res.content)
         check(
             "an unusable call gets an actionable shape error",
@@ -122,7 +140,7 @@ async def main() -> int:
         if cat:
             props = set((cat.input_schema or {}).get("properties") or {})
             check("ask_llm accepts a category", "category" in props)
-        res = await client.call_tool("list_llm_categories", {"verify": True})
+        res = await call("list_llm_categories", {"verify": True})
         text = "".join(getattr(c, "text", "") for c in res.content)
         check(
             "categories cover the capabilities a user would ask for",
@@ -160,7 +178,7 @@ async def main() -> int:
         check("each category shows the evidence behind it", "Why each pick:" in text)
 
         # an unknown capability must not silently pick something
-        res = await client.call_tool(
+        res = await call(
             "ask_llm",
             {"question": "hi", "category": "underwater basket weaving"},
         )
@@ -172,16 +190,16 @@ async def main() -> int:
         )
 
         # cheap catalogue call, no model tokens spent
-        res = await client.call_tool("list_llm_models", {"search": "kimi-k3", "limit": 3})
+        res = await call("list_llm_models", {"search": "kimi-k3", "limit": 3})
         text = "".join(getattr(c, "text", "") for c in res.content)
         check("list_llm_models returns the real slug", "moonshotai/kimi-k3" in text)
 
-        res = await client.call_tool("llm_model_info", {"model": "glm"})
+        res = await call("llm_model_info", {"model": "glm"})
         text = "".join(getattr(c, "text", "") for c in res.content)
         check("llm_model_info resolves the glm alias", "z-ai/glm-5.3" in text)
 
         # a real (small) model call through the full protocol path
-        res = await client.call_tool(
+        res = await call(
             "ask_llm",
             {
                 "question": "Reply with exactly the word: ACKNOWLEDGED",
@@ -195,7 +213,7 @@ async def main() -> int:
         check("answer carries cost metadata", "cost: $" in text)
 
         # the headline "ask both" feature, over the real protocol
-        res = await client.call_tool(
+        res = await call(
             "ask_panel",
             {
                 "question": "Reply with exactly one word: PANEL",
@@ -216,7 +234,7 @@ async def main() -> int:
         )
 
         # a panel with one bad model must still return the good one
-        res = await client.call_tool(
+        res = await call(
             "ask_panel",
             {
                 "question": "Reply with exactly one word: PARTIAL",
@@ -243,7 +261,7 @@ async def main() -> int:
         with tempfile.TemporaryDirectory() as tmp:
             pdf = Path(tmp) / "proof.pdf"
             pdf.write_bytes(base64.b64decode(PROOF_PDF_B64))
-            res = await client.call_tool(
+            res = await call(
                 "ask_llm",
                 {
                     "question": "What codeword is in the attached PDF? Reply with just it.",
@@ -258,7 +276,7 @@ async def main() -> int:
             check("the answer says the file was attached, not pasted", "attached 1 file" in text)
 
         # error path must come back as a readable message, not a crash
-        res = await client.call_tool("ask_llm", {"question": "hi", "model": "no-such-model-xyz"})
+        res = await call("ask_llm", {"question": "hi", "model": "no-such-model-xyz"})
         text = "".join(getattr(c, "text", "") for c in res.content)
         check(
             "unknown model gives a usable error",

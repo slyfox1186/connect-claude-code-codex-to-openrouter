@@ -11,12 +11,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 from typing import Any
 
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 
-from . import __version__, core
+from . import __version__, consultations, core
 
 INSTRUCTIONS = """\
 Second-opinion bridge to other frontier LLMs through OpenRouter.
@@ -313,6 +314,87 @@ async def _run(func, /, **kwargs):
         raise ToolError(str(exc)) from exc
 
 
+CONSULTATION_WAIT_S = 20.0
+
+
+async def _consult(kind: str, notes: list[str], **kwargs) -> str:
+    consultation_id = await _run(consultations.start, kind=kind, kwargs=kwargs, notes=notes)
+    return await _wait_consultation(consultation_id, CONSULTATION_WAIT_S)
+
+
+async def _wait_consultation(consultation_id: str, wait_seconds: float) -> str:
+    if not math.isfinite(wait_seconds) or not 0 <= wait_seconds <= 30:
+        raise ToolError("wait_seconds must be a finite number from 0 to 30")
+    deadline = asyncio.get_running_loop().time() + wait_seconds
+    while True:
+        record = await _run(consultations.get, consultation_id=consultation_id)
+        if record["status"] != "running" or asyncio.get_running_loop().time() >= deadline:
+            rendered = await _render_consultation(record)
+            if record["status"] == "failed":
+                raise ToolError(rendered)
+            return rendered
+        await asyncio.sleep(min(0.1, max(0, deadline - asyncio.get_running_loop().time())))
+
+
+async def _render_consultation(record: dict[str, Any]) -> str:
+    status = record["status"]
+    consultation_id = record["consultation_id"]
+    results = record["results"]
+    lines = [f"`consultation_id: {consultation_id} | status: {status}`"]
+    if status == "running":
+        lines += [
+            (
+                "The original consultation is still running and its results are saved locally. "
+                f'Call get_consultation(consultation_id="{consultation_id}") to wait for it. '
+                "Polling sends no new model request. Do not repeat ask_llm/ask_panel for this work."
+            )
+        ]
+    if record.get("error"):
+        lines.append(record["error"])
+    if record.get("category") and record["kind"] == "ask_panel":
+        match = await _run(core.resolve_category, term=record["category"])
+        if match:
+            name, spec = match
+            lines.append(f"`category: {name}`" + (f" - {spec['why']}" if spec.get("why") else ""))
+    for result in results:
+        if result.get("pending"):
+            label = "RUNNING" if status == "running" else "UNFINISHED (billing unknown)"
+            lines.append(f"### {result['model']} - {label}")
+        else:
+            lines.append(_render(result, record.get("show_reasoning", False)))
+    if record["kind"] == "ask_panel":
+        total = sum(float((r.get("usage") or {}).get("cost_usd") or 0) for r in results)
+        answered = [r["model"] for r in results if r.get("ok")]
+        cost_label = "total cost" if status == "completed" else "known cost so far"
+        lines.append(
+            f"---\n`panel: {len(answered)}/{len(results)} answered "
+            f"({', '.join(answered) or 'none'}) | {cost_label} ${total:.4f}`"
+        )
+        if len(answered) > 1:
+            lines.append(
+                "Compare the answers above before acting: where they agree you have "
+                "corroboration, where they disagree say so rather than silently picking one."
+            )
+    return _note("\n\n".join(lines), *record.get("notes", []))
+
+
+@mcp.tool(
+    name="get_consultation",
+    title="Recover an existing consultation",
+    description=(
+        "Retrieve saved answers and status for the consultation_id returned by ask_llm or "
+        "ask_panel. Waits up to 20 seconds by default; repeat while status is running. "
+        "This never calls a model or incurs another model charge. Omit consultation_id to "
+        "list the 20 most recent IDs, including work whose initial tool reply was lost. "
+        "Workers and saved results survive an MCP client restart."
+    ),
+)
+async def get_consultation(consultation_id: str | None = None, wait_seconds: float = 20) -> str:
+    if consultation_id is None:
+        return json.dumps(await _run(consultations.recent), indent=2)
+    return await _wait_consultation(consultation_id, wait_seconds)
+
+
 @mcp.tool(
     name="ask_llm",
     title="Ask another LLM for a second opinion",
@@ -420,8 +502,9 @@ async def ask_llm(
     question, context, files, shape_note = _question("ask_llm", question, context, files)
     allow_expensive, expensive_note = _gate("mcp_allow_expensive", allow_expensive)
     allow_secret_files, secret_note = _gate("mcp_allow_secret_files", allow_secret_files)
-    result = await _run(
-        core.ask,
+    return await _consult(
+        "ask_llm",
+        notes=[note for note in (shape_note, expensive_note, secret_note) if note],
         question=question,
         model=model,
         category=category,
@@ -443,7 +526,6 @@ async def ask_llm(
         effort_reason=effort_reason,
         _mcp_call=True,
     )
-    return _note(_render(result, show_reasoning), shape_note, expensive_note, secret_note)
 
 
 @mcp.tool(
@@ -527,8 +609,9 @@ async def ask_panel(
     question, context, files, shape_note = _question("ask_panel", question, context, files)
     allow_expensive, expensive_note = _gate("mcp_allow_expensive", allow_expensive)
     allow_secret_files, secret_note = _gate("mcp_allow_secret_files", allow_secret_files)
-    results = await _run(
-        core.ask_panel,
+    return await _consult(
+        "ask_panel",
+        notes=[note for note in (shape_note, expensive_note, secret_note) if note],
         question=question,
         models=models,
         category=category,
@@ -549,33 +632,6 @@ async def ask_panel(
         effort_reason=effort_reason,
         _mcp_call=True,
     )
-    # Every result, not just the ones that answered: an empty completion is ok: False and is
-    # still billed, so filtering on ok reports a total lower than the invoice.
-    total = sum(float((r.get("usage") or {}).get("cost_usd") or 0) for r in results)
-    # When a capability chose the panel rather than the caller, say which category
-    # that resolved to and why. Otherwise "use the coding LLMs" returns answers
-    # from two models with nothing saying they were the ones meant.
-    header = ""
-    if category and not models:
-        match = await _run(core.resolve_category, term=category)
-        if match:
-            name, spec = match
-            header = f"`category: {name}`"
-            if spec.get("why"):
-                header += f" - {spec['why']}"
-            header += "\n\n"
-    body = header + "\n\n".join(_render(r, show_reasoning) for r in results)
-    agreed = [r["model"] for r in results if r.get("ok")]
-    footer = (
-        f"\n\n---\n`panel: {len(agreed)}/{len(results)} answered "
-        f"({', '.join(agreed) or 'none'}) | total cost ${total:.4f}`"
-    )
-    if len(agreed) > 1:
-        footer += (
-            "\n\nCompare the answers above before acting: where they agree you have "
-            "corroboration, where they disagree say so rather than silently picking one."
-        )
-    return _note(body + footer, shape_note, expensive_note, secret_note)
 
 
 @mcp.tool(

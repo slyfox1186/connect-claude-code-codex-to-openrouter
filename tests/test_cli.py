@@ -389,6 +389,7 @@ for name, body in (
             for tool in (
                 "ask_llm",
                 "ask_panel",
+                "get_consultation",
                 "list_llm_categories",
                 "list_llm_models",
                 "llm_model_info",
@@ -413,6 +414,7 @@ CODEX_WITH_TOOLS = (
         [
             "ask_llm",
             "ask_panel",
+            "get_consultation",
             "list_llm_categories",
             "list_llm_models",
             "llm_model_info",

@@ -39,6 +39,7 @@ id_ed25519*
 # ---------------------------------------------------------------------------
 calls.jsonl
 threads/
+consultations/
 .cache/
 cache/
 state/
