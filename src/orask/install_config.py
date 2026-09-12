@@ -70,7 +70,7 @@ def _statements(text: str) -> list[tuple[int, int, str]]:
             if not stack or stack.pop() != {"}": "{", "]": "["}[char]:
                 raise ValueError("unbalanced TOML delimiters")
         if char == "\n" and not quote and not stack:
-            result.append((start, index + 1, text[start:index + 1]))
+            result.append((start, index + 1, text[start : index + 1]))
             start = index + 1
         index += 1
     if quote or stack:
@@ -103,7 +103,7 @@ def _key_path(text: str, end: str) -> tuple[tuple[str, ...], int]:
                     escape = text[index]
                     if escape in "uU":
                         count = 4 if escape == "u" else 8
-                        digits = text[index + 1:index + 1 + count]
+                        digits = text[index + 1 : index + 1 + count]
                         if not re.fullmatch(rf"[0-9a-fA-F]{{{count}}}", digits):
                             raise ValueError("invalid TOML Unicode escape")
                         value = int(digits, 16)
@@ -112,8 +112,15 @@ def _key_path(text: str, end: str) -> tuple[tuple[str, ...], int]:
                         char = chr(value)
                         index += count
                     else:
-                        escapes = {"b": "\b", "t": "\t", "n": "\n", "f": "\f",
-                                   "r": "\r", '"': '"', "\\": "\\"}
+                        escapes = {
+                            "b": "\b",
+                            "t": "\t",
+                            "n": "\n",
+                            "f": "\f",
+                            "r": "\r",
+                            '"': '"',
+                            "\\": "\\",
+                        }
                         if escape not in escapes:
                             raise ValueError("unsupported TOML key escape")
                         char = escapes[escape]
@@ -144,7 +151,7 @@ def _table(statement: str) -> tuple[tuple[str, ...], bool]:
     array = statement.startswith("[[")
     width = 2 if array else 1
     path, end = _key_path(statement[width:], "]" * width)
-    tail = statement[width + end:].strip()
+    tail = statement[width + end :].strip()
     if tail and not tail.startswith("#"):
         raise ValueError("unsupported TOML table syntax")
     return path, array
@@ -163,14 +170,14 @@ def _managed_spans(original: str) -> list[tuple[int, int]]:
                 spans.append((start, end))
             start = end = None
             table, array = _table(statement)
-            if array and (table[:2] == TARGET or TARGET[:len(table)] == table):
+            if array and (table[:2] == TARGET or TARGET[: len(table)] == table):
                 raise ValueError("managed server cannot be an array of tables")
             if table[:2] == TARGET:
                 start, end = left, right
         else:
             key, _ = _key_path(statement, "=")
             absolute = table + key
-            if TARGET[:len(absolute)] == absolute or (
+            if TARGET[: len(absolute)] == absolute or (
                 absolute[:2] == TARGET and table[:2] != TARGET
             ):
                 raise ValueError(
@@ -206,7 +213,7 @@ def update_codex_text(original: str, command: str, interpreter: str) -> str:
     spans = _managed_spans(original)
     block = codex_block(command, interpreter)
     if spans:
-        updated = original[:spans[0][0]] + block
+        updated = original[: spans[0][0]] + block
         for index, (_, end) in enumerate(spans):
             next_start = spans[index + 1][0] if index + 1 < len(spans) else len(original)
             updated += original[end:next_start]
@@ -235,7 +242,8 @@ def read_config(path: Path) -> bytes | None:
     with os.fdopen(descriptor, "rb") as handle:
         opened = os.fstat(handle.fileno())
         if not stat.S_ISREG(opened.st_mode) or (opened.st_dev, opened.st_ino) != (
-            info.st_dev, info.st_ino
+            info.st_dev,
+            info.st_ino,
         ):
             raise ValueError("configuration changed while opening it; retry installation")
         limit_error = f"configuration exceeds the {MAX_CONFIG_BYTES // (1024 * 1024)} MiB limit"
@@ -313,8 +321,11 @@ def register_codex(path: Path, command: str, interpreter: str, backup: Path) -> 
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     # A stable sidecar serializes installers across atomic replacement of the
     # config inode. Other editors do not share this lock; check their changes too.
-    descriptor = os.open(path.with_name(path.name + ".orask.lock"),
-                         os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+    descriptor = os.open(
+        path.with_name(path.name + ".orask.lock"),
+        os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
+        0o600,
+    )
     with os.fdopen(descriptor, "r+b") as handle:
         if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
             raise ValueError("configuration lock must be a regular file")
@@ -339,13 +350,19 @@ def main() -> int:
             print(f"Update refused: {exc}. The original file was not replaced.", file=sys.stderr)
             return 1
         if pin:
-            print(f"Interpreter pin update refused ({type(exc).__name__}); "
-                  "use an absolute interpreter path and a writable regular pin file. "
-                  "The previous pin was not replaced.", file=sys.stderr)
+            print(
+                f"Interpreter pin update refused ({type(exc).__name__}); "
+                "use an absolute interpreter path and a writable regular pin file. "
+                "The previous pin was not replaced.",
+                file=sys.stderr,
+            )
             return 1
-        print(f"Configuration update refused ({type(exc).__name__}); "
-              "check file access and TOML syntax; inline/dotted managed definitions "
-              "must be migrated manually. Original config was not replaced.", file=sys.stderr)
+        print(
+            f"Configuration update refused ({type(exc).__name__}); "
+            "check file access and TOML syntax; inline/dotted managed definitions "
+            "must be migrated manually. Original config was not replaced.",
+            file=sys.stderr,
+        )
         return 1
     return 0
 

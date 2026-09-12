@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The gate. One command, one exit code: lint, types, shell syntax, offline tests.
+# The gate. One exit code: lint, format, types, shell syntax, offline tests.
 #
 # The tests run against a scratch config/state/cache so a run can never read the real API
 # key, never append to the real call log, and never reach the network.
@@ -30,6 +30,7 @@ run() {
 }
 
 run "ruff (lint)"  "$PYTHON" -m ruff check "$PROJECT/src" "$PROJECT/tests"
+run "ruff (format)" "$PYTHON" -m ruff format --check "$PROJECT/src" "$PROJECT/tests"
 run "mypy (types)" "$PYTHON" -m mypy --config-file "$PROJECT/pyproject.toml"
 run "bash -n (shell syntax)" bash -c '
     for f in "$1"/install.sh "$1"/check.sh "$1"/bin/orask "$1"/bin/openrouter-mcp \

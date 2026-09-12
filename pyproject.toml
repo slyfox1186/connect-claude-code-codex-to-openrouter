@@ -11,9 +11,8 @@ src = ["src"]
 [tool.ruff.lint]
 select = ["E", "W", "F", "I", "B", "C4", "ISC", "PIE", "RUF", "SIM", "UP", "PLW", "TID"]
 ignore = [
-    # ruff's own formatter owns this one, and we do not run the formatter: the source is
-    # hand-aligned (the magic-byte table, the media maps, the printed column widths) and a
-    # wholesale reformat would bury every real change in 2000 lines of churn.
+    # Ruff's formatter owns implicit concatenation layout; enabling this lint rule can
+    # conflict with its output. Keep one authority for formatting.
     "ISC001",
     # The catalogue, config and index caches are module-level on purpose, and the CLI must
     # stay importable with no third-party help. Rewriting that into a class to satisfy a

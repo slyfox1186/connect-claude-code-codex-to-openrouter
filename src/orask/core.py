@@ -123,12 +123,21 @@ MAX_ATTACHMENT_TOTAL_BYTES = 32 * 1024 * 1024
 # PDFs go through the file-parser plugin and work on every model; images and
 # audio need the target model to advertise that input modality.
 IMAGE_MEDIA = {
-    ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
-    ".webp": "image/webp", ".gif": "image/gif",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+    ".gif": "image/gif",
 }
 AUDIO_FORMATS = {
-    ".wav": "wav", ".mp3": "mp3", ".ogg": "ogg", ".flac": "flac",
-    ".m4a": "m4a", ".aac": "aac", ".aiff": "aiff", ".aif": "aiff",
+    ".wav": "wav",
+    ".mp3": "mp3",
+    ".ogg": "ogg",
+    ".flac": "flac",
+    ".m4a": "m4a",
+    ".aac": "aac",
+    ".aiff": "aiff",
+    ".aif": "aiff",
     ".pcm": "pcm16",
 }
 PDF_MEDIA = "application/pdf"
@@ -157,10 +166,31 @@ MISTRAL_OCR_USD_PER_1K_PAGES = 2.0
 
 # Directories that are never what someone means by "send this folder".
 SKIP_DIRS = {
-    ".git", ".hg", ".svn", "node_modules", "__pycache__", ".venv", "venv",
-    "env", "dist", "build", ".next", "target", ".mypy_cache", ".pytest_cache",
-    ".ruff_cache", ".tox", ".idea", ".vscode", "vendor", ".terraform",
-    ".gradle", ".cache", "coverage", ".nyc_output", "site-packages",
+    ".git",
+    ".hg",
+    ".svn",
+    "node_modules",
+    "__pycache__",
+    ".venv",
+    "venv",
+    "env",
+    "dist",
+    "build",
+    ".next",
+    "target",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".tox",
+    ".idea",
+    ".vscode",
+    "vendor",
+    ".terraform",
+    ".gradle",
+    ".cache",
+    "coverage",
+    ".nyc_output",
+    "site-packages",
 }
 
 # Per-attachment token counts for the pre-flight cost guard only. OpenRouter
@@ -178,32 +208,72 @@ TOKENS_PER_AUDIO_BYTE = 1 / 1000
 # OpenRouter. Override per call with allow_secret_files, or edit
 # deny_file_patterns in the config.
 DEFAULT_DENY_PATTERNS = [
-    "*/.ssh/*", "*/.gnupg/*", "*/.aws/credentials", "*/.aws/config",
-    "*/.netrc", "*/.npmrc", "*/.pypirc", "*/.docker/config.json",
-    "*/.kube/config", "*/.git-credentials",
-    "*.pem", "*.key", "*.p12", "*.pfx", "*.keystore", "*.jks",
-    "*/id_rsa*", "*/id_dsa*", "*/id_ecdsa*", "*/id_ed25519*",
-    "*/.env", "*/.env.*", "*.env",
-    "*/.credentials.json", "*/auth.json", "*/.config/openrouter/env",
-    "*RAILWAY_VARS.md", "*this_pc_ssh_transer_details*",
-    "*admin_login_credentials*", "*/shadow", "*/.password-store/*",
+    "*/.ssh/*",
+    "*/.gnupg/*",
+    "*/.aws/credentials",
+    "*/.aws/config",
+    "*/.netrc",
+    "*/.npmrc",
+    "*/.pypirc",
+    "*/.docker/config.json",
+    "*/.kube/config",
+    "*/.git-credentials",
+    "*.pem",
+    "*.key",
+    "*.p12",
+    "*.pfx",
+    "*.keystore",
+    "*.jks",
+    "*/id_rsa*",
+    "*/id_dsa*",
+    "*/id_ecdsa*",
+    "*/id_ed25519*",
+    "*/.env",
+    "*/.env.*",
+    "*.env",
+    "*/.credentials.json",
+    "*/auth.json",
+    "*/.config/openrouter/env",
+    "*RAILWAY_VARS.md",
+    "*this_pc_ssh_transer_details*",
+    "*admin_login_credentials*",
+    "*/shadow",
+    "*/.password-store/*",
     # Cloud and tooling credential stores. None of these is ever source code someone wants a
     # second opinion on, and every one of them is a plausible thing to talk an agent into
     # attaching: gcloud's application-default file is the commonest cloud credential on a
     # development machine.
-    "*/.config/gcloud/*credentials*", "*/.azure/*", "*/.config/gh/hosts.yml",
-    "*/.pgpass", "*/.my.cnf", "*/.s3cfg", "*/.boto", "*/.htpasswd",
-    "*/.terraformrc", "*/terraform.tfvars", "*/*.auto.tfvars",
-    "*/.gem/credentials", "*/.cargo/credentials*", "*/.gradle/gradle.properties",
+    "*/.config/gcloud/*credentials*",
+    "*/.azure/*",
+    "*/.config/gh/hosts.yml",
+    "*/.pgpass",
+    "*/.my.cnf",
+    "*/.s3cfg",
+    "*/.boto",
+    "*/.htpasswd",
+    "*/.terraformrc",
+    "*/terraform.tfvars",
+    "*/*.auto.tfvars",
+    "*/.gem/credentials",
+    "*/.cargo/credentials*",
+    "*/.gradle/gradle.properties",
     # A git remote URL routinely carries an access token inside it.
-    "*/.gitconfig", "*/.git/config",
+    "*/.gitconfig",
+    "*/.git/config",
     # Process state, not files. /proc/<pid>/environ holds this process's own environment,
     # which is where OPENROUTER_API_KEY lives when it is exported. Until now the only thing
     # stopping that being attached was the binary-content heuristic noticing the NUL
     # separators. The informational parts of /proc (cpuinfo, meminfo) are deliberately left
     # readable, because asking a model about your own hardware is a real use.
-    "/proc/*/environ", "/proc/*/cmdline", "/proc/*/mem", "/proc/*/maps",
-    "/proc/*/fd/*", "/proc/*/task/*", "/proc/kcore", "/proc/keys", "/proc/key-users",
+    "/proc/*/environ",
+    "/proc/*/cmdline",
+    "/proc/*/mem",
+    "/proc/*/maps",
+    "/proc/*/fd/*",
+    "/proc/*/task/*",
+    "/proc/kcore",
+    "/proc/keys",
+    "/proc/key-users",
 ]
 
 
@@ -251,15 +321,21 @@ def _validate_config(cfg: Config, path: Path) -> None:
         raise OpenRouterError(f"config file {path}: {field} must be {expected}")
 
     for key in ("aliases", "roles"):
-        if key in cfg and (not isinstance(cfg[key], dict) or any(
-            not isinstance(v, str) or not v.strip() for v in cfg[key].values()
-        )):
+        if key in cfg and (
+            not isinstance(cfg[key], dict)
+            or any(not isinstance(v, str) or not v.strip() for v in cfg[key].values())
+        ):
             reject(key, "an object of non-empty strings")
-    for key in ("allowed_models", "default_panel", "deny_file_patterns",
-                "category_exclude_vendors"):
-        if key in cfg and (not isinstance(cfg[key], list) or any(
-            not isinstance(v, str) or not v.strip() for v in cfg[key]
-        )):
+    for key in (
+        "allowed_models",
+        "default_panel",
+        "deny_file_patterns",
+        "category_exclude_vendors",
+    ):
+        if key in cfg and (
+            not isinstance(cfg[key], list)
+            or any(not isinstance(v, str) or not v.strip() for v in cfg[key])
+        ):
             reject(key, "a list of non-empty strings")
     for key in ("default_model", "default_role", "default_effort", "pdf_engine"):
         if key in cfg and cfg[key] is not None and not isinstance(cfg[key], str):
@@ -456,10 +532,10 @@ def _request(
 ERROR_TYPE_HINTS = {
     "invalid_image": "the image is corrupt or unreadable; re-export it and try again",
     "image_too_large": "the image is over this provider's size or pixel limit; "
-                       "scale it down and send it again",
+    "scale it down and send it again",
     "image_too_small": "the image is under this provider's minimum pixel size",
     "unsupported_image_format": "this provider does not take that image format; "
-                                "convert it to png or jpg",
+    "convert it to png or jpg",
     "image_not_found": "the referenced image could not be resolved",
     "image_download_failed": "OpenRouter could not fetch the image from that URL",
 }
@@ -526,17 +602,26 @@ def _valid_catalog(data: Any) -> bool:
             if entry.get(key) is not None and not isinstance(entry[key], dict):
                 return False
         top = entry.get("top_provider") or {}
-        for value in (entry.get("created"), entry.get("context_length"),
-                      top.get("context_length"), top.get("max_completion_tokens")):
-            if value is not None and (not isinstance(value, (int, float))
-                                      or _nonnegative_number(value) is None):
+        for value in (
+            entry.get("created"),
+            entry.get("context_length"),
+            top.get("context_length"),
+            top.get("max_completion_tokens"),
+        ):
+            if value is not None and (
+                not isinstance(value, (int, float)) or _nonnegative_number(value) is None
+            ):
                 return False
         reasoning = entry.get("reasoning") or {}
         architecture = entry.get("architecture") or {}
-        for value in (reasoning.get("supported_efforts"), entry.get("supported_parameters"),
-                      architecture.get("input_modalities")):
-            if value is not None and (not isinstance(value, list)
-                                      or any(not isinstance(v, str) for v in value)):
+        for value in (
+            reasoning.get("supported_efforts"),
+            entry.get("supported_parameters"),
+            architecture.get("input_modalities"),
+        ):
+            if value is not None and (
+                not isinstance(value, list) or any(not isinstance(v, str) for v in value)
+            ):
                 return False
         bench = (entry.get("benchmarks") or {}).get("artificial_analysis")
         if bench is not None:
@@ -563,11 +648,7 @@ def get_catalog(refresh: bool = False, allow_stale: bool = True) -> list[dict[st
     # serve the catalogue it started with for as long as the process lives, and
     # silently use stale prices, efforts and model lists.
     def _fresh() -> list[dict[str, Any]] | None:
-        if (
-            _catalog_cache is not None
-            and not refresh
-            and (time.time() - _catalog_fetched_at) < ttl
-        ):
+        if _catalog_cache is not None and not refresh and (time.time() - _catalog_fetched_at) < ttl:
             return _catalog_cache
         return None
 
@@ -583,9 +664,7 @@ def get_catalog(refresh: bool = False, allow_stale: bool = True) -> list[dict[st
         return _fetch_catalog(refresh, allow_stale, ttl)
 
 
-def _fetch_catalog(
-    refresh: bool, allow_stale: bool, ttl: float
-) -> list[dict[str, Any]]:
+def _fetch_catalog(refresh: bool, allow_stale: bool, ttl: float) -> list[dict[str, Any]]:
     """The slow half of get_catalog. Only ever called with _catalog_lock held."""
     global _catalog_cache, _catalog_fetched_at, _catalog_failed_at
     cached: list[dict[str, Any]] | None = None
@@ -643,7 +722,9 @@ def _fetch_catalog(
 
 
 def _write_json_atomic(
-    target: Path, payload: dict[str, Any], indent: int | None = None,
+    target: Path,
+    payload: dict[str, Any],
+    indent: int | None = None,
     max_bytes: int | None = None,
 ) -> bool:
     """Write via a per-process temp file so concurrent writers cannot collide.
@@ -748,8 +829,8 @@ def resolve_model(spec: str) -> tuple[str, str | None]:
     if "/" in spec:
         bare = spec.lstrip("~")
         if not known or spec in known or f"~{bare}" in known or bare in known:
-            exact = spec if (not known or spec in known) else (
-                bare if bare in known else f"~{bare}"
+            exact = (
+                spec if (not known or spec in known) else (bare if bare in known else f"~{bare}")
             )
             return _enforce_allowed(exact, allowed), None
         slug, match_note = _fuzzy(bare.split("/", 1)[1], catalog)
@@ -918,13 +999,15 @@ def list_categories() -> list[dict[str, Any]]:
     cats = load_config().get("categories") or {}
     rows = []
     for name, spec in cats.items():
-        rows.append({
-            "category": name,
-            "models": as_list(spec.get("models")),
-            "aka": as_list(spec.get("aka")),
-            "why": spec.get("why") or "",
-            "measured": spec.get("measured") or "",
-        })
+        rows.append(
+            {
+                "category": name,
+                "models": as_list(spec.get("models")),
+                "aka": as_list(spec.get("aka")),
+                "why": spec.get("why") or "",
+                "measured": spec.get("measured") or "",
+            }
+        )
     return rows
 
 
@@ -947,15 +1030,17 @@ def verify_categories() -> list[dict[str, Any]]:
                 index = ((model.get("benchmarks") or {}).get("artificial_analysis") or {}).get(
                     "intelligence_index"
                 )
-            rows.append({
-                "category": row["category"],
-                "slug": slug,
-                "available": bool(model),
-                "excluded_vendor": bool(banned and _vendor(slug) in banned),
-                "intelligence_index": index,
-                "context": (model or {}).get("context_length"),
-                "measured": row["measured"],
-            })
+            rows.append(
+                {
+                    "category": row["category"],
+                    "slug": slug,
+                    "available": bool(model),
+                    "excluded_vendor": bool(banned and _vendor(slug) in banned),
+                    "intelligence_index": index,
+                    "context": (model or {}).get("context_length"),
+                    "measured": row["measured"],
+                }
+            )
     return rows
 
 
@@ -1130,8 +1215,7 @@ def _open_regular_fd(path: Path, flags: int = os.O_RDONLY) -> int:
             child = os.open(part, directory_flags, dir_fd=directory)
             os.close(directory)
             directory = child
-        fd = os.open(path.name, flags | os.O_NONBLOCK | os.O_NOFOLLOW, 0o600,
-                     dir_fd=directory)
+        fd = os.open(path.name, flags | os.O_NONBLOCK | os.O_NOFOLLOW, 0o600, dir_fd=directory)
     finally:
         os.close(directory)
     try:
@@ -1372,7 +1456,7 @@ def _read_file(path: Path, limit: int, *, deny_key: bool = False) -> tuple[str, 
         tail = limit - head
         marker = f"\n\n... [{len(raw)} bytes total, middle elided by orask] ...\n\n"
         # text[-0:] would be the entire string, not an empty one.
-        text = text[:head] + marker + (text[len(text) - tail:] if tail > 0 else "")
+        text = text[:head] + marker + (text[len(text) - tail :] if tail > 0 else "")
         return text, f"{path} truncated to {limit} chars"
     return text, None
 
@@ -1393,9 +1477,22 @@ def _read_file(path: Path, limit: int, *, deny_key: bool = False) -> tuple[str, 
 # only when they wrap or terminate the whole value, so a genuine question about
 # XML keeps its markup.
 CALL_SYNTAX_TAGS = (
-    "question", "context", "prompt", "query", "task", "instructions",
-    "parameter", "parameters", "arg", "args", "argument", "arguments",
-    "invoke", "function_calls", "antml:invoke", "antml:parameter",
+    "question",
+    "context",
+    "prompt",
+    "query",
+    "task",
+    "instructions",
+    "parameter",
+    "parameters",
+    "arg",
+    "args",
+    "argument",
+    "arguments",
+    "invoke",
+    "function_calls",
+    "antml:invoke",
+    "antml:parameter",
     "antml:function_calls",
 )
 
@@ -1450,18 +1547,17 @@ def strip_call_syntax(value: str | None) -> str | None:
         before = text
         opening = _OPEN_TAG.match(text)
         if opening and opening.group(1).lower() in CALL_SYNTAX_TAGS:
-            tail = re.search(
-                rf"</\s*{re.escape(opening.group(1))}\s*>\s*\Z", text, re.IGNORECASE
-            )
+            tail = re.search(rf"</\s*{re.escape(opening.group(1))}\s*>\s*\Z", text, re.IGNORECASE)
             if tail:
-                text = text[opening.end():tail.start()].strip()
+                text = text[opening.end() : tail.start()].strip()
         # An orphan closer with no matching opener means the call was truncated.
         closing = _CLOSE_TAG.search(text)
         if (
             closing
             and closing.group(1).lower() in CALL_SYNTAX_TAGS
             and not re.search(
-                rf"<\s*{re.escape(closing.group(1))}(\s[^<>]*)?>", text[: closing.start()],
+                rf"<\s*{re.escape(closing.group(1))}(\s[^<>]*)?>",
+                text[: closing.start()],
                 re.IGNORECASE,
             )
         ):
@@ -1478,7 +1574,7 @@ def _extract_tagged(text: str, tag: str) -> tuple[str, str] | None:
     )
     if not match or not match.group(1).strip():
         return None
-    rest = (text[: match.start()] + "\n\n" + text[match.end():]).strip()
+    rest = (text[: match.start()] + "\n\n" + text[match.end() :]).strip()
     return match.group(1).strip(), rest
 
 
@@ -1509,8 +1605,10 @@ def split_embedded_question(
             return (
                 strip_call_syntax(inner),
                 strip_call_syntax(rest) or None,
-                (f"`question` was empty and a <{tag}> block was found inside `context`; "
-                "used that as the question. Send `question` as its own argument next time."),
+                (
+                    f"`question` was empty and a <{tag}> block was found inside `context`; "
+                    "used that as the question. Send `question` as its own argument next time."
+                ),
             )
 
     # The input was checked non-empty above, so this cannot come back as None.
@@ -1518,13 +1616,15 @@ def split_embedded_question(
     heading = None
     for match in _QUESTION_HEADING.finditer(stripped):
         heading = match  # the last heading wins; earlier ones are background
-    if heading and stripped[heading.end():].strip():
+    if heading and stripped[heading.end() :].strip():
         return (
-            strip_call_syntax(stripped[heading.end():]),
+            strip_call_syntax(stripped[heading.end() :]),
             strip_call_syntax(stripped[: heading.start()]) or None,
-            ("`question` was empty and a 'Question' heading was found inside `context`; "
-            "used the text under it as the question. Send `question` as its own "
-            "argument next time."),
+            (
+                "`question` was empty and a 'Question' heading was found inside `context`; "
+                "used the text under it as the question. Send `question` as its own "
+                "argument next time."
+            ),
         )
 
     return None, stripped, None
@@ -1644,7 +1744,9 @@ def _gather_files(
     if not allow_secret_files:
         patterns.append(ENV_FILE.resolve().as_posix())
     candidates, walk_notes = _expand_paths(
-        as_list(files), base, _setting("max_dir_files", 50),
+        as_list(files),
+        base,
+        _setting("max_dir_files", 50),
         [] if allow_secret_files else patterns,
     )
     notes.extend(walk_notes)
@@ -1698,9 +1800,7 @@ def _gather_files(
             )
             continue
         if len(attachments) >= ceiling:
-            notes.append(
-                f"{candidate} not attached: already at the {ceiling} attachment limit"
-            )
+            notes.append(f"{candidate} not attached: already at the {ceiling} attachment limit")
             continue
 
         raw, problem = _slurp(candidate, per_file, deny_key=not allow_secret_files)
@@ -1782,8 +1882,7 @@ def build_messages(
         if wanted not in roles and roles:
             fallback = "advisor" if "advisor" in roles else next(iter(roles))
             notes.append(
-                f"role '{wanted}' is not defined ({', '.join(sorted(roles))}); "
-                f"used '{fallback}'"
+                f"role '{wanted}' is not defined ({', '.join(sorted(roles))}); used '{fallback}'"
             )
             wanted = fallback
         system_prompt = roles.get(wanted) or _DEFAULTS_ADVISOR
@@ -1793,9 +1892,7 @@ def build_messages(
         parts.append("## Background from the agent asking\n\n" + context.strip())
 
     base = Path(cwd).expanduser() if cwd else Path.cwd()
-    sections, attachments, file_notes = _gather_files(
-        files, base, allow_secret_files, model_slug
-    )
+    sections, attachments, file_notes = _gather_files(files, base, allow_secret_files, model_slug)
     parts.extend(sections)
     notes.extend(file_notes)
 
@@ -1817,9 +1914,7 @@ def build_messages(
     replayed = 0
     for message in usable_turns(history or []):
         if message.get("role") in ("user", "assistant") and message.get("content"):
-            turn: dict[str, Any] = {
-                "role": message["role"], "content": message["content"]
-            }
+            turn: dict[str, Any] = {"role": message["role"], "content": message["content"]}
             # Sending a past turn's file annotations back is what tells
             # OpenRouter it has already parsed that PDF, so a long thread about
             # one document parses it once rather than once per question.
@@ -1827,7 +1922,8 @@ def build_messages(
                 turn["annotations"] = message["annotations"]
             if message["role"] == "user" and isinstance(message.get("content"), list):
                 replayed += sum(
-                    1 for part in message["content"]
+                    1
+                    for part in message["content"]
                     if isinstance(part, dict) and part.get("type") != "text"
                 )
             messages.append(turn)
@@ -1859,8 +1955,11 @@ def text_chars(messages: list[dict[str, Any]]) -> int:
             for part in content:
                 if isinstance(part, dict) and part.get("type") == "text":
                     total += len(part.get("text") or "")
-    return total + sum(len(part["text"]) for part in _annotation_parts(messages)
-                       if part.get("type") == "text" and isinstance(part.get("text"), str))
+    return total + sum(
+        len(part["text"])
+        for part in _annotation_parts(messages)
+        if part.get("type") == "text" and isinstance(part.get("text"), str)
+    )
 
 
 def sent_attachments(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1870,10 +1969,7 @@ def sent_attachments(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     content = messages[-1].get("content")
     if not isinstance(content, list):
         return []
-    return [
-        part for part in content
-        if isinstance(part, dict) and part.get("type") != "text"
-    ]
+    return [part for part in content if isinstance(part, dict) and part.get("type") != "text"]
 
 
 def _attachment_blob(part: dict[str, Any]) -> str | None:
@@ -1916,18 +2012,27 @@ def _annotation_parts(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def _direct_attachments(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return [part for message in messages if isinstance(message.get("content"), list)
-            for part in message["content"] if isinstance(part, dict) and part.get("type") != "text"]
+    return [
+        part
+        for message in messages
+        if isinstance(message.get("content"), list)
+        for part in message["content"]
+        if isinstance(part, dict) and part.get("type") != "text"
+    ]
 
 
 def _all_attachments(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return [*_direct_attachments(messages),
-            *(part for part in _annotation_parts(messages) if part.get("type") != "text")]
+    return [
+        *_direct_attachments(messages),
+        *(part for part in _annotation_parts(messages) if part.get("type") != "text"),
+    ]
 
 
 def _thread_attachment_weight(messages: list[dict[str, Any]]) -> int:
-    values = [*_direct_attachments(messages),
-              *(m["annotations"] for m in messages if m.get("annotations"))]
+    values = [
+        *_direct_attachments(messages),
+        *(m["annotations"] for m in messages if m.get("annotations")),
+    ]
     return sum(len(json.dumps(value, ensure_ascii=False).encode("utf-8")) for value in values)
 
 
@@ -1935,8 +2040,10 @@ def _validate_attachment_limits(messages: list[dict[str, Any]], slug: str | None
     """Apply current limits to the complete wire payload, including historical attachments."""
     parts = _all_attachments(messages)
     if len(parts) > _setting("max_attachments", 20):
-        raise OpenRouterError("new and replayed files exceed max_attachments; use a new thread "
-                              "or explicitly raise the configured limit")
+        raise OpenRouterError(
+            "new and replayed files exceed max_attachments; use a new thread "
+            "or explicitly raise the configured limit"
+        )
     sizes = []
     modalities = _model_modalities(slug)
     for part in parts:
@@ -1944,8 +2051,11 @@ def _validate_attachment_limits(messages: list[dict[str, Any]], slug: str | None
         if blob is None:
             raise OpenRouterError("thread contains an unsupported attachment; repair it first")
         padding = len(blob) - len(blob.rstrip("="))
-        if (len(blob) % 4 or padding > 2
-                or re.search(r"[^A-Za-z0-9+/]", blob[:-padding] if padding else blob)):
+        if (
+            len(blob) % 4
+            or padding > 2
+            or re.search(r"[^A-Za-z0-9+/]", blob[:-padding] if padding else blob)
+        ):
             raise OpenRouterError("thread contains malformed base64 attachment data")
         sizes.append(len(blob) * 3 // 4 - padding)
     # OpenRouter strips PDF-extracted images for text-only models. Direct image/audio
@@ -1953,8 +2063,10 @@ def _validate_attachment_limits(messages: list[dict[str, Any]], slug: str | None
     for part in _direct_attachments(messages):
         kind = {"image_url": "image", "input_audio": "audio"}.get(part["type"])
         if kind and modalities and kind not in modalities:
-            raise OpenRouterError(f"{slug} cannot accept the thread's {kind} attachment; "
-                                  "choose a compatible model or a new thread")
+            raise OpenRouterError(
+                f"{slug} cannot accept the thread's {kind} attachment; "
+                "choose a compatible model or a new thread"
+            )
     if any(size > _setting("max_attachment_bytes", MAX_ATTACHMENT_BYTES) for size in sizes):
         raise OpenRouterError("replayed file exceeds the current max_attachment_bytes limit")
     if sum(sizes) > _setting("max_attachment_total_bytes", MAX_ATTACHMENT_TOTAL_BYTES):
@@ -2081,9 +2193,7 @@ def fit_context(
             )
             window = published
         elif published:
-            notes.append(
-                f"context budgeted to {window} tokens of the {published} {slug} allows"
-            )
+            notes.append(f"context budgeted to {window} tokens of the {published} {slug} allows")
     if window <= 0:
         return max_tokens, 0, notes
 
@@ -2150,7 +2260,7 @@ def _clean_usage(raw: Any, notes: list[str]) -> dict[str, Any]:
     """Optional provider accounting cannot invalidate a useful paid answer."""
     out: dict[str, Any] = {}
     invalid = not isinstance(raw, dict) or not raw
-    for key, value in (raw.items() if isinstance(raw, dict) else []):
+    for key, value in raw.items() if isinstance(raw, dict) else []:
         if key in ("prompt_tokens", "completion_tokens", "cost", "total_cost"):
             number = _nonnegative_number(value)
             if number is None:
@@ -2170,8 +2280,10 @@ def _clean_usage(raw: Any, notes: list[str]) -> dict[str, Any]:
                     else:
                         out[key][field] = int(number)
     if invalid:
-        notes.append("provider usage was missing or malformed; valid fields were kept, "
-                     "but a zero fallback cost does not confirm a free call")
+        notes.append(
+            "provider usage was missing or malformed; valid fields were kept, "
+            "but a zero fallback cost does not confirm a free call"
+        )
     return out
 
 
@@ -2179,16 +2291,23 @@ def actual_cost(slug: str, usage: dict[str, Any]) -> float:
     """Prefer OpenRouter's own cost; fall back to catalogue pricing."""
     for key in ("cost", "total_cost"):
         value = usage.get(key)
-        if (isinstance(value, (int, float)) and not isinstance(value, bool)
-                and math.isfinite(value) and value >= 0):
+        if (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(value)
+            and value >= 0
+        ):
             return float(value)
     model = _find(slug)
     if not model:
         return 0.0
     prompt = _nonnegative_number(usage.get("prompt_tokens")) or 0
     completion = _nonnegative_number(usage.get("completion_tokens")) or 0
-    return (prompt * _price(model, "prompt") + completion * _price(model, "completion")
-            + _price(model, "request"))
+    return (
+        prompt * _price(model, "prompt")
+        + completion * _price(model, "completion")
+        + _price(model, "request")
+    )
 
 
 # --------------------------------------------------------------------------
@@ -2511,8 +2630,14 @@ def ask(
 
     history = load_thread(thread)
     messages, build_notes = build_messages(
-        question, context=context, files=files, system=system, role=role,
-        cwd=cwd, history=history, allow_secret_files=allow_secret_files,
+        question,
+        context=context,
+        files=files,
+        system=system,
+        role=role,
+        cwd=cwd,
+        history=history,
+        allow_secret_files=allow_secret_files,
         model_slug=slug,
     )
     notes.extend(build_notes)
@@ -2536,9 +2661,7 @@ def ask(
     if max_tokens is not None and int(max_tokens) < 1:
         # 0 would read as "no cap": no max_tokens sent and zero output priced,
         # so the provider's own ceiling applies against a $0.00 estimate.
-        raise OpenRouterError(
-            "max_tokens must be 1 or more; omit it to use the configured default"
-        )
+        raise OpenRouterError("max_tokens must be 1 or more; omit it to use the configured default")
     limit = int(max_tokens) if max_tokens is not None else _setting("default_max_tokens", 32000)
     ceiling = int(((_find(slug).get("top_provider") or {}).get("max_completion_tokens")) or 0)
     if limit and ceiling and limit > ceiling:
@@ -2556,7 +2679,8 @@ def ask(
         )
 
     wanted_window = (
-        int(max_context_tokens) if max_context_tokens is not None
+        int(max_context_tokens)
+        if max_context_tokens is not None
         else _setting("max_context_tokens", 0)
     )
     if wanted_window and wanted_window < MIN_ANSWER_TOKENS:
@@ -2565,13 +2689,12 @@ def ask(
             "model's own context window"
         )
     compress = (
-        context_compression if context_compression is not None
+        context_compression
+        if context_compression is not None
         else _tristate(cfg.get("context_compression"))
     )
     # Ahead of the cost guard, so the answer is priced at the cap that is actually sent.
-    limit, window, fit_notes = fit_context(
-        slug, billable, limit, wanted_window, compress is True
-    )
+    limit, window, fit_notes = fit_context(slug, billable, limit, wanted_window, compress is True)
     notes.extend(fit_notes)
 
     # Resolved before the guard runs, because which engine reads the PDF changes what the
@@ -2630,8 +2753,7 @@ def ask(
                 + (f", plus about {fmt_usd(ocr)} of mistral-ocr page charges" if ocr else "")
                 + f"), over the {fmt_usd(guard)} per-call guard. Trim the context, lower "
                 "max_tokens, "
-                + ("use pdf_engine='cloudflare-ai' if the PDF has real text in it, "
-                   if ocr else "")
+                + ("use pdf_engine='cloudflare-ai' if the PDF has real text in it, " if ocr else "")
                 + "or pass allow_expensive to override."
             )
 
@@ -2644,9 +2766,12 @@ def ask(
     wanted_effort = effort if effort is not None else cfg.get("default_effort")
     final_effort, effort_note = clamp_effort(slug, wanted_effort)
     if _mcp_call:
-        declared = ((_find(slug).get("reasoning") or {}).get("supported_efforts") or [])
-        if (not declared or final_effort not in EFFORT_LADDER
-                or EFFORT_LADDER.index(final_effort) < EFFORT_LADDER.index("medium")):
+        declared = (_find(slug).get("reasoning") or {}).get("supported_efforts") or []
+        if (
+            not declared
+            or final_effort not in EFFORT_LADDER
+            or EFFORT_LADDER.index(final_effort) < EFFORT_LADDER.index("medium")
+        ):
             raise OpenRouterError(
                 f"{slug} cannot satisfy the MCP reasoning policy with its published efforts. "
                 "Choose a model advertising medium or stronger reasoning; low is never used."
@@ -2677,8 +2802,7 @@ def ask(
                 + (
                     " which bills separately per 1,000 pages"
                     if engine == "mistral-ocr"
-                    else "; pass pdf_engine='mistral-ocr' if the PDF is a scan that "
-                         "needs OCR"
+                    else "; pass pdf_engine='mistral-ocr' if the PDF is a scan that needs OCR"
                 )
             )
     if compress is not None:
@@ -2703,11 +2827,16 @@ def ask(
     except OpenRouterError as exc:
         log_call(
             {
-                "model": slug, "requested": model, "ok": False,
-                "error": str(exc)[:500], "chars_in": chars,
+                "model": slug,
+                "requested": model,
+                "ok": False,
+                "error": str(exc)[:500],
+                "chars_in": chars,
                 "cost_usd": actual_cost(slug, _clean_usage(response.get("usage"), []))
-                if response.get("usage") else 0.0,
-                "latency_s": round(time.monotonic() - started, 2), "thread": thread,
+                if response.get("usage")
+                else 0.0,
+                "latency_s": round(time.monotonic() - started, 2),
+                "thread": thread,
             }
         )
         raise
@@ -2760,9 +2889,10 @@ def ask(
         # left with a follow-up the model cannot see the document for.
         budget = _setting("thread_attachment_bytes", 4 * 1024 * 1024)
         keep = _setting("thread_max_messages", 20)
-        retained = history[-max(0, keep - 2):] if keep > 2 else ([] if keep else history)
-        weight = _thread_attachment_weight([
-            *retained, {"content": parts}, {"annotations": annotations}])
+        retained = history[-max(0, keep - 2) :] if keep > 2 else ([] if keep else history)
+        weight = _thread_attachment_weight(
+            [*retained, {"content": parts}, {"annotations": annotations}]
+        )
         if weight <= budget:
             carried = parts
         else:
@@ -2790,16 +2920,24 @@ def ask(
 
     log_call(
         {
-            "model": slug, "requested": model, "ok": not incomplete, "empty": empty,
-            "incomplete": incomplete, "finish_reason": finish,
-            "effort": final_effort, "role": role or cfg.get("default_role"),
+            "model": slug,
+            "requested": model,
+            "ok": not incomplete,
+            "empty": empty,
+            "incomplete": incomplete,
+            "finish_reason": finish,
+            "effort": final_effort,
+            "role": role or cfg.get("default_role"),
             "prompt_tokens": usage.get("prompt_tokens"),
             "completion_tokens": usage.get("completion_tokens"),
             "reasoning_tokens": (usage.get("completion_tokens_details") or {}).get(
                 "reasoning_tokens"
             ),
-            "cost_usd": round(cost, 6), "latency_s": elapsed,
-            "chars_in": chars, "attachments": attached["total"], "thread": thread,
+            "cost_usd": round(cost, 6),
+            "latency_s": elapsed,
+            "chars_in": chars,
+            "attachments": attached["total"],
+            "thread": thread,
         }
     )
 
@@ -2809,7 +2947,8 @@ def ask(
         "incomplete": incomplete,
         "error": (
             f"{slug} returned an incomplete response (finish_reason={finish})"
-            if incomplete else None
+            if incomplete
+            else None
         ),
         "model": slug,
         "requested": model,
@@ -2973,7 +3112,7 @@ def list_models(
         rows.sort(key=lambda r: r["slug"])
     else:
         rows.sort(
-            key=lambda r: (r["intelligence_index"] if r["intelligence_index"] is not None else -1),
+            key=lambda r: r["intelligence_index"] if r["intelligence_index"] is not None else -1,
             reverse=True,
         )
     return rows[: max(1, int(limit))]
@@ -3031,9 +3170,7 @@ def account_usage() -> dict[str, Any]:
     # ok: False and is still billed, so filtering on ok under-reports real spend.
     spend = sum(_num(e, "cost_usd") for e in entries)
     day_cutoff = time.time() - 86400
-    spend_day = sum(
-        _num(e, "cost_usd") for e in entries if _num(e, "ts") >= day_cutoff
-    )
+    spend_day = sum(_num(e, "cost_usd") for e in entries if _num(e, "ts") >= day_cutoff)
     return {
         "key_label": data.get("label"),
         "account_usage_usd": data.get("usage"),
@@ -3205,8 +3342,11 @@ def _guide_headings(body: str) -> list[tuple[int, re.Match[str]]]:
             token = marker.group(1)
             if not fence:
                 fence = token
-            elif (token[0] == fence[0] and len(token) >= len(fence)
-                  and not line[marker.end():].strip()):
+            elif (
+                token[0] == fence[0]
+                and len(token) >= len(fence)
+                and not line[marker.end() :].strip()
+            ):
                 fence = ""
             continue
         if fence:
@@ -3234,13 +3374,15 @@ def list_guides() -> list[dict]:
     for slug, path in sorted(_guide_map().items()):
         head = _guide_read(path, FRONT_MATTER_BYTES)
         meta, body = _guide_split(head)
-        rows.append({
-            "topic": slug,
-            "triggers": meta.get("triggers", "") or _guide_title(body),
-            "verified": meta.get("verified", ""),
-            "stale": not _valid_guide_date(meta.get("verified", "")),
-            "path": str(path),
-        })
+        rows.append(
+            {
+                "topic": slug,
+                "triggers": meta.get("triggers", "") or _guide_title(body),
+                "verified": meta.get("verified", ""),
+                "stale": not _valid_guide_date(meta.get("verified", "")),
+                "path": str(path),
+            }
+        )
     return rows
 
 
@@ -3280,11 +3422,13 @@ def guide_outline(topic: str) -> dict:
     sections = []
     for position, (index, match) in enumerate(starts):
         end = starts[position + 1][0] if position + 1 < len(starts) else len(lines)
-        sections.append({
-            "level": len(match.group(1)),
-            "title": match.group(2),
-            "lines": end - index,
-        })
+        sections.append(
+            {
+                "level": len(match.group(1)),
+                "title": match.group(2),
+                "lines": end - index,
+            }
+        )
     return {
         "topic": _guide_slug(path.stem),
         "triggers": meta.get("triggers", ""),
@@ -3380,12 +3524,14 @@ def search_guides(query: str, limit: int = 20) -> dict:
             # an agent is looking for actually appears.
             if needle in line.lower():
                 total += 1
-                found.append({
-                    "topic": slug,
-                    "section": heading,
-                    "line": index + 1,
-                    "snippet": line.strip()[:200],
-                })
+                found.append(
+                    {
+                        "topic": slug,
+                        "section": heading,
+                        "line": index + 1,
+                        "snippet": line.strip()[:200],
+                    }
+                )
         if found:
             per_guide.append(found)
 

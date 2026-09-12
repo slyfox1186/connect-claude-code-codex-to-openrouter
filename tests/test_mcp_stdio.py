@@ -31,8 +31,13 @@ PROOF_PDF_B64 = (
 )
 
 EXPECTED_TOOLS = {
-    "ask_llm", "ask_panel", "list_llm_models", "llm_model_info", "openrouter_usage",
-    "list_llm_categories", "read_guide",
+    "ask_llm",
+    "ask_panel",
+    "list_llm_models",
+    "llm_model_info",
+    "openrouter_usage",
+    "list_llm_categories",
+    "read_guide",
 }
 
 
@@ -57,18 +62,27 @@ async def main() -> int:
         ask = next((t for t in tools.tools if t.name == "ask_llm"), None)
         if ask:
             props = set((ask.input_schema or {}).get("properties") or {})
-            check("ask_llm schema has question/model/context/files",
-                  {"question", "model", "context", "files"} <= props)
+            check(
+                "ask_llm schema has question/model/context/files",
+                {"question", "model", "context", "files"} <= props,
+            )
             check("ask_llm exposes the pdf engine choice", "pdf_engine" in props)
-            check("ask_llm description tells the caller not to paste files in",
-                  "Never paste a file" in (ask.description or ""))
+            check(
+                "ask_llm description tells the caller not to paste files in",
+                "Never paste a file" in (ask.description or ""),
+            )
             # The call shape has to travel with the tool, not just live in the
             # server instructions: a model reads the description at call time.
             desc = ask.description or ""
-            check("ask_llm description spells out the call shape",
-                  '"question":' in desc and "XML" in desc, desc[-90:])
-            check("ask_llm description says the question is separate from context",
-                  "separate from `context`" in desc)
+            check(
+                "ask_llm description spells out the call shape",
+                '"question":' in desc and "XML" in desc,
+                desc[-90:],
+            )
+            check(
+                "ask_llm description says the question is separate from context",
+                "separate from `context`" in desc,
+            )
 
         # The exact malformed call that failed in the wild: `question` never
         # arrived because it had been folded into `context` in <question> tags,
@@ -87,16 +101,21 @@ async def main() -> int:
             },
         )
         text = "".join(getattr(c, "text", "") for c in res.content)
-        check("a question folded into context is recovered, not bounced",
-              "cannot resolve model" in text.lower(), text.strip()[:140])
+        check(
+            "a question folded into context is recovered, not bounced",
+            "cannot resolve model" in text.lower(),
+            text.strip()[:140],
+        )
 
         # A call with nothing usable must explain the shape, not hand back a
         # pydantic traceback for the model to decode.
         res = await client.call_tool("ask_llm", {"context": "background only, no question"})
         text = "".join(getattr(c, "text", "") for c in res.content)
-        check("an unusable call gets an actionable shape error",
-              '"question":' in text and "Received:" in text and "validation error" not in text,
-              text.strip()[:140])
+        check(
+            "an unusable call gets an actionable shape error",
+            '"question":' in text and "Received:" in text and "validation error" not in text,
+            text.strip()[:140],
+        )
 
         # categories: the "ask one that's good at coding" path. Free, no model call.
         cat = next((t for t in tools.tools if t.name == "ask_llm"), None)
@@ -105,25 +124,52 @@ async def main() -> int:
             check("ask_llm accepts a category", "category" in props)
         res = await client.call_tool("list_llm_categories", {"verify": True})
         text = "".join(getattr(c, "text", "") for c in res.content)
-        check("categories cover the capabilities a user would ask for",
-              all(c in text for c in ("coding", "chat", "reasoning", "math", "budget",
-                                      "long_context", "creative", "agentic")))
-        check("every pinned category model is still listed by OpenRouter",
-              "NO LONGER LISTED" not in text,
-              next((line for line in text.splitlines() if "NO LONGER" in line), "")[:90])
-        check("category picks exclude the asking agent's own vendors",
-              "openai/" not in text and "anthropic/" not in text and "google/" not in text,
-              next((line for line in text.splitlines()
-                    if any(v in line for v in ("openai/", "anthropic/", "google/"))), "")[:90])
+        check(
+            "categories cover the capabilities a user would ask for",
+            all(
+                c in text
+                for c in (
+                    "coding",
+                    "chat",
+                    "reasoning",
+                    "math",
+                    "budget",
+                    "long_context",
+                    "creative",
+                    "agentic",
+                )
+            ),
+        )
+        check(
+            "every pinned category model is still listed by OpenRouter",
+            "NO LONGER LISTED" not in text,
+            next((line for line in text.splitlines() if "NO LONGER" in line), "")[:90],
+        )
+        check(
+            "category picks exclude the asking agent's own vendors",
+            "openai/" not in text and "anthropic/" not in text and "google/" not in text,
+            next(
+                (
+                    line
+                    for line in text.splitlines()
+                    if any(v in line for v in ("openai/", "anthropic/", "google/"))
+                ),
+                "",
+            )[:90],
+        )
         check("each category shows the evidence behind it", "Why each pick:" in text)
 
         # an unknown capability must not silently pick something
         res = await client.call_tool(
-            "ask_llm", {"question": "hi", "category": "underwater basket weaving"},
+            "ask_llm",
+            {"question": "hi", "category": "underwater basket weaving"},
         )
         text = "".join(getattr(c, "text", "") for c in res.content)
-        check("an unknown category is refused rather than guessed",
-              "not a known category" in text.lower(), text.strip()[:120])
+        check(
+            "an unknown category is refused rather than guessed",
+            "not a known category" in text.lower(),
+            text.strip()[:120],
+        )
 
         # cheap catalogue call, no model tokens spent
         res = await client.call_tool("list_llm_models", {"search": "kimi-k3", "limit": 3})
@@ -139,7 +185,9 @@ async def main() -> int:
             "ask_llm",
             {
                 "question": "Reply with exactly the word: ACKNOWLEDGED",
-                "model": "kimi", "effort": "max", "max_tokens": 16000,
+                "model": "kimi",
+                "effort": "max",
+                "max_tokens": 16000,
             },
         )
         text = "".join(getattr(c, "text", "") for c in res.content)
@@ -151,15 +199,21 @@ async def main() -> int:
             "ask_panel",
             {
                 "question": "Reply with exactly one word: PANEL",
-                "models": ["kimi", "glm"], "effort": "max", "max_tokens": 16000,
+                "models": ["kimi", "glm"],
+                "effort": "max",
+                "max_tokens": 16000,
             },
         )
         text = "".join(getattr(c, "text", "") for c in res.content)
-        check("ask_panel returns both models",
-              "moonshotai/kimi-k3" in text and "z-ai/glm-5.3" in text)
+        check(
+            "ask_panel returns both models", "moonshotai/kimi-k3" in text and "z-ai/glm-5.3" in text
+        )
         check("ask_panel reports a combined cost", "total cost $" in text)
-        check("ask_panel answered from both", "2/2 answered" in text,
-              next((line for line in text.splitlines() if "answered" in line), "")[:90])
+        check(
+            "ask_panel answered from both",
+            "2/2 answered" in text,
+            next((line for line in text.splitlines() if "answered" in line), "")[:90],
+        )
 
         # a panel with one bad model must still return the good one
         res = await client.call_tool(
@@ -167,16 +221,21 @@ async def main() -> int:
             {
                 "question": "Reply with exactly one word: PARTIAL",
                 "models": ["kimi", "no-such-model-xyz"],
-                "effort": "max", "max_tokens": 16000,
+                "effort": "max",
+                "max_tokens": 16000,
             },
         )
         text = "".join(getattr(c, "text", "") for c in res.content)
-        check("one bad model does not lose the others",
-              "moonshotai/kimi-k3" in text and "1/2 answered" in text,
-              next((line for line in text.splitlines() if "answered" in line), "")[:90])
-        check("an unreachable model is labelled FAILED, not NO ANSWER",
-              "no-such-model-xyz - FAILED" in text,
-              next((line for line in text.splitlines() if "no-such-model" in line), "")[:90])
+        check(
+            "one bad model does not lose the others",
+            "moonshotai/kimi-k3" in text and "1/2 answered" in text,
+            next((line for line in text.splitlines() if "answered" in line), "")[:90],
+        )
+        check(
+            "an unreachable model is labelled FAILED, not NO ANSWER",
+            "no-such-model-xyz - FAILED" in text,
+            next((line for line in text.splitlines() if "no-such-model" in line), "")[:90],
+        )
 
         # An attachment has to survive the whole path: tool argument, base64,
         # the wire, and the model actually seeing it. A codeword the model can
@@ -188,21 +247,24 @@ async def main() -> int:
                 "ask_llm",
                 {
                     "question": "What codeword is in the attached PDF? Reply with just it.",
-                    "model": "kimi", "files": [str(pdf)],
-                    "effort": "max", "max_tokens": 16000,
+                    "model": "kimi",
+                    "files": [str(pdf)],
+                    "effort": "max",
+                    "max_tokens": 16000,
                 },
             )
             text = "".join(getattr(c, "text", "") for c in res.content)
-            check("a pdf attachment reaches the model", "PELICAN-9931" in text,
-                  text.strip()[-160:])
-            check("the answer says the file was attached, not pasted",
-                  "attached 1 file" in text)
+            check("a pdf attachment reaches the model", "PELICAN-9931" in text, text.strip()[-160:])
+            check("the answer says the file was attached, not pasted", "attached 1 file" in text)
 
         # error path must come back as a readable message, not a crash
         res = await client.call_tool("ask_llm", {"question": "hi", "model": "no-such-model-xyz"})
         text = "".join(getattr(c, "text", "") for c in res.content)
-        check("unknown model gives a usable error", "cannot resolve model" in text.lower(),
-              text.strip()[:160])
+        check(
+            "unknown model gives a usable error",
+            "cannot resolve model" in text.lower(),
+            text.strip()[:160],
+        )
 
     print()
     if failures:

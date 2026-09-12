@@ -142,7 +142,7 @@ def _guide_index() -> str:
     loud below rather than left for someone to discover.
     """
     try:
-        rows = core.list_guides()[:core.MAX_INDEXED_GUIDES]
+        rows = core.list_guides()[: core.MAX_INDEXED_GUIDES]
     except Exception:
         # A guides directory problem must never stop the server starting.
         return ""
@@ -157,9 +157,7 @@ def _guide_index() -> str:
         "the server starts; read_guide with no arguments is always current.",
         "",
     ]
-    lines += [
-        f"  {_clean(r['topic'], 24):<24} {_clean(r['triggers'], 110)}" for r in rows
-    ]
+    lines += [f"  {_clean(r['topic'], 24):<24} {_clean(r['triggers'], 110)}" for r in rows]
     return "\n".join(lines)
 
 
@@ -198,8 +196,11 @@ def _render(result: dict[str, Any], include_reasoning: bool = False) -> str:
         billed_call = bool(usage)
         lines = [
             f"### {result.get('model') or result.get('requested')} - "
-            + ("INCOMPLETE" if result.get("incomplete") else
-               ("NO ANSWER" if billed_call else "FAILED")),
+            + (
+                "INCOMPLETE"
+                if result.get("incomplete")
+                else ("NO ANSWER" if billed_call else "FAILED")
+            ),
             "",
             str(result.get("error")),
         ]
@@ -221,9 +222,7 @@ def _render(result: dict[str, Any], include_reasoning: bool = False) -> str:
     if result.get("latency_s") is not None:
         bits.append(f"{result['latency_s']}s")
     if usage.get("prompt_tokens") is not None:
-        bits.append(
-            f"tokens in/out: {usage.get('prompt_tokens')}/{usage.get('completion_tokens')}"
-        )
+        bits.append(f"tokens in/out: {usage.get('prompt_tokens')}/{usage.get('completion_tokens')}")
     if usage.get("reasoning_tokens"):
         bits.append(f"reasoning: {usage['reasoning_tokens']}")
     window = result.get("context_window") or 0
@@ -423,13 +422,26 @@ async def ask_llm(
     allow_secret_files, secret_note = _gate("mcp_allow_secret_files", allow_secret_files)
     result = await _run(
         core.ask,
-        question=question, model=model, category=category, context=context, files=files,
-        role=role, effort=effort, system=system, max_tokens=max_tokens,
-        max_context_tokens=max_context_tokens, context_compression=context_compression,
+        question=question,
+        model=model,
+        category=category,
+        context=context,
+        files=files,
+        role=role,
+        effort=effort,
+        system=system,
+        max_tokens=max_tokens,
+        max_context_tokens=max_context_tokens,
+        context_compression=context_compression,
         temperature=temperature,
-        thread=thread, cwd=cwd, pdf_engine=pdf_engine, allow_expensive=allow_expensive,
-        allow_secret_files=allow_secret_files, include_reasoning=show_reasoning,
-        effort_reason=effort_reason, _mcp_call=True,
+        thread=thread,
+        cwd=cwd,
+        pdf_engine=pdf_engine,
+        allow_expensive=allow_expensive,
+        allow_secret_files=allow_secret_files,
+        include_reasoning=show_reasoning,
+        effort_reason=effort_reason,
+        _mcp_call=True,
     )
     return _note(_render(result, show_reasoning), shape_note, expensive_note, secret_note)
 
@@ -447,7 +459,8 @@ async def ask_llm(
         "category pairs different vendors, so the panel is independent houses rather than "
         "one lab asked twice. "
         "Costs one call per model; one model failing does not lose the others.\n\n"
-        + CALL_SHAPE + " `models` is a JSON array of aliases or slugs."
+        + CALL_SHAPE
+        + " `models` is a JSON array of aliases or slugs."
     ),
 )
 async def ask_panel(
@@ -516,12 +529,25 @@ async def ask_panel(
     allow_secret_files, secret_note = _gate("mcp_allow_secret_files", allow_secret_files)
     results = await _run(
         core.ask_panel,
-        question=question, models=models, category=category, context=context, files=files,
-        role=role, effort=effort, system=system, max_tokens=max_tokens,
-        max_context_tokens=max_context_tokens, context_compression=context_compression,
-        temperature=temperature, cwd=cwd, pdf_engine=pdf_engine,
-        allow_expensive=allow_expensive, allow_secret_files=allow_secret_files,
-        include_reasoning=show_reasoning, effort_reason=effort_reason, _mcp_call=True,
+        question=question,
+        models=models,
+        category=category,
+        context=context,
+        files=files,
+        role=role,
+        effort=effort,
+        system=system,
+        max_tokens=max_tokens,
+        max_context_tokens=max_context_tokens,
+        context_compression=context_compression,
+        temperature=temperature,
+        cwd=cwd,
+        pdf_engine=pdf_engine,
+        allow_expensive=allow_expensive,
+        allow_secret_files=allow_secret_files,
+        include_reasoning=show_reasoning,
+        effort_reason=effort_reason,
+        _mcp_call=True,
     )
     # Every result, not just the ones that answered: an empty completion is ok: False and is
     # still billed, so filtering on ok reports a total lower than the invoice.
@@ -577,7 +603,11 @@ async def list_llm_models(
         sort: intelligence (default), context, price, or name.
     """
     rows = await _run(
-        core.list_models, search=search, vendor=vendor, limit=limit, sort=sort,
+        core.list_models,
+        search=search,
+        vendor=vendor,
+        limit=limit,
+        sort=sort,
     )
     if not rows:
         return f"No models matched search={search!r} vendor={vendor!r}."
@@ -647,9 +677,11 @@ async def list_llm_categories(verify: bool = False) -> str:
     if excluded:
         lines += [
             "",
-            (f"Category picks never return {' or '.join(excluded)} models: this bridge is for "
-            "an opinion from outside the agent asking. Ask for one of those by full slug if "
-            "you specifically want it."),
+            (
+                f"Category picks never return {' or '.join(excluded)} models: this bridge is for "
+                "an opinion from outside the agent asking. Ask for one of those by full slug if "
+                "you specifically want it."
+            ),
         ]
     return "\n".join(lines)
 
@@ -697,7 +729,7 @@ def _guide_topics() -> str:
     whether a harness surfaces server instructions is its own choice.
     """
     try:
-        topics = ", ".join(r["topic"] for r in core.list_guides()[:core.MAX_INDEXED_GUIDES])
+        topics = ", ".join(r["topic"] for r in core.list_guides()[: core.MAX_INDEXED_GUIDES])
     except Exception:
         return ""
     return f" Guides on this machine: {topics}." if topics else ""

@@ -1,12 +1,12 @@
 """Command-line front-end: orask.
 
-    orask "why is this leaking?" -m glm -f server.py
-    orask "what does this diagram show?" -f ~/shots/arch.png -m glm
-    orask "does this spec contradict itself?" -f ~/docs/spec.pdf
-    git diff | orask ask "review this diff" --role reviewer
-    orask panel "is this plan sound?" -c "$(cat PLAN.md)"
-    orask models --search kimi
-    orask doctor
+orask "why is this leaking?" -m glm -f server.py
+orask "what does this diagram show?" -f ~/shots/arch.png -m glm
+orask "does this spec contradict itself?" -f ~/docs/spec.pdf
+git diff | orask ask "review this diff" --role reviewer
+orask panel "is this plan sound?" -c "$(cat PLAN.md)"
+orask models --search kimi
+orask doctor
 """
 
 from __future__ import annotations
@@ -25,8 +25,18 @@ from typing import Any
 
 from . import __version__, core
 
-SUBCOMMANDS = {"ask", "panel", "models", "info", "usage", "threads", "log", "doctor",
-               "categories", "guide"}
+SUBCOMMANDS = {
+    "ask",
+    "panel",
+    "models",
+    "info",
+    "usage",
+    "threads",
+    "log",
+    "doctor",
+    "categories",
+    "guide",
+}
 
 
 def _cost_value(value: Any) -> float | None:
@@ -153,8 +163,9 @@ def read_stdin_safely(wait: float | None = None) -> str:
         if remaining <= 0:
             timed_out()
         try:
-            ready, _, _ = select.select([fd], [], [],
-                                        remaining if drainable else min(wait, remaining))
+            ready, _, _ = select.select(
+                [fd], [], [], remaining if drainable else min(wait, remaining)
+            )
         except (OSError, ValueError, OverflowError) as exc:
             raise core.OpenRouterError(
                 "cannot read stdin safely; no call was sent. Check ORASK_STDIN_WAIT "
@@ -198,42 +209,58 @@ def _shared_ask_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("question", nargs="+", help="the question to ask")
     parser.add_argument("-c", "--context", help="background text to include")
     parser.add_argument(
-        "-f", "--file", action="append", default=[], metavar="PATH",
+        "-f",
+        "--file",
+        action="append",
+        default=[],
+        metavar="PATH",
         help="send a file, or a directory of files (repeatable). Source goes in as "
-             "text; a PDF, image or audio file is attached to the message directly",
+        "text; a PDF, image or audio file is attached to the message directly",
     )
     parser.add_argument(
-        "--pdf-engine", choices=list(core.PDF_ENGINES),
+        "--pdf-engine",
+        choices=list(core.PDF_ENGINES),
         help="how an attached PDF is read (default: cloudflare-ai, free)",
     )
     parser.add_argument("-e", "--effort", help="reasoning effort: low|medium|high|xhigh|max|none")
     parser.add_argument(
-        "-r", "--role",
+        "-r",
+        "--role",
         help="advisor (default) | reviewer | debugger | architect | redteam",
     )
     parser.add_argument("-s", "--system", help="override the system prompt entirely")
     parser.add_argument(
-        "--max-tokens", type=int,
+        "--max-tokens",
+        type=int,
         help="cap reasoning plus final-answer tokens; size for task complexity",
     )
     parser.add_argument(
-        "--max-context-tokens", type=int, metavar="N",
+        "--max-context-tokens",
+        type=int,
+        metavar="N",
         help="budget prompt plus answer into N tokens; capped at the model's own window",
     )
     parser.add_argument(
-        "--compress", dest="compress", action="store_true", default=None,
+        "--compress",
+        dest="compress",
+        action="store_true",
+        default=None,
         help="let OpenRouter drop text from the middle of an oversized prompt",
     )
     parser.add_argument(
-        "--no-compress", dest="compress", action="store_false",
+        "--no-compress",
+        dest="compress",
+        action="store_false",
         help="refuse an oversized prompt instead, even on an endpoint that compresses by default",
     )
     parser.add_argument("--temperature", type=float)
     parser.add_argument("--show-reasoning", action="store_true", help="print reasoning too")
-    parser.add_argument("--allow-expensive", action="store_true",
-                        help="bypass the per-call cost guard")
     parser.add_argument(
-        "--allow-secret-files", action="store_true",
+        "--allow-expensive", action="store_true", help="bypass the per-call cost guard"
+    )
+    parser.add_argument(
+        "--allow-secret-files",
+        action="store_true",
         help="permit sending files that match the secrets denylist",
     )
     parser.add_argument("--json", action="store_true", help="machine-readable output")
@@ -251,19 +278,23 @@ def build_parser() -> argparse.ArgumentParser:
     _shared_ask_args(ask)
     ask.add_argument("-m", "--model", help="alias (kimi, glm) or full OpenRouter slug")
     ask.add_argument(
-        "-C", "--category",
+        "-C",
+        "--category",
         help="pick by capability instead of naming a model: coding, debugging, reasoning, "
-             "math, chat, agentic, research, long_context, creative, budget, general",
+        "math, chat, agentic, research, long_context, creative, budget, general",
     )
     ask.add_argument("-t", "--thread", help="keep a named conversation for follow-ups")
 
     panel = subs.add_parser("panel", help="ask several models in parallel and compare")
     _shared_ask_args(panel)
     panel.add_argument(
-        "-M", "--models", help="comma-separated list (default: kimi,glm)",
+        "-M",
+        "--models",
+        help="comma-separated list (default: kimi,glm)",
     )
     panel.add_argument(
-        "-C", "--category",
+        "-C",
+        "--category",
         help="put the two current leaders for a capability against each other",
     )
 
@@ -272,7 +303,8 @@ def build_parser() -> argparse.ArgumentParser:
     models.add_argument("--vendor", help="restrict to one vendor, e.g. moonshotai")
     models.add_argument("--limit", type=int, default=25)
     models.add_argument(
-        "--sort", default="intelligence",
+        "--sort",
+        default="intelligence",
         choices=["intelligence", "context", "price", "name"],
     )
     models.add_argument("--include-batch", action="store_true")
@@ -294,8 +326,9 @@ def build_parser() -> argparse.ArgumentParser:
     log.add_argument("--json", action="store_true")
 
     cats = subs.add_parser("categories", help="capabilities you can ask for by name")
-    cats.add_argument("--verify", action="store_true",
-                      help="check each pinned model against the live catalogue")
+    cats.add_argument(
+        "--verify", action="store_true", help="check each pinned model against the live catalogue"
+    )
     cats.add_argument("--json", action="store_true")
 
     guide = subs.add_parser("guide", help="local best-practice guides (free, no model call)")
@@ -303,8 +336,11 @@ def build_parser() -> argparse.ArgumentParser:
     guide.add_argument("section", nargs="?", help="one heading within that guide")
     guide.add_argument("--search", metavar="TEXT", help="search across every guide")
     guide.add_argument("--all", action="store_true", help="print the whole guide")
-    guide.add_argument("--stale", action="store_true",
-                       help="list guides whose verified date is over six months old")
+    guide.add_argument(
+        "--stale",
+        action="store_true",
+        help="list guides whose verified date is over six months old",
+    )
 
     subs.add_parser("doctor", help="check key, catalogue, aliases and registrations")
     return parser
@@ -315,11 +351,13 @@ def _cmd_categories(args: argparse.Namespace) -> int:
     status = 0
     if args.verify:
         checks = {(r["category"], r["slug"]): r for r in core.verify_categories()}
-        status = int(any(not r.get("available") or r.get("excluded_vendor")
-                         for r in checks.values()))
+        status = int(
+            any(not r.get("available") or r.get("excluded_vendor") for r in checks.values())
+        )
     if args.json:
-        payload = rows if not args.verify else {"categories": rows,
-                                                "verified": list(checks.values())}
+        payload = (
+            rows if not args.verify else {"categories": rows, "verified": list(checks.values())}
+        )
         print(json.dumps(payload, indent=2))
         return status
 
@@ -330,8 +368,13 @@ def _cmd_categories(args: argparse.Namespace) -> int:
             if args.verify:
                 check = checks.get((row["category"], slug)) or {}
                 iq = check.get("intelligence_index")
-                state = ("EXCLUDED VENDOR" if check.get("excluded_vendor") else
-                         "ok" if check.get("available") else "NO LONGER LISTED")
+                state = (
+                    "EXCLUDED VENDOR"
+                    if check.get("excluded_vendor")
+                    else "ok"
+                    if check.get("available")
+                    else "NO LONGER LISTED"
+                )
                 line += f"    [{state}" + (f", index {iq:.1f}" if iq is not None else "") + "]"
             print(line)
         if row["aka"]:
@@ -376,8 +419,7 @@ def _cmd_ask(args: argparse.Namespace) -> int:
 def _cmd_panel(args: argparse.Namespace) -> int:
     models = [m.strip() for m in (args.models or "").split(",") if m.strip()] or None
     started = time.monotonic()
-    if (getattr(args, "category", None) and not getattr(args, "models", None)
-            and not args.json):
+    if getattr(args, "category", None) and not getattr(args, "models", None) and not args.json:
         match = core.resolve_category(args.category)
         if match:
             name, spec = match
@@ -424,8 +466,11 @@ def _cmd_models(args: argparse.Namespace) -> int:
     if args.refresh:
         core.get_catalog(refresh=True)
     rows = core.list_models(
-        search=args.search, vendor=args.vendor, limit=args.limit,
-        include_batch=args.include_batch, sort=args.sort,
+        search=args.search,
+        vendor=args.vendor,
+        limit=args.limit,
+        include_batch=args.include_batch,
+        sort=args.sort,
     )
     if args.json:
         print(json.dumps(rows, indent=2))
@@ -518,9 +563,13 @@ def _registration_issues(server: Any, *, codex: bool = False) -> list[str]:
     command = server.get("command")
     launcher = core.PROJECT_ROOT / "bin" / "openrouter-mcp"
     try:
-        current = (isinstance(command, str) and Path(command).is_absolute()
-                   and Path(command).resolve() == launcher.resolve()
-                   and launcher.is_file() and os.access(launcher, os.X_OK))
+        current = (
+            isinstance(command, str)
+            and Path(command).is_absolute()
+            and Path(command).resolve() == launcher.resolve()
+            and launcher.is_file()
+            and os.access(launcher, os.X_OK)
+        )
     except (OSError, ValueError):
         current = False
     if not current:
@@ -535,8 +584,10 @@ def _registration_issues(server: Any, *, codex: bool = False) -> list[str]:
     elif "ORASK_PYTHON" in env:
         interpreter = env["ORASK_PYTHON"]
         try:
-            matches = (Path(interpreter).is_absolute()
-                       and Path(interpreter).resolve() == Path(sys.executable).resolve())
+            matches = (
+                Path(interpreter).is_absolute()
+                and Path(interpreter).resolve() == Path(sys.executable).resolve()
+            )
         except (OSError, ValueError):
             matches = False
         if not matches:
@@ -546,8 +597,11 @@ def _registration_issues(server: Any, *, codex: bool = False) -> list[str]:
             issues.append("server is disabled or enabled is not a boolean")
         enabled = server.get("enabled_tools", list(core.MCP_TOOLS))
         disabled = server.get("disabled_tools", [])
-        if (not isinstance(enabled, list) or not isinstance(disabled, list)
-                or any(not isinstance(t, str) for t in [*enabled, *disabled])):
+        if (
+            not isinstance(enabled, list)
+            or not isinstance(disabled, list)
+            or any(not isinstance(t, str) for t in [*enabled, *disabled])
+        ):
             issues.append("enabled_tools and disabled_tools must be arrays of strings")
         else:
             available = set(enabled) - set(disabled)
@@ -615,7 +669,8 @@ def _cmd_doctor(_args: argparse.Namespace) -> int:
     try:
         usage = core.account_usage()
         check(
-            "account reachable", True,
+            "account reachable",
+            True,
             f"spent ${usage.get('account_usage_usd')} lifetime on this key; "
             f"bridge has logged {usage.get('bridge_calls_logged')} calls "
             f"(${usage.get('bridge_spend_usd')})",
@@ -626,17 +681,24 @@ def _cmd_doctor(_args: argparse.Namespace) -> int:
     # These are the installer's user-scope registrations. Project overrides, trust
     # policy and a running client's MCP handshake need checking in that client.
     claude_dir = os.environ.get("CLAUDE_CONFIG_DIR")
-    claude_json = (Path(claude_dir).expanduser() / ".claude.json" if claude_dir
-                   else Path.home() / ".claude.json")
+    claude_json = (
+        Path(claude_dir).expanduser() / ".claude.json"
+        if claude_dir
+        else Path.home() / ".claude.json"
+    )
     try:
         with claude_json.open(encoding="utf-8") as handle:
             data = json.load(handle)
         servers = data.get("mcpServers", {}) if isinstance(data, dict) else None
         server = servers.get("openrouter") if isinstance(servers, dict) else None
         issues = _registration_issues(server)
-        check("Claude Code user-scope registration", not issues,
-              "; ".join(issues) + "; run install.sh, then restart Claude Code" if issues
-              else "configured for this checkout")
+        check(
+            "Claude Code user-scope registration",
+            not issues,
+            "; ".join(issues) + "; run install.sh, then restart Claude Code"
+            if issues
+            else "configured for this checkout",
+        )
     except (OSError, ValueError) as exc:
         check("Claude Code user-scope registration", False, f"{claude_json}: {exc}")
 
@@ -645,9 +707,13 @@ def _cmd_doctor(_args: argparse.Namespace) -> int:
     try:
         server = _codex_registration(codex_toml)
         issues = _registration_issues(server, codex=True)
-        check("Codex user-scope registration", not issues,
-              "; ".join(issues) + "; run install.sh, then restart Codex" if issues
-              else f"configured for this checkout; {len(core.MCP_TOOLS)} tools enabled")
+        check(
+            "Codex user-scope registration",
+            not issues,
+            "; ".join(issues) + "; run install.sh, then restart Codex"
+            if issues
+            else f"configured for this checkout; {len(core.MCP_TOOLS)} tools enabled",
+        )
     except (OSError, ValueError, core.OpenRouterError) as exc:
         check("Codex user-scope registration", False, f"{codex_toml}: {exc}")
 
@@ -706,9 +772,16 @@ def _cmd_guide(args: argparse.Namespace) -> int:
 
 
 HANDLERS = {
-    "ask": _cmd_ask, "panel": _cmd_panel, "models": _cmd_models, "info": _cmd_info,
-    "usage": _cmd_usage, "threads": _cmd_threads, "log": _cmd_log, "doctor": _cmd_doctor,
-    "categories": _cmd_categories, "guide": _cmd_guide,
+    "ask": _cmd_ask,
+    "panel": _cmd_panel,
+    "models": _cmd_models,
+    "info": _cmd_info,
+    "usage": _cmd_usage,
+    "threads": _cmd_threads,
+    "log": _cmd_log,
+    "doctor": _cmd_doctor,
+    "categories": _cmd_categories,
+    "guide": _cmd_guide,
 }
 
 
