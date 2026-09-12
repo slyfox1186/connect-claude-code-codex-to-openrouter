@@ -1400,8 +1400,10 @@ check("every @mcp.tool is in core.MCP_TOOLS",
       sorted(_declared) == sorted(core.MCP_TOOLS),
       f"decorators {sorted(_declared)} vs constant {sorted(core.MCP_TOOLS)}")
 _install_src = (ROOT / "install.sh").read_text()
+_install_config_src = (ROOT / "src/orask/install_config.py").read_text()
 check("the installer derives the Codex tool list instead of repeating it",
-      "from orask.core import MCP_TOOLS" in _install_src)
+      "-m orask.install_config" in _install_src
+      and "from .core import MCP_TOOLS" in _install_config_src)
 check("the live MCP protocol test expects the same set",
       sorted(re.findall(r'"([a-z_]+)"',
              (ROOT / "tests" / "test_mcp_stdio.py").read_text()

@@ -12,12 +12,12 @@ source "$PROJECT/bin/_python-env.sh"
 
 : "${HOME:?HOME must be set}"
 BIN_DIR="$HOME/.local/bin"
-CLAUDE_JSON="$HOME/.claude.json"
-CODEX_TOML="$HOME/.codex/config.toml"
+CLAUDE_JSON="${CLAUDE_CONFIG_DIR:-$HOME}/.claude.json"
+CODEX_TOML="${CODEX_HOME:-$HOME/.codex}/config.toml"
 CONFIG_DIR="${ORASK_CONFIG_DIR:-$HOME/.config/openrouter}"
 KEY_FILE="$CONFIG_DIR/env"
 PIN_FILE="$PROJECT/.orask-python"
-STAMP="$(date +%Y-%m-%d_%H%M%S)"
+STAMP="$(date +%Y-%m-%d_%H%M%S).$$"
 CHANGED=0
 # From the shared helper, so the installer's floor and the launchers' floor cannot drift.
 MIN_PYTHON="$ORASK_MIN_PYTHON_MAJOR.$ORASK_MIN_PYTHON_MINOR"
@@ -92,10 +92,15 @@ bootstrap_venv() {
 }
 
 step "Checking prerequisites"
-orask_find_python "$PROJECT" || true
+if ! orask_find_python "$PROJECT" && [[ -n ${ORASK_PYTHON:-} ]]; then
+    die "Nothing installed: fix ORASK_PYTHON or unset it to enable interpreter search."
+fi
 if python_ok "${PYTHON:-}"; then
     say "interpreter ready: $PYTHON ($(python_report "$PYTHON"))"
 else
+    if [[ -n ${ORASK_PYTHON:-} ]]; then
+        die "Nothing installed: ORASK_PYTHON must have Python >= $MIN_PYTHON and mcp.server.mcpserver."
+    fi
     # Anything on the machine that could at least build an env.
     BASE_PYTHON="${PYTHON:-}"
     [[ -n $BASE_PYTHON ]] || BASE_PYTHON="$(command -v python3 2>/dev/null || true)"
@@ -171,6 +176,11 @@ fi
 step "Installing launchers into $BIN_DIR"
 mkdir -p "$BIN_DIR"
 for tool in orask openrouter-mcp; do
+    if [[ -e $BIN_DIR/$tool && ! -L $BIN_DIR/$tool ]]; then
+        die "Refusing to replace $BIN_DIR/$tool: move the existing file or directory first."
+    fi
+done
+for tool in orask openrouter-mcp; do
     ln -sfn "$PROJECT/bin/$tool" "$BIN_DIR/$tool"
     say "$BIN_DIR/$tool -> $PROJECT/bin/$tool"
 done
@@ -196,13 +206,25 @@ else
     # An entry left by an older install points at whatever was true then: a
     # different project directory, a different interpreter, no env at all. It
     # has to be compared against what this run would write, not just counted.
-    CLAUDE_STATE="$("$PYTHON" - "$CLAUDE_JSON" "$SERVER_JSON" <<'PY' || echo failed
+    if ! CLAUDE_STATE="$(PYTHONPATH="$PROJECT/src${PYTHONPATH:+:$PYTHONPATH}" \
+        "$PYTHON" - "$CLAUDE_JSON" "$SERVER_JSON" <<'PY'
 import json, sys
+from pathlib import Path
+from orask.install_config import read_config
 try:
-    with open(sys.argv[1], encoding="utf-8") as fh:
-        current = (json.load(fh).get("mcpServers") or {}).get("openrouter")
+    contents = read_config(Path(sys.argv[1]))
+    config = json.loads(contents.decode("utf-8")) if contents is not None else {}
+    if not isinstance(config, dict):
+        raise ValueError("Claude config must be an object")
+    servers = config.get("mcpServers", {})
+    if not isinstance(servers, dict):
+        raise ValueError("mcpServers must be an object")
+    current = servers.get("openrouter")
+    if current is not None and not isinstance(current, dict):
+        raise ValueError("openrouter must be an object")
 except (OSError, ValueError):
-    current = None
+    print("Claude config is unreadable or invalid; no registration attempted.", file=sys.stderr)
+    raise SystemExit(1) from None
 if not current:
     print("missing")
     raise SystemExit
@@ -212,19 +234,24 @@ want = json.loads(sys.argv[2])
 drift = sorted(key for key, value in want.items() if current.get(key) != value)
 print("current" if not drift else "stale:" + ",".join(drift))
 PY
-)"
+)"; then
+        die "FAILED: could not read $CLAUDE_JSON; repair its access or JSON before retrying."
+    fi
     case "$CLAUDE_STATE" in
         current)
             say "already registered and up to date" ;;
-        failed)
-            say "FAILED: could not read $CLAUDE_JSON; register by hand with:"
-            say "  claude mcp add-json openrouter '$SERVER_JSON' --scope user" ;;
         *)
-            cp -p "$CLAUDE_JSON" "$HOME/.claude.json.bak.$STAMP" 2>/dev/null \
-                && say "backed up ~/.claude.json -> ~/.claude.json.bak.$STAMP"
+            if [[ -e $CLAUDE_JSON || -L $CLAUDE_JSON ]]; then
+                PYTHONPATH="$PROJECT/src${PYTHONPATH:+:$PYTHONPATH}" \
+                    "$PYTHON" -m orask.install_config backup "$CLAUDE_JSON" \
+                    "$CLAUDE_JSON.bak.$STAMP" \
+                    || die "FAILED: could not back up $CLAUDE_JSON; no registration attempted."
+                say "backed up $CLAUDE_JSON -> $CLAUDE_JSON.bak.$STAMP"
+            fi
             if [[ $CLAUDE_STATE == stale:* ]]; then
                 say "registered, but out of date (${CLAUDE_STATE#stale:}); replacing it"
-                claude mcp remove openrouter -s user >/dev/null 2>&1 || true
+                claude mcp remove openrouter -s user >/dev/null \
+                    || die "FAILED: Claude removal failed; no replacement attempted. Backup retained."
             fi
             # Written through the Claude CLI rather than by editing ~/.claude.json
             # directly, because a running session owns that file.
@@ -238,100 +265,25 @@ PY
             else
                 say "FAILED: 'claude mcp add-json' did not accept the server; register it by hand with:"
                 say "  claude mcp add-json openrouter '$SERVER_JSON' --scope user"
+                die "Installation incomplete. Any existing Claude config backup was retained."
             fi ;;
     esac
 fi
 
 step "Registering the MCP server with Codex"
-if [[ ! -f $CODEX_TOML ]] && ! command -v codex >/dev/null 2>&1; then
+if [[ ! -e $CODEX_TOML && ! -L $CODEX_TOML ]] && ! command -v codex >/dev/null 2>&1; then
     say "SKIPPED: Codex is not installed ($CODEX_TOML does not exist)"
 else
-    if [[ -f $CODEX_TOML ]]; then
-        cp -p "$CODEX_TOML" "$CODEX_TOML.bak.$STAMP"
-    else
-        mkdir -p "$(dirname "$CODEX_TOML")"
-        say "creating $CODEX_TOML"
+    # The editor reads and validates before making a private backup and replacing
+    # the file atomically. Read errors must never be interpreted as an empty config.
+    if ! CODEX_STATE="$(PYTHONPATH="$PROJECT/src${PYTHONPATH:+:$PYTHONPATH}" \
+        "$PYTHON" -m orask.install_config "$CODEX_TOML" "$PROJECT/bin/openrouter-mcp" \
+        "$PYTHON" "$CODEX_TOML.bak.$STAMP")"; then
+        die "FAILED: could not safely update $CODEX_TOML. Installation incomplete."
     fi
-    # An existing block is rewritten in place rather than left alone. A block
-    # written by an older install can name a stale project path, or list fewer
-    # tools than the server now has, and Codex would go on believing it.
-    CODEX_STATE="$("$PYTHON" - "$CODEX_TOML" "$PROJECT/bin/openrouter-mcp" "$PYTHON" "$PROJECT/src" <<'PY' || echo failed
-import json, os, sys, tempfile
-
-path, command, interpreter, PROJECT_SRC = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
-HEADER = "[mcp_servers.openrouter]"
-# The list lives in core so the installer, doctor and the offline suite cannot
-# drift from each other. core is stdlib-only, so importing it here is free.
-sys.path.insert(0, PROJECT_SRC)
-from orask.core import MCP_TOOLS  # noqa: E402
-TOOLS = list(MCP_TOOLS)
-block = f"""{HEADER}
-command = {json.dumps(command)}
-args = []
-env = {{ ORASK_PYTHON = {json.dumps(interpreter)} }}
-startup_timeout_sec = 30
-# Reasoning models on a large context can take minutes; a panel runs in parallel.
-tool_timeout_sec = 600
-enabled_tools = {json.dumps(TOOLS)}
-"""
-
-try:
-    with open(path, encoding="utf-8") as fh:
-        original = fh.read()
-except OSError:
-    original = ""
-
-lines = original.splitlines(keepends=True)
-start = end = None
-for index, line in enumerate(lines):
-    stripped = line.strip()
-    if start is None:
-        if stripped == HEADER:
-            start = index
-        continue
-    # The block ends at the next table header that is not one of its own
-    # subtables; a trailing subtable belongs to this server and is replaced
-    # with it rather than orphaned under the next one.
-    if stripped.startswith("[") and not stripped.startswith("[mcp_servers.openrouter."):
-        end = index
-        break
-
-if start is None:
-    updated = original
-    if updated and not updated.endswith("\n"):
-        updated += "\n"
-    updated += "\n" + block
-    state = "added"
-else:
-    if end is None:
-        end = len(lines)
-    if "".join(lines[start:end]).strip() == block.strip():
-        print("unchanged")
-        raise SystemExit
-    updated = "".join(lines[:start]) + block + "".join(lines[end:])
-    state = "updated"
-
-# Written through a temporary file and renamed: a half-written config.toml
-# would stop Codex from starting at all.
-directory = os.path.dirname(os.path.abspath(path)) or "."
-os.makedirs(directory, exist_ok=True)
-handle = tempfile.NamedTemporaryFile(
-    "w", encoding="utf-8", dir=directory, prefix=".orask-", delete=False
-)
-try:
-    handle.write(updated)
-    handle.flush()
-    os.fsync(handle.fileno())
-finally:
-    handle.close()
-os.replace(handle.name, path)
-print(state)
-PY
-)"
     case "$CODEX_STATE" in
         unchanged)
-            say "already registered and up to date"
-            rm -f "$CODEX_TOML.bak.$STAMP" ;;
+            say "already registered and up to date" ;;
         added)
             CHANGED=1
             say "appended [mcp_servers.openrouter] to $CODEX_TOML" ;;
@@ -340,8 +292,7 @@ PY
             say "rewrote the existing [mcp_servers.openrouter] block"
             say "backed up -> $CODEX_TOML.bak.$STAMP" ;;
         *)
-            say "FAILED: could not update $CODEX_TOML"
-            say "the file is unchanged; a copy of it is at $CODEX_TOML.bak.$STAMP" ;;
+            die "FAILED: unexpected Codex editor result. Installation incomplete." ;;
     esac
 fi
 

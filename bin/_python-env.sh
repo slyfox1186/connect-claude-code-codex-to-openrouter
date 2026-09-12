@@ -13,7 +13,7 @@ ORASK_MIN_PYTHON_MINOR=10
 # SDK. Whether mcp is importable is an install-time question, answered in install.sh.
 orask_python_new_enough() {
     [[ -n ${1:-} && -x ${1:-} ]] || return 1
-    "$1" -c "import sys; raise SystemExit(0 if sys.version_info[:2] >= ($ORASK_MIN_PYTHON_MAJOR, $ORASK_MIN_PYTHON_MINOR) else 1)" 2>/dev/null
+    "$1" -c "import sys; raise SystemExit(0 if sys.version_info[:2] >= ($ORASK_MIN_PYTHON_MAJOR, $ORASK_MIN_PYTHON_MINOR) else 1)" >/dev/null 2>&1
 }
 
 # readlink -f is GNU; BSD and older macOS do not have it, so walk the symlinks.
@@ -29,10 +29,10 @@ orask_project_root() {
 
 # Every conda-style root a machine might plausibly have, most likely first.
 orask_conda_roots() {
-    local home="${HOME:-}" root base
-    if [[ -n $home ]]; then
+    local user_home="${HOME:-}" root base
+    if [[ -n $user_home ]]; then
         for base in miniconda3 anaconda3 miniforge3 mambaforge micromamba; do
-            printf '%s\n' "$home/$base"
+            printf '%s\n' "$user_home/$base"
         done
     fi
     printf '%s\n' "/opt/conda"
@@ -56,11 +56,17 @@ orask_find_python() {
     local root="$1" candidate conda_root
     local -a candidates=()
 
-    # An explicit override is honoured as given: if someone points ORASK_PYTHON at an
-    # interpreter, second-guessing it helps nobody.
+    # An explicit override is a requirement, not a search hint. A typo or old
+    # interpreter must never silently select another environment.
     PYTHON="${ORASK_PYTHON:-}"
-    if [[ -n $PYTHON && -x $PYTHON ]]; then
-        return 0
+    if [[ -n $PYTHON ]]; then
+        if orask_python_new_enough "$PYTHON"; then
+            return 0
+        fi
+        printf 'orask: ORASK_PYTHON must name an executable Python >= %s.%s: %s\n' \
+            "$ORASK_MIN_PYTHON_MAJOR" "$ORASK_MIN_PYTHON_MINOR" "$PYTHON" >&2
+        PYTHON=""
+        return 1
     fi
 
     if [[ -f $root/.orask-python ]]; then
