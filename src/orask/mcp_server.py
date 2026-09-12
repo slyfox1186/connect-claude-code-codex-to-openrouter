@@ -19,6 +19,21 @@ from mcp.server.mcpserver.exceptions import ToolError
 
 from . import __version__, consultations, core
 
+CODING_PANEL_GUIDANCE = (
+    'For "Ask all of coding LLMs to ...", "all coding models", or "the coding LLMs", '
+    'call ask_panel(category="coding", question="the complete requested task") with '
+    "models unset. The coding group is exactly four: "
+    + ", ".join(f"{label} (`{slug}`)" for slug, label in core.CODING_PANEL.items())
+    + ". The task can be anything; its subject does not change the requested group. "
+    "This named group includes Google Flash regardless of benchmark-category vendor "
+    "exclusions, alias overrides or default_panel. All four IDs are exact: if one is "
+    "unavailable, report failure instead of substituting a different model or version. "
+    "Only an explicit user request to change the members "
+    "overrides the group; then pass that roster as models. If a member fails or is "
+    "unavailable, report its failed slot and the answered count; never describe fewer "
+    "than four completed answers as all four."
+)
+
 INSTRUCTIONS = """\
 Second-opinion bridge to other frontier LLMs through OpenRouter.
 
@@ -29,30 +44,31 @@ compare. The other model cannot see the repository, so pass the relevant code
 with `files` and the situation with `context` - a question with no context
 gets a generic answer.
 
+{coding_panel_guidance}
+
 Never paste a file's contents into `question` or `context`. Put its path in
 `files` and the bridge sends the file itself: source and prose go in as text,
 while a PDF, screenshot, diagram or sound file is attached to the message as
 a real attachment. A directory path in `files` sends the files inside it.
 
-When the user names a capability instead of a model, pass it as `category` and
+For other capability requests, pass the requested capability as `category` and
 leave `model` and `models` unset. Which tool depends on how they said it:
 
   singular - "ask an LLM that is good at coding", "something strong at math"
              -> ask_llm with category
-  plural   - "use the coding LLMs", "ask the reasoning models", "what do the
+  plural   - "ask the reasoning models", "what do the
              debugging ones say" -> ask_panel with category
 
-Pass the user's own words as `category`. It is matched against the category
-names, their synonyms, and any phrase containing one, so "use the coding LLMs
-to review this" resolves on its own. A phrase matching nothing is refused
-rather than guessed at, so you do not need to map it yourself first.
+Keep the requested task in `question` and the recipient capability in `category`.
+Category names and synonyms are accepted; a phrase matching nothing is refused.
+Task words and instructions inside reference files do not select the recipients.
 
-Each category resolves to the current benchmark leaders for it, two different
-vendors on purpose; list_llm_categories shows the evidence behind each pick.
+Benchmark categories carry two model pins from different vendors;
+list_llm_categories shows their recorded selection evidence. ask_llm takes the
+first pin; ask_panel uses both except for coding, which uses the four-member group.
 
-Category picks never return an OpenAI, Anthropic or Google model: this bridge
-exists to fetch a view from outside the agent asking. Ask for one of those by
-full slug if you specifically want it.
+Benchmark picks exclude OpenAI, Anthropic and Google by default. This filter
+does not apply to the named coding group or explicitly requested models.
 
 Any OpenRouter model can be reached by passing its full slug; use
 list_llm_models to find one. Short aliases are configured for these:
@@ -68,7 +84,7 @@ A long `context` is fine and expected; length is not what breaks a call.
 
 Budget each consultation for a completed answer. Before a large review or a
 retry after truncation, inspect llm_model_info for every selected model; for a
-category panel, list_llm_categories identifies its models first. Use the returned
+category panel, list_llm_categories identifies its panel roster first. Use the returned
 context_length, max_output_tokens, reasoning_efforts and bridge_limits to choose
 max_tokens and effort for the task. MCP defaults to max: prefer max or xhigh.
 Medium is permitted only with a concrete task-specific effort_reason. Low,
@@ -103,7 +119,7 @@ Two safety overrides exist but are off for tool calls: `allow_secret_files`
 the per-call cost guard). Passing either is refused with a note unless the
 user has turned it on in their config. Relay that note rather than retrying:
 the user has to make that decision, not you.\
-"""
+""".replace("{coding_panel_guidance}", CODING_PANEL_GUIDANCE)
 
 
 def _alias_index() -> str:
@@ -355,7 +371,8 @@ async def _render_consultation(record: dict[str, Any]) -> str:
         match = await _run(core.resolve_category, term=record["category"])
         if match:
             name, spec = match
-            lines.append(f"`category: {name}`" + (f" - {spec['why']}" if spec.get("why") else ""))
+            why = ", ".join(core.CODING_PANEL.values()) if name == "coding" else spec.get("why")
+            lines.append(f"`category: {name}`" + (f" - {why}" if why else ""))
     for result in results:
         if result.get("pending"):
             label = "RUNNING" if status == "running" else "UNFINISHED (billing unknown)"
@@ -399,14 +416,15 @@ async def get_consultation(consultation_id: str | None = None, wait_seconds: flo
     name="ask_llm",
     title="Ask another LLM for a second opinion",
     description=(
+        CODING_PANEL_GUIDANCE + "\n\n"
         "Ask a different frontier model for its independent take on the problem at hand. "
         "Use for 'ask Kimi', 'what does GLM think', 'get a second opinion', or when you are stuck. "
         "When the user asks for a model good at something ('one that's good at coding', "
-        "'strong at math'), pass their words as `category` and leave `model` unset: coding, "
+        "'strong at math'), pass the capability as `category` and leave `model` unset: coding, "
         "debugging, reasoning, math, chat, agentic, research, long_context, creative, budget, "
         "general. If they said it in the plural ('the coding LLMs', 'the reasoning models') "
-        "use ask_panel with the same `category` instead, so they get every leader rather than "
-        "the first. Otherwise pass `model` ('kimi', 'glm', 'grok', 'gemini', or any slug). "
+        "use ask_panel with the same `category` instead. "
+        "Otherwise pass `model` ('kimi', 'glm', 'grok', 'gemini', or any slug). "
         "The other model has no access to this machine or repo: pass the relevant source "
         "with `files` and the situation with `context`, or the answer will be generic. "
         "Never paste a file's contents into the question: put its path in `files` and the "
@@ -532,14 +550,13 @@ async def ask_llm(
     name="ask_panel",
     title="Ask several LLMs at once and compare",
     description=(
+        CODING_PANEL_GUIDANCE + "\n\n"
         "Ask the same question of several models in parallel and get every answer back "
         "side by side. Use when the user wants more than one outside view, when a decision "
         "is contested, or to see whether independent models agree. This is the tool for a "
-        "plural request: 'use the coding LLMs', 'ask the reasoning models', 'what do the "
-        "debugging ones think' - pass the user's own words as `category` instead of "
-        "`models`, and the current leaders for that capability answer side by side. Each "
-        "category pairs different vendors, so the panel is independent houses rather than "
-        "one lab asked twice. "
+        "plural capability request: 'ask the reasoning models', 'what do the "
+        "debugging ones think' - pass the recipient capability as `category` instead of "
+        "`models`. Other categories use their configured benchmark pins. "
         "Costs one call per model; one model failing does not lose the others.\n\n"
         + CALL_SHAPE
         + " `models` is a JSON array of aliases or slugs."
@@ -571,10 +588,11 @@ async def ask_panel(
         question: What to ask all of them, as a plain string, and required. It is
             always its own argument: do not fold it into `context` and do not
             wrap it in <question> tags.
-        models: A JSON array of aliases or slugs, e.g. ["kimi", "glm"]. Defaults
-            to both configured models. Leave unset when using `category`.
-        category: Put the two current leaders for a capability against each
-            other instead of naming models: coding, debugging, reasoning, math,
+        models: A JSON array of aliases or slugs, e.g. ["kimi", "glm"]. Explicit
+            members override category; otherwise defaults to default_panel.
+            Leave unset when using category.
+        category: Coding selects the four-member coding group. Other capabilities
+            select their benchmark pins: debugging, reasoning, math,
             chat, agentic, research, long_context, creative, budget, general.
         context: Background every model should see. One plain string, as long as
             you like. The question does not go in here.
@@ -687,8 +705,9 @@ async def list_llm_models(
     name="list_llm_categories",
     title="Capabilities you can ask for by name",
     description=(
-        "Show every capability category ask_llm and ask_panel accept, the two models each one "
-        "resolves to, and the benchmark evidence behind the pick. Use when the user asks which "
+        CODING_PANEL_GUIDANCE + "\n\n"
+        "Show every capability category ask_llm and ask_panel accept, single-model benchmark "
+        "pins, panel rosters, and recorded selection evidence. Use when the user asks which "
         "model is best at something, or to check what a category would actually call before "
         "spending money on it."
     ),
@@ -703,13 +722,15 @@ async def list_llm_categories(verify: bool = False) -> str:
     """
     rows = await _run(core.list_categories)
     lines = [
-        "| category | models | also matches | measured |",
-        "| --- | --- | --- | --- |",
+        "| category | benchmark pins (single uses first) | panel roster | synonyms | measured |",
+        "| --- | --- | --- | --- | --- |",
     ]
     for row in rows:
         aka = ", ".join(row["aka"][:4])
         models = "<br>".join(f"`{m}`" for m in row["models"])
-        lines.append(f"| **{row['category']}** | {models} | {aka} | {row['measured']} |")
+        panel = "<br>".join(f"`{m}`" for m in row["panel_models"])
+        lines.append(f"| **{row['category']}** | {models} | {panel} | {aka} | {row['measured']} |")
+    lines += ["", CODING_PANEL_GUIDANCE]
     lines.append("")
     lines.append("Why each pick:")
     for row in rows:
@@ -734,9 +755,8 @@ async def list_llm_categories(verify: bool = False) -> str:
         lines += [
             "",
             (
-                f"Category picks never return {' or '.join(excluded)} models: this bridge is for "
-                "an opinion from outside the agent asking. Ask for one of those by full slug if "
-                "you specifically want it."
+                f"Benchmark picks exclude {' or '.join(excluded)} models. "
+                "The named coding group and explicitly requested models do not use this filter."
             ),
         ]
     return "\n".join(lines)

@@ -100,6 +100,19 @@ check(
     proc.stdout[:80],
 )
 
+proc = run_cli(["categories"], data="")
+check(
+    "category discovery shows the coding group and its vendor-filter exception",
+    proc.returncode == 0
+    and (
+        "panel: x-ai/grok-4.6, google/gemini-3.8-flash, z-ai/glm-5.3, moonshotai/kimi-k3"
+        in proc.stdout
+    )
+    and "Benchmark picks exclude" in proc.stdout
+    and "named coding group" in proc.stdout
+    and "Category picks never return" not in proc.stdout,
+)
+
 proc = run_cli(["question", "--json", "-c", "explicit"], data="piped")
 check(
     "shorthand ask combines explicit and piped context",
@@ -280,6 +293,7 @@ for args in (["categories", "--verify"], ["categories", "--verify", "--json"]):
             data="",
             setup=f"""
 core.list_categories = lambda: [{{'category': 'test', 'models': ['test/model'],
+    'panel_models': ['test/model'],
     'aka': [], 'why': 'fixture', 'measured': '2026-09-12'}}]
 core.verify_categories = lambda: [{{'category': 'test', 'slug': 'test/model',
     'available': {available}, 'excluded_vendor': {excluded}}}]

@@ -32,6 +32,7 @@ pyproject.toml            ruff and mypy config (no [project] table, on purpose)
 guides/                   local best-practice cheat sheets, served by read_guide
 tests/test_core.py        offline engine checks, no network or key needed
 tests/test_mcp_offline.py offline MCP protocol and safety checks
+tests/test_coding_panel.py four-member coding group routing and failure checks
 tests/test_consultations.py detached-worker lifecycle, deadlines and storage checks
 tests/test_cli.py         CLI subprocess and doctor checks
 tests/test_boundaries.py provider/configuration boundary checks
@@ -315,11 +316,43 @@ not saved. Pass the needed files again or choose a new thread.
 
 ## Categories
 
-"Ask an LLM that is good at coding" has to land on a real slug, so `category`
-maps a capability onto two configured model pins. Pass it instead
-of `model`, and the agent picks:
+**"Ask all of coding LLMs to ..." selects exactly four models: Grok, Google
+Flash, GLM, and Kimi.** The task after "to" can be anything. Claude Code and
+Codex receive this rule in the MCP initialization instructions and the relevant
+tool descriptions. The call is:
 
-| category | configured models |
+```json
+{"category": "coding", "question": "the complete requested task"}
+```
+
+Use `ask_panel` with `models` unset. The engine selects the named coding group
+using these exact IDs, independently of aliases, `default_panel` and benchmark pins:
+
+| Member | Exact OpenRouter ID |
+|---|---|
+| Grok | `x-ai/grok-4.6` |
+| Google Flash | `google/gemini-3.8-flash` |
+| GLM | `z-ai/glm-5.3` |
+| Kimi | `moonshotai/kimi-k3` |
+
+An explicit request for a different roster, such as "all coding LLMs except
+Grok", uses `models` with that
+roster instead. Each member gets the same question, context and files. Failed
+members retain their slots; three answers and one failure are reported as 3/4.
+If any exact ID is unavailable, its slot fails visibly; this group never
+substitutes another model or version. Ordinary alias lookup outside the named
+coding group retains its existing fallback behavior.
+
+The named group takes priority over keywords in the task, so "Ask all of coding
+LLMs to investigate a debugging workflow" still calls all four. The bridge only
+interprets the recipient selector; task and reference text stay request data.
+Restart existing Claude Code and Codex sessions to load changed instructions.
+
+"Ask an LLM that is good at coding" has to land on a real slug, so `category`
+also maps a capability onto configured benchmark pins for a single-model
+consultation. `ask_llm` takes the first pin:
+
+| category | benchmark pins (single consultation uses first) |
 |---|---|
 | `coding` | Kimi K3, GLM 5.3 |
 | `debugging` | GLM 5.3, Grok 4.6 |
@@ -336,32 +369,31 @@ of `model`, and the agent picks:
 These are the packaged selections recorded on 2026-09-10, not a live benchmark
 ranking. Exact slugs, selection rationale and dates live in `config/models.json`.
 
-`ask_llm` takes the first; `ask_panel` puts both against each other, which is
-what a plural request means. "Use the coding LLMs to review this" is passed
-through as `category` verbatim: `resolve_category()` matches the name, the
-synonyms, or any phrase containing one, and refuses rather than guesses when
-nothing matches. Synonyms
-resolve too, so "programming", "whole codebase" and "cheap" all land somewhere
-sensible, and a capability that matches nothing is refused rather than guessed.
+For other categories, `ask_panel` uses both pins. Coding panels always use the
+four-member group above. `list_llm_categories` displays both the benchmark pins
+and the panel roster; `orask categories --json` exposes them as `models` and
+`panel_models`. Pass the requested recipient capability in `category` and the
+task in `question`. Synonyms such as "programming", "whole codebase" and "cheap"
+are accepted. An unknown capability is refused rather than guessed.
 
-**No OpenAI, Anthropic or Google model is ever a category pick.** This bridge
-exists to fetch a view from outside the agent asking: Claude Code is Anthropic
-and Codex is OpenAI, so routing a category back to those returns the house view
-the asker already holds. Any of them can still be reached by full slug on
-purpose. The rule lives in `category_exclude_vendors`.
-
-Every category pairs **two different vendors**, so a panel is two independent
-houses rather than one lab asked twice.
+`category_exclude_vendors` excludes OpenAI, Anthropic and Google from benchmark
+picks by default. It does **not** filter the named coding group or explicitly
+requested models. Google Flash is therefore included in every coding panel.
+The global `allowed_models` restriction and per-model cost and safety checks
+still apply; a refused member returns a failure rather than disappearing.
 
 Each entry records its selection rationale and date. `orask categories --verify`
-requires a fresh catalogue and exits nonzero for missing or excluded pins. It
-checks availability and policy, not benchmark leadership:
+requires a fresh catalogue and exits nonzero for missing or excluded benchmark
+pins. It checks those pins' availability and policy, not benchmark leadership
+or the coding group's exact IDs; inspect each ID with `llm_model_info` before a
+large consultation. `orask doctor` checks configured aliases:
 
 ```
 orask categories                    # what each category is and why
 orask categories --verify           # check the pins against the live catalogue
 orask "why is this slow?" -C coding
 orask panel "is this design sound?" -C reasoning
+orask panel "review this change" -C coding  # Grok, Google Flash, GLM, Kimi
 ```
 
 ## Roles
@@ -372,6 +404,14 @@ design), `redteam` (attack the plan). Full text in `config/models.json`; `system
 replaces it outright.
 
 ## Design decisions worth knowing
+
+**The coding group is separate from benchmark recommendations.** Previously,
+the caller instructions sent "all coding LLMs" to a two-pin category that
+excluded Google, bypassing the four-member default panel. `core.CODING_PANEL`
+now owns the named group's membership and supplies both routing and MCP text.
+The single-model benchmark choice stays intact. The shared coding guidance is
+included in initialization and relevant tool descriptions so either discovery
+surface carries the same rule.
 
 **Provider latency is separate from the MCP reply deadline.** The old adapter
 waited for all panel futures before returning, while Codex's registration had a
@@ -635,7 +675,12 @@ and installer suites. Offline fixtures use scratch configuration/state/cache and
 fake client commands; they do not require the real key or paid model calls.
 Coverage includes malformed provider data, effort/budget policy, incomplete
 answers, attachment replay, private persistence, stdin limits, client registration
-and installer failure recovery. Live tests are separate opt-in checks.
+and installer failure recovery. Coding-group regressions exercise all four
+provider requests, arbitrary task keywords, explicit subsets, missing members,
+allowlist refusals, discovery metadata, and actual MCP stdio/worker results.
+These deterministic checks validate routing and delivered prompt text; they
+do not measure Claude Code/Codex natural-language tool-choice reliability.
+Live tests are separate opt-in checks.
 
 The supported minimum is Python 3.10 with MCP 2.x. Linux offline checks cover the
 minimum and current project environments; macOS execution remains unverified.
@@ -654,8 +699,8 @@ The packaged aliases are `kimi` → `moonshotai/kimi-k3`, `glm` → `z-ai/glm-5.
 `grok` → `x-ai/grok-4.6` and `gemini` → `google/gemini-3.8-flash`.
 `default_model` is `kimi`; `default_panel` includes all four aliases. Each distinct
 resolved model is a separate billed consultation. The category vendor exclusion
-applies to category selection; it does not remove Gemini from this explicit
-panel or prevent a deliberately named model.
+applies to benchmark picks; it does not remove Google Flash from the coding
+group, the default panel, or a deliberately named model.
 
 Find exact slugs with `orask models --search grok`. A user copy at
 `~/.config/openrouter/config.json` overrides the packaged file, and `aliases` and

@@ -353,6 +353,9 @@ def _cmd_categories(args: argparse.Namespace) -> int:
 
     for row in rows:
         print(f"\n{row['category']}")
+        if row["panel_models"] != row["models"]:
+            print(f"    panel: {', '.join(row['panel_models'])}")
+            print("    benchmark pins (single consultation uses first):")
         for slug in row["models"]:
             line = f"    {slug}"
             if args.verify:
@@ -374,8 +377,8 @@ def _cmd_categories(args: argparse.Namespace) -> int:
 
     banned = core.excluded_vendors()
     if banned:
-        print(f"\nCategory picks never return {' or '.join(banned)} models: this bridge is for")
-        print("an opinion from outside the agent asking. Ask by full slug to override.")
+        print(f"\nBenchmark picks exclude {' or '.join(banned)} models.")
+        print("The named coding group and explicitly requested models do not use this filter.")
     return status
 
 
@@ -413,7 +416,8 @@ def _cmd_panel(args: argparse.Namespace) -> int:
         match = core.resolve_category(args.category)
         if match:
             name, spec = match
-            print(f"category: {name}" + (f" - {spec['why']}" if spec.get("why") else ""))
+            why = ", ".join(core.CODING_PANEL.values()) if name == "coding" else spec.get("why")
+            print(f"category: {name}" + (f" - {why}" if why else ""))
             print()
 
     results = core.ask_panel(

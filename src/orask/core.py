@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Any
 
 __all__ = [
+    "CODING_PANEL",
     "MCP_TOOLS",
     "Config",
     "OpenRouterError",
@@ -879,6 +880,17 @@ def resolve_model(spec: str) -> tuple[str, str | None]:
 # --------------------------------------------------------------------------
 
 
+# The owner's named group is independent of benchmark pins and default_panel.
+# Exact IDs are intentional: alias edits and catalogue fallback cannot change this group.
+# Labels also feed MCP guidance, so the advertised roster is the one actually requested.
+CODING_PANEL = {
+    "x-ai/grok-4.6": "Grok",
+    "google/gemini-3.8-flash": "Google Flash",
+    "z-ai/glm-5.3": "GLM",
+    "moonshotai/kimi-k3": "Kimi",
+}
+
+
 def _norm_category(term: str) -> str:
     return re.sub(r"[\s\-]+", "_", (term or "").strip().lower())
 
@@ -904,6 +916,16 @@ def resolve_category(term: str) -> tuple[str, dict[str, Any]] | None:
     cats = load_config().get("categories") or {}
     if not term or not term.strip() or not cats:
         return None
+
+    # The requested group precedes the task. A longer task keyword such as
+    # "debugging" or "long context" must not replace an explicit coding group.
+    if "coding" in cats and re.match(
+        r"\s*(?:(?:ask|use|consult)\s+)?(?:all\s+(?:of\s+)?)?(?:the\s+)?"
+        r"coding\s+(?:llms|models)\b",
+        term,
+        re.IGNORECASE,
+    ):
+        return "coding", cats["coding"]
 
     wanted = _norm_category(term)
     if wanted in cats:
@@ -943,10 +965,12 @@ def _heal_slug(slug: str, catalog: list[dict[str, Any]], banned: list[str]) -> s
     return None
 
 
-def category_models(term: str) -> tuple[list[str], list[str]]:
+def category_models(term: str, *, panel: bool = False) -> tuple[list[str], list[str]]:
     """The models configured for a category, validated against the catalogue.
 
-    Returns (slugs, notes). A slug that has been retired upstream is replaced
+    Returns (model specs, notes). Coding panels use the named four-model group;
+    each member is resolved by ask(), retaining failed members in their own slots.
+    Other picks use benchmark pins. A slug that has been retired upstream is replaced
     by the closest live match rather than failing the call, and one that
     violates the vendor exclusion is dropped, both with a note saying so.
     """
@@ -960,6 +984,8 @@ def category_models(term: str) -> tuple[list[str], list[str]]:
         )
 
     name, spec = match
+    if panel and name == "coding":
+        return list(CODING_PANEL), []
     catalog = _catalog_or_empty()
     listed = {m.get("id") for m in catalog}
     banned = excluded_vendors()
@@ -1006,6 +1032,9 @@ def list_categories() -> list[dict[str, Any]]:
             {
                 "category": name,
                 "models": as_list(spec.get("models")),
+                "panel_models": list(CODING_PANEL)
+                if name == "coding"
+                else as_list(spec.get("models")),
                 "aka": as_list(spec.get("aka")),
                 "why": spec.get("why") or "",
                 "measured": spec.get("measured") or "",
@@ -2575,6 +2604,7 @@ def ask(
     include_reasoning: bool = False,
     effort_reason: str | None = None,
     _mcp_call: bool = False,
+    _exact_model: bool = False,
 ) -> dict[str, Any]:
     """Ask one model and return a structured result."""
     cfg = load_config()
@@ -2618,7 +2648,18 @@ def ask(
         )
         category = None
 
-    if category:
+    if _exact_model:
+        if not model or "/" not in model:
+            raise OpenRouterError("an exact model requires a full OpenRouter ID")
+        known = {m.get("id") for m in _catalog_or_empty()}
+        if known and model not in known:
+            raise OpenRouterError(
+                f"exact model '{model}' is not in the OpenRouter catalogue; "
+                "no substitute was called."
+            )
+        slug = _enforce_allowed(model, cfg.get("allowed_models") or [])
+        resolve_note = None
+    elif category:
         picks, cat_notes = category_models(category)
         notes.extend(cat_notes)
         # category_models has already refused an unknown category, so this always matches.
@@ -2996,9 +3037,8 @@ def ask_panel(
     One model failing never takes the panel down: its slot comes back as an
     error entry so the caller still sees every other opinion.
 
-    A category supplies the panel when no explicit models are given. Each
-    category pairs two different vendors on purpose, so the panel is two
-    independent houses rather than one lab asked twice.
+    A category supplies the panel when no explicit models are given. Coding
+    selects the named four-member group; other categories use benchmark pins.
     """
     cfg = load_config()
     if "files" in kwargs:
@@ -3006,7 +3046,10 @@ def ask_panel(
     panel_notes: list[str] = []
     wanted = as_list(models)
     if not wanted and category:
-        wanted, panel_notes = category_models(category)
+        wanted, panel_notes = category_models(category, panel=True)
+        match = resolve_category(category)
+        if match and match[0] == "coding":
+            kwargs["_exact_model"] = True
     wanted = wanted or as_list(cfg.get("default_panel"))
     if not wanted:
         wanted = [cfg.get("default_model") or "kimi"]
@@ -3018,7 +3061,7 @@ def ask_panel(
     already: set[str] = set()
     for entry in wanted:
         try:
-            slug, _ = resolve_model(entry)
+            slug = entry if kwargs.get("_exact_model") else resolve_model(entry)[0]
         except OpenRouterError:
             slug = entry.strip().lower()
         if slug in already:

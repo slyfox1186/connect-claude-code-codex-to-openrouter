@@ -31,7 +31,12 @@ def provider_fixture():
             "supported_parameters": ["reasoning"],
             "reasoning": {"supported_efforts": ["max", "high", "medium", "low"]},
         }
-        for slug in ("moonshotai/kimi-k3", "z-ai/glm-5.3")
+        for slug in (
+            "moonshotai/kimi-k3",
+            "z-ai/glm-5.3",
+            "x-ai/grok-4.6",
+            "google/gemini-3.8-flash",
+        )
     ]
     core._catalog_fetched_at = time.time()
 
@@ -41,6 +46,11 @@ def provider_fixture():
         effort = payload["reasoning"]["effort"]
         if effort not in {"medium", "high", "xhigh", "max"}:
             raise AssertionError("weak effort reached provider")
+        if (
+            "force-google-failure" in json.dumps(payload["messages"])
+            and payload["model"] == "google/gemini-3.8-flash"
+        ):
+            raise core.OpenRouterError("Google Flash fixture unavailable")
         partial = "force-incomplete" in json.dumps(payload["messages"])
         answer = "partial" if partial else "FINISHED"
         if "force-wide" in json.dumps(payload["messages"]):
@@ -113,6 +123,42 @@ async def check_protocol():
             ask = next(t for t in tools.tools if t.name == "ask_llm")
             assert "effort_reason" in ask.input_schema["properties"]
             assert "max_tokens includes BOTH" in client.instructions
+            panel = next(t for t in tools.tools if t.name == "ask_panel")
+            categories = next(t for t in tools.tools if t.name == "list_llm_categories")
+            for instructions in (
+                client.instructions,
+                ask.description,
+                panel.description,
+                categories.description,
+            ):
+                for model in ("Grok", "Google Flash", "GLM", "Kimi"):
+                    assert model in instructions, (model, instructions)
+                assert 'category="coding"' in instructions, instructions
+            for question, category, expected in (
+                ("Review this change", "coding", "4/4 answered"),
+                (
+                    "Explain a debugging workflow",
+                    "Ask all of coding LLMs to explain a debugging workflow",
+                    "4/4 answered",
+                ),
+                ("force-google-failure", "coding", "3/4 answered"),
+            ):
+                result = await client.call_tool(
+                    "ask_panel", {"question": question, "category": category}
+                )
+                text = "".join(getattr(c, "text", "") for c in result.content)
+                if "status: running" in text:
+                    coding_id = re.search(r"consultation_id: ([0-9a-f]{32})", text)[1]
+                    result = await client.call_tool(
+                        "get_consultation", {"consultation_id": coding_id, "wait_seconds": 3}
+                    )
+                    text = "".join(getattr(c, "text", "") for c in result.content)
+                assert expected in text, text
+                assert "Grok, Google Flash, GLM, Kimi" in text, text
+                if expected == "4/4 answered":
+                    assert "$0.0800" in text, text
+                else:
+                    assert "Google Flash fixture unavailable" in text and "$0.0600" in text, text
             for effort in ("low", "minimal", "off", "none", "medium"):
                 result = await client.call_tool("ask_llm", {"question": "q", "effort": effort})
                 text = "".join(getattr(c, "text", "") for c in result.content)

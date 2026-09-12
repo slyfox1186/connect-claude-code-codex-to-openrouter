@@ -11,6 +11,7 @@
     "CATEGORIES: 'ask an LLM that is good at coding' resolves through these. Each one names the",
     "benchmark evidence and the date it was checked, so a stale entry is visible rather than silent.",
     "Re-check them with 'orask categories --verify'.",
+    "Coding panels instead use the four exact model IDs in core.CODING_PANEL, without alias fallback.",
     "ATTACHMENTS: a path in 'files' is sent as the file itself. Source and prose are pasted in as",
     "text and bounded by max_file_chars; a PDF, image or audio file is attached to the message and",
     "bounded by max_attachment_bytes per file and max_attachment_total_bytes per call instead.",

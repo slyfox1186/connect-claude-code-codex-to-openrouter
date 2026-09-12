@@ -45,6 +45,7 @@ run "offline tests" env \
     OPENROUTER_API_KEY="" \
     "$PYTHON" "$PROJECT/tests/test_core.py"
 run "offline MCP protocol" "$PYTHON" "$PROJECT/tests/test_mcp_offline.py"
+run "four-member coding group" "$PYTHON" "$PROJECT/tests/test_coding_panel.py"
 run "detached consultation lifecycle" "$PYTHON" "$PROJECT/tests/test_consultations.py"
 run "CLI subprocess tests" "$PYTHON" "$PROJECT/tests/test_cli.py"
 run "provider and config boundaries" "$PYTHON" "$PROJECT/tests/test_boundaries.py"
