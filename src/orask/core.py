@@ -3156,38 +3156,134 @@ def model_info(spec: str) -> dict[str, Any]:
     }
 
 
-def account_usage() -> dict[str, Any]:
-    data = _request("GET", "/key", timeout=30.0, retries=2).get("data") or {}
-    entries = read_log(limit=100000)
-
-    def _num(entry: dict[str, Any], key: str) -> float:
-        try:
-            return float(entry.get(key) or 0)
-        except (TypeError, ValueError):
-            return 0.0
-
-    # Summed over every entry, not only the ones that answered: an empty completion logs
-    # ok: False and is still billed, so filtering on ok under-reports real spend.
-    spend = sum(_num(e, "cost_usd") for e in entries)
-    day_cutoff = time.time() - 86400
-    spend_day = sum(_num(e, "cost_usd") for e in entries if _num(e, "ts") >= day_cutoff)
-    return {
-        "key_label": data.get("label"),
-        "account_usage_usd": data.get("usage"),
-        "credit_limit_usd": data.get("limit"),
-        "credit_remaining_usd": data.get("limit_remaining"),
-        "free_tier": data.get("is_free_tier"),
-        "bridge_calls_logged": len([e for e in entries if e.get("ok")]),
-        "bridge_calls_billed": len([e for e in entries if _num(e, "cost_usd") > 0]),
-        "bridge_spend_usd": round(spend, 4),
-        "bridge_spend_last_24h_usd": round(spend_day, 4),
-        # Said out loud, because the read is bounded: a log past the window would otherwise
-        # report a total that quietly stops being the whole story.
-        "bridge_spend_covers": (
-            f"the most recent {MAX_LOG_WINDOW_BYTES // (1024 * 1024)} MB of the call log"
-            if CALL_LOG.is_file() and CALL_LOG.stat().st_size > MAX_LOG_WINDOW_BYTES
+def _usage_log_window() -> tuple[bytes, str, str | None]:
+    """One bounded snapshot for totals, without the recent-record reader's count cap."""
+    try:
+        fd = _open_regular_fd(CALL_LOG)
+        with os.fdopen(fd, "rb") as handle:
+            size = os.fstat(handle.fileno()).st_size
+            start = max(0, size - MAX_LOG_WINDOW_BYTES)
+            handle.seek(max(0, start - 1))
+            raw = handle.read(size - start + bool(start))
+        if len(raw) != size - start + bool(start):
+            return b"", "unavailable", "call log changed while being read; totals are unavailable"
+        if start:
+            # The extra preceding byte distinguishes a complete boundary record from a
+            # partial one. Always discarding the first line silently loses valid spend.
+            raw = raw[1:] if raw[:1] == b"\n" else raw.partition(b"\n")[2]
+        covers = (
+            f"the most recent {MAX_LOG_WINDOW_BYTES:,} bytes of the call log"
+            if start
             else "every logged call"
+        )
+        return raw, covers, None
+    except FileNotFoundError:
+        return b"", "every logged call", None
+    except OSError:
+        return b"", "unavailable", "call log could not be read safely; totals are unavailable"
+
+
+def _account_number(data: dict[str, Any], key: str, notes: list[str]) -> float | None:
+    value = data.get(key)
+    if value is None and key in {"limit", "limit_remaining"}:
+        return None  # OpenRouter uses null for an unlimited key.
+    number = _nonnegative_number(value)
+    if key == "limit_remaining" and value is not None and not isinstance(value, bool):
+        # A negative remainder can indicate exhausted credit, not corrupt accounting.
+        try:
+            number = float(value)
+            number = number if math.isfinite(number) else None
+        except (TypeError, ValueError, OverflowError):
+            number = None
+    if number is None:
+        notes.append(f"account field {key} is unavailable or invalid")
+    return number
+
+
+def _usage_total(values: list[float], label: str, notes: list[str]) -> float | None:
+    try:
+        total = math.fsum(values)
+        if math.isfinite(total):
+            return round(total, 4)
+    except OverflowError:
+        pass
+    notes.append(f"{label} exceeds the numeric range; total is unknown")
+    return None
+
+
+def account_usage() -> dict[str, Any]:
+    response = _request("GET", "/key", timeout=30.0, retries=2)
+    data = response.get("data") if isinstance(response, dict) else None
+    if not isinstance(data, dict):
+        raise OpenRouterError("OpenRouter returned invalid key usage data; expected an object")
+    notes: list[str] = []
+    raw, covers, problem = _usage_log_window()
+    if problem:
+        notes.append(problem)
+    costs: list[float] = []
+    day_costs: list[float] = []
+    answered = billed = unknown_costs = unknown_times = skipped = 0
+    now = time.time()
+    # Iterate lines without constructing a list of potentially a million tiny objects.
+    for match in re.finditer(rb"[^\n]+", raw):
+        line = match.group().strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except (ValueError, UnicodeError):
+            skipped += 1
+            continue
+        if not isinstance(entry, dict):
+            skipped += 1
+            continue
+        answered += entry.get("ok") is True
+        cost = _nonnegative_number(entry.get("cost_usd"))
+        stamp = _nonnegative_number(entry.get("ts"))
+        if stamp is None or stamp > now:
+            unknown_times += 1
+            stamp = None
+        if cost is None:
+            unknown_costs += 1
+            continue
+        costs.append(cost)
+        billed += cost > 0
+        if stamp is not None and now - 86400 <= stamp <= now:
+            day_costs.append(cost)
+    if skipped:
+        notes.append(f"skipped {skipped} malformed call-log records; totals cover readable records")
+    if unknown_costs:
+        notes.append(f"{unknown_costs} records have unknown cost; totals include known costs only")
+    if unknown_times:
+        notes.append(
+            f"{unknown_times} records have unknown timestamps; excluded from last-24h spend"
+        )
+    label = data.get("label")
+    if label is not None and not isinstance(label, str):
+        notes.append("account field label is invalid")
+        label = None
+    free = data.get("is_free_tier")
+    if free is not None and not isinstance(free, bool):
+        notes.append("account field is_free_tier is invalid")
+        free = None
+    return {
+        "key_label": label,
+        "account_usage_usd": _account_number(data, "usage", notes),
+        "credit_limit_usd": _account_number(data, "limit", notes),
+        "credit_remaining_usd": _account_number(data, "limit_remaining", notes),
+        "free_tier": free,
+        # Historical name preserved: this field counts successful answers, not all records.
+        "bridge_calls_logged": answered,
+        "bridge_calls_billed": billed,
+        "bridge_spend_usd": None if problem else _usage_total(costs, "bridge spend", notes),
+        "bridge_spend_last_24h_usd": (
+            None if problem else _usage_total(day_costs, "last-24h spend", notes)
         ),
+        "bridge_spend_covers": covers,
+        "bridge_costs_unknown": unknown_costs,
+        "bridge_timestamps_unknown": unknown_times,
+        "bridge_log_records_skipped": skipped,
+        "notes": notes,
         "log_file": str(CALL_LOG),
     }
 

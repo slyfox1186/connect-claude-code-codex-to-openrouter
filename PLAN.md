@@ -58,17 +58,17 @@ trees and fake external commands. Offline tests must never reach OpenRouter.
   handling with fake responses, including HTTPError cleanup, connection resets,
   malformed error/choice/usage structures and explicit zero cost. Preserve
   useful answers when optional metadata is malformed. Keep POST retry policy.
-- [ ] Installer/launchers (`install.sh`, `bin/_python-env.sh`, new installer
+- [x] Installer/launchers (`install.sh`, `bin/_python-env.sh`, new installer
   tests): reproduce config loss on read errors, TOML quoted/commented headers,
   multiline arrays/strings, drift/idempotence, backup failure and launcher
   collisions. Refuse ambiguous edits and preserve unrelated config. Check the
   explicit interpreter version and avoid silently selecting another interpreter
   when the override is invalid. Verify with fixtures, never real agent configs.
-- [ ] CLI/discovery/guides (`cli.py`, `core.py`, tests): reproduce category prose
+- [x] CLI/discovery/guides (`cli.py`, `core.py`, tests): reproduce category prose
   corrupting JSON; malformed stdin environment settings and silent truncation;
   category verification falsely succeeding offline; nested Markdown fences and
   invalid/stale guide dates. Fix only demonstrated errors and document behavior.
-- [ ] Gate and maintainability (`check.sh`, `pyproject.toml`, tests): make the gate
+- [x] Gate and maintainability (`check.sh`, `pyproject.toml`, tests): make the gate
   independent of caller cwd; fail safely if scratch allocation fails; clean test
   scratch state; add offline real MCP stdio coverage separately from the stdlib
   unit suite. Add the format gate in its own commit. Remove obsolete suppressions
@@ -92,8 +92,9 @@ External opinions are proposals, not evidence. Track accepted, rejected and
 deferred suggestions here with test results and reasons as review proceeds.
 
 First panel: Kimi K3 and GLM 5.3, $0.5068 total. Both exhausted their reply
-budgets and returned unfinished reviews. A second pass requests concise final
-findings at low effort, with every file attached again.
+budgets and returned unfinished reviews. A second pass used low effort before
+the owner prohibited it, with every file attached again. All subsequent live
+calls after that instruction used max effort.
 
 - Confirmed locally: 18 failing safety assertions; follow-up coverage also
   reproduces omitted per-request fees and ignored explicit zero usage cost.
@@ -208,3 +209,18 @@ JSONL tail cannot consume the next billed record. OpenRouter's current PDF schem
 confirms annotations contain parsed content, contradicting the old code comment.
 Corrected that comment and report attachment retention only after a confirmed save.
 Full gate passes: 354 core assertions, 93 CLI checks, 25 boundary tests and offline MCP.
+
+Release verification update: integrated 67 installer fixtures, bounded/atomic
+configuration and pin writes, strict absolute interpreter overrides, and safe
+backup failures. The gate now runs from any cwd, allocates scratch before work,
+cleans it, and checks Ruff formatting separately. Python formatting preserves
+the AST except docstring whitespace. Linux Python 3.10.21/MCP 2.0.0 and Python
+3.13.15/MCP 2.2.0 gates passed; macOS execution is unverified.
+
+MCP requests now require provider parameter support, preventing normal routing
+from silently dropping reasoning. Invalid request numbers fail before transport;
+model_info reports the effective context ceiling. The final real stdio suite
+passed max-effort single/panel calls, partial failure, discovery, argument
+recovery and PDF content. Usage regression fixes add explicit unknown/skipped
+counts and notes while preserving existing success-count semantics. Cost guards
+are heuristics, not guaranteed upper bounds; corrected code and docs accordingly.

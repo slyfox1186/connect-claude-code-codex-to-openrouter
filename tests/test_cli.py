@@ -487,5 +487,201 @@ with tempfile.TemporaryDirectory() as scratch:
     )
 check("doctor inspects relocated paths or reports unavailable TOML parser", doctor_ready(proc))
 
+# ---- usage accounting consumes real scratch logs and a fake free /key response ----
+USAGE_SETUP = """
+core._request = lambda *args, **kwargs: {'data': {
+    'label': 'fixture', 'usage': 0, 'limit': None, 'limit_remaining': None, 'is_free_tier': False}}
+core.CALL_LOG.parent.mkdir(parents=True, exist_ok=True)
+"""
+
+for bad in (None, [], 42, "PRIVATE_PROVIDER_DATA"):
+    proc = run_cli(
+        ["usage", "--json"],
+        data="",
+        setup=USAGE_SETUP
+        + f"""
+core._request = lambda *args, **kwargs: {{'data': {bad!r}}}
+""",
+    )
+    check(
+        f"usage refuses non-object provider data {type(bad).__name__}",
+        proc.returncode == 1
+        and "key" in proc.stderr
+        and "Traceback" not in proc.stderr
+        and "PRIVATE_PROVIDER_DATA" not in proc.stderr,
+    )
+
+proc = run_cli(["usage", "--json"], data="", setup=USAGE_SETUP)
+usage = payload(proc) or {}
+check(
+    "usage preserves explicit zero, unlimited credits, and false free-tier status",
+    proc.returncode == 0
+    and usage.get("account_usage_usd") == 0
+    and usage.get("credit_limit_usd") is None
+    and usage.get("credit_remaining_usd") is None
+    and usage.get("free_tier") is False,
+)
+
+for bad in ("bad", "nan", "inf", True, -1, {}, []):
+    proc = run_cli(
+        ["usage", "--json"],
+        data="",
+        setup=USAGE_SETUP
+        + f"""
+core._request = lambda *args, **kwargs: {{'data': {{'usage': {bad!r}, 'limit': {bad!r},
+    'limit_remaining': 'nan', 'is_free_tier': 'false', 'label': {{'private': 'payload'}}}}}}
+""",
+    )
+    usage = payload(proc) or {}
+    check(
+        f"usage labels invalid account amounts {bad!r} instead of forwarding them",
+        proc.returncode == 0
+        and usage.get("account_usage_usd") is None
+        and usage.get("credit_limit_usd") is None
+        and usage.get("credit_remaining_usd") is None
+        and usage.get("free_tier") is None
+        and usage.get("key_label") is None
+        and bool(usage.get("notes")),
+    )
+
+proc = run_cli(
+    ["usage", "--json"],
+    data="",
+    setup=USAGE_SETUP
+    + """
+core._request = lambda *args, **kwargs: {'data': {'usage': 2.5, 'limit': 1,
+    'limit_remaining': -1.5, 'is_free_tier': False}}
+""",
+)
+check(
+    "usage retains a finite negative credit remainder as debt",
+    proc.returncode == 0 and (payload(proc) or {}).get("credit_remaining_usd") == -1.5,
+)
+
+for bad in ("bad", "nan", "inf", True, -1, None, {}, []):
+    proc = run_cli(
+        ["usage", "--json"],
+        data="",
+        setup=USAGE_SETUP
+        + f"""
+rows = [{{'ts': core.time.time(), 'ok': True, 'cost_usd': {bad!r}}},
+        {{'ts': core.time.time(), 'ok': False, 'cost_usd': 0.25}}]
+core.CALL_LOG.write_text(''.join(json.dumps(row) + '\\n' for row in rows))
+""",
+    )
+    usage = payload(proc) or {}
+    check(
+        f"usage totals known billed failures and labels unknown cost {bad!r}",
+        proc.returncode == 0
+        and usage.get("bridge_spend_usd") == 0.25
+        and usage.get("bridge_spend_last_24h_usd") == 0.25
+        and usage.get("bridge_calls_billed") == 1
+        and usage.get("bridge_costs_unknown") == 1,
+    )
+
+for bad in ("bad", "nan", "inf", True, -1, None, 1e308):
+    proc = run_cli(
+        ["usage", "--json"],
+        data="",
+        setup=USAGE_SETUP
+        + f"""
+core.CALL_LOG.write_text(json.dumps({{'ts': {bad!r}, 'ok': True, 'cost_usd': 0.25}}) + '\\n')
+""",
+    )
+    usage = payload(proc) or {}
+    check(
+        f"usage cannot put invalid timestamp {bad!r} into the last day",
+        proc.returncode == 0
+        and usage.get("bridge_spend_usd") == 0.25
+        and usage.get("bridge_spend_last_24h_usd") == 0
+        and usage.get("bridge_timestamps_unknown") == 1,
+    )
+
+proc = run_cli(
+    ["usage", "--json"],
+    data="",
+    setup=USAGE_SETUP
+    + """
+core.CALL_LOG.write_text(json.dumps({'ok': True, 'cost_usd': 0.25}) + '\\n'
+    + (json.dumps({'ok': True, 'cost_usd': 0}) + '\\n') * 100000)
+""",
+)
+usage = payload(proc) or {}
+check(
+    "usage reads more than 100000 compact records when all fit the byte window",
+    proc.returncode == 0
+    and usage.get("bridge_calls_logged") == 100001
+    and usage.get("bridge_spend_usd") == 0.25
+    and usage.get("bridge_spend_covers") == "every logged call",
+)
+
+proc = run_cli(
+    ["usage", "--json"],
+    data="",
+    setup=USAGE_SETUP
+    + """
+line = json.dumps({'cost_usd': 1}) + '\\n'
+core.MAX_LOG_WINDOW_BYTES = len(line.encode()) * 2
+core.CALL_LOG.write_text(line * 3)
+""",
+)
+usage = payload(proc) or {}
+check(
+    "usage includes a complete record exactly at its truncated window boundary",
+    proc.returncode == 0
+    and usage.get("bridge_spend_usd") == 2
+    and "most recent" in usage.get("bridge_spend_covers", ""),
+)
+
+proc = run_cli(
+    ["usage", "--json"],
+    data="",
+    setup=USAGE_SETUP
+    + """
+core.CALL_LOG.write_text('broken\\n[]\\n' + json.dumps({'ok': True, 'cost_usd': 0.25}) + '\\n')
+""",
+)
+usage = payload(proc) or {}
+check(
+    "usage discloses skipped malformed log records",
+    proc.returncode == 0
+    and usage.get("bridge_spend_usd") == 0.25
+    and usage.get("bridge_log_records_skipped") == 2
+    and bool(usage.get("notes")),
+)
+
+proc = run_cli(
+    ["usage", "--json"],
+    data="",
+    setup=USAGE_SETUP
+    + """
+core.CALL_LOG.symlink_to(core.PROJECT_ROOT / 'README.md')
+""",
+)
+usage = payload(proc) or {}
+check(
+    "usage does not claim full accounting when the log cannot be safely read",
+    proc.returncode == 0
+    and usage.get("bridge_spend_covers") != "every logged call"
+    and bool(usage.get("notes")),
+)
+
+proc = run_cli(
+    ["usage", "--json"],
+    data="",
+    setup=USAGE_SETUP
+    + """
+core.CALL_LOG.write_text((json.dumps({'cost_usd': 1e308}) + '\\n') * 2)
+""",
+)
+usage = payload(proc) or {}
+check(
+    "usage reports an overflowing total as unknown instead of Infinity",
+    proc.returncode == 0
+    and usage.get("bridge_spend_usd") is None
+    and bool(usage.get("notes"))
+    and "Infinity" not in proc.stdout,
+)
+
 print(f"\n{CHECKS - len(FAILURES)}/{CHECKS} CLI checks passed")
 raise SystemExit(bool(FAILURES))

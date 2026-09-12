@@ -39,18 +39,8 @@ SUBCOMMANDS = {
 }
 
 
-def _cost_value(value: Any) -> float | None:
-    if isinstance(value, bool):
-        return None
-    try:
-        number = float(value)
-    except (TypeError, ValueError, OverflowError):
-        return None
-    return number if math.isfinite(number) and number >= 0 else None
-
-
 def _fmt_money(value: Any) -> str:
-    number = _cost_value(value)
+    number = core._nonnegative_number(value)
     return f"${number:.4f}" if number is not None else "$?"
 
 
@@ -547,7 +537,7 @@ def _cmd_log(args: argparse.Namespace) -> int:
             )
         else:
             print(f"{stamp}  {str(row.get('model'))[:34]:34} FAILED  {str(row.get('error'))[:70]}")
-    costs = [_cost_value(row.get("cost_usd")) for row in rows]
+    costs = [core._nonnegative_number(row.get("cost_usd")) for row in rows]
     total = sum(cost for cost in costs if cost is not None)
     unknown = sum(cost is None for cost in costs)
     suffix = f" known cost; {unknown} unknown" if unknown else " total"
