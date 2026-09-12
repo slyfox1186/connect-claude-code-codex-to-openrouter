@@ -166,7 +166,7 @@ a read before making it:
 
 ```bash
 orask guide                      # the index: topic and when to read it
-orask guide python               # whole guide if short; heading tree if long
+orask guide python               # heading tree; add --all for the whole guide
 orask guide python Subprocess    # one section
 orask guide python --all         # the whole file
 orask guide --search flock       # every guide at once, with the section named
