@@ -1009,6 +1009,91 @@ check("and reports how many calls were billed", _usage["bridge_calls_billed"] ==
 core._request = _no_network
 
 
+# --------------------------------------------------------------------------
+# a recovered question must reach the transcript, and old damage must heal
+# --------------------------------------------------------------------------
+
+_answered = {
+    "choices": [{"message": {"content": "the answer"}, "finish_reason": "stop"}],
+    "usage": {"prompt_tokens": 10, "completion_tokens": 5, "cost": 0.001},
+}
+with tempfile.TemporaryDirectory() as tmp:
+    core.THREAD_DIR = Path(tmp) / "threads"
+    core._request = lambda method, path, payload=None, timeout=60.0, retries=3: _answered
+    core.ask(None, model="kimi", thread="recovered",
+             context="Background.\n<question>Is the plan sound?</question>")
+    _kept = core.load_thread("recovered")
+    check("a question recovered from context is stored, not a null turn",
+          [m["role"] for m in _kept] == ["user", "assistant"], str([m.get("role") for m in _kept]))
+    check("and the stored question is the recovered text",
+          _kept[0]["content"] == "Is the plan sound?", repr(_kept[0]["content"]))
+
+    _png = Path(tmp) / "shot.png"
+    _png.write_bytes(PNG_1PX)
+    core.ask(None, model="kimi", thread="recovered-file", files=[str(_png)],
+             context="<question>What is in this image?</question>")
+    _first = core.load_thread("recovered-file")[0]["content"]
+    check("an attached turn carries real question text, never null",
+          isinstance(_first, list) and _first[0] == {"type": "text",
+                                                     "text": "What is in this image?"},
+          str(_first[0])[:80])
+
+    # a transcript already damaged by the old bug repairs itself on load
+    _damaged = core.THREAD_DIR / "damaged.json"
+    core.THREAD_DIR.mkdir(parents=True, exist_ok=True)
+    _damaged.write_text(json.dumps({"name": "damaged", "messages": [
+        {"role": "user", "content": None},
+        {"role": "assistant", "content": "orphaned reply"},
+        {"role": "user", "content": [{"type": "text", "text": None}, _FILE_PART]},
+        {"role": "assistant", "content": "reply about the file"},
+    ]}))
+    _healed = core.load_thread("damaged")
+    check("a null content turn is dropped on load", len(_healed) == 3, str(len(_healed)))
+    check("a null text part is dropped but the file part survives",
+          _healed[1]["content"] == [_FILE_PART], str(_healed[1]["content"])[:80])
+    core._request = _no_network
+
+# ---- classification must not be fooled either way -------------------------
+with tempfile.TemporaryDirectory() as tmp:
+    root = Path(tmp)
+    (root / "ids.csv").write_text("ID3,name,score\n1,alpha,10\n2,beta,20\n")
+    check("a csv whose first column is ID3 is not an mp3",
+          core.classify_attachment(root / "ids.csv") is None,
+          str(core.classify_attachment(root / "ids.csv")))
+    (root / "tagged.mp3").write_bytes(b"ID3\x03\x00\x00\x00\x00\x00\x21" + b"\x00" * 40)
+    check("a real ID3v2 tag is still audio",
+          core.classify_attachment(root / "tagged.mp3") == ("audio", "mp3"))
+    (root / "untagged.mp3").write_bytes(b"\xff\xfb\x90\x44" + b"\x00" * 60)
+    check("an mp3 with no tag is still audio, by extension",
+          core.classify_attachment(root / "untagged.mp3") == ("audio", "mp3"))
+    (root / "notes.mp3").write_text("these are meeting notes, not a sound file\n" * 3)
+    check("a text file named .mp3 is not attached as corrupt audio",
+          core.classify_attachment(root / "notes.mp3") is None)
+    (root / "shot.png").write_bytes(PNG_1PX)
+    check("a real png is unaffected",
+          core.classify_attachment(root / "shot.png") == ("image", "image/png"))
+
+# ---- the role fallback has to name the role it actually used --------------
+core._config_cache = dict(cfg, roles={"reviewer": "REVIEWER PROMPT"})
+_msgs, _notes = core.build_messages("q", role="nope")
+check("the role fallback note names the role actually used",
+      any("used 'reviewer'" in n for n in _notes), str(_notes)[:90])
+check("and that is the prompt that was sent", _msgs[0]["content"] == "REVIEWER PROMPT")
+core._config_cache = cfg
+
+# ---- a panel asks one model once ------------------------------------------
+_panel = core.ask_panel("q", models=["kimi", "moonshotai/kimi-k3"])
+check("a panel does not bill the same model twice", len(_panel) == 1, str(len(_panel)))
+check("and says why the duplicate was dropped",
+      any("already on the panel" in n for n in _panel[0].get("notes") or []),
+      str(_panel[0].get("notes"))[:90])
+_mixed = core.ask_panel("q", models=["kimi", "no-such-model-xyz"])
+check("an unresolvable model keeps its own slot", len(_mixed) == 2, str(len(_mixed)))
+check("and is reported there rather than killing the panel",
+      any("cannot resolve model" in str(r.get("error") or "").lower() for r in _mixed),
+      str([r.get("error") for r in _mixed])[:90])
+
+
 print()
 if FAILS:
     print(f"{len(FAILS)} of {CHECKS} checks failed: {', '.join(FAILS)}")

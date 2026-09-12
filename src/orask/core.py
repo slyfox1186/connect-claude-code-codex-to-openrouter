@@ -45,6 +45,7 @@ __all__ = [
     "attachment_summary",
     "summarize_parts",
     "sent_attachments",
+    "usable_turns",
     "ask",
     "ask_panel",
     "list_models",
@@ -108,7 +109,6 @@ MAGIC_SIGNATURES = (
     (b"GIF89a", "image", "image/gif"),
     (b"OggS", "audio", "ogg"),
     (b"fLaC", "audio", "flac"),
-    (b"ID3", "audio", "mp3"),
 )
 
 PDF_ENGINES = ("cloudflare-ai", "mistral-ocr", "native")
@@ -953,10 +953,17 @@ def classify_attachment(path: Path) -> tuple[str, str] | None:
     with no suffix still attaches as an image, and a .txt that is really a PDF
     is not pasted in as mojibake.
     """
-    head = _peek(path)
+    # 64 bytes rather than 16: the extension fallback below needs enough of the head to tell
+    # text from binary, and 16 is not enough to be sure.
+    head = _peek(path, 64)
     for signature, kind, media in MAGIC_SIGNATURES:
         if head.startswith(signature):
             return kind, media
+    # ID3 is only three bytes, so a CSV whose first column is called ID3 looks like an MP3.
+    # A real ID3v2 tag names its major version next, and 2, 3 and 4 are the only ones there
+    # have ever been.
+    if head[:3] == b"ID3" and len(head) >= 4 and head[3] in (2, 3, 4):
+        return "audio", "mp3"
     # RIFF....WEBP and RIFF....WAVE share a container, so the tag at byte 8 is
     # what separates them.
     if head[:4] == b"RIFF" and len(head) >= 12:
@@ -966,13 +973,19 @@ def classify_attachment(path: Path) -> tuple[str, str] | None:
             return "audio", "wav"
 
     suffix = path.suffix.lower()
+    if suffix not in IMAGE_MEDIA and suffix not in AUDIO_FORMATS and suffix != ".pdf":
+        return None
+    # The extension still has to carry the untagged formats: an MP3 with no ID3 tag starts
+    # with a frame sync, not a signature. But a text file someone named notes.mp3 would be
+    # attached as corrupt audio and billed, so a head that reads as plain text is taken at
+    # its word over the name.
+    if head and not BINARY_HINT.search(head):
+        return None
     if suffix == ".pdf":
         return "pdf", PDF_MEDIA
     if suffix in IMAGE_MEDIA:
         return "image", IMAGE_MEDIA[suffix]
-    if suffix in AUDIO_FORMATS:
-        return "audio", AUDIO_FORMATS[suffix]
-    return None
+    return "audio", AUDIO_FORMATS[suffix]
 
 
 def _human_bytes(size: int) -> str:
@@ -1437,10 +1450,12 @@ def build_messages(
         roles = cfg.get("roles") or {}
         wanted = (role or cfg.get("default_role") or "advisor").strip().lower()
         if wanted not in roles and roles:
+            fallback = "advisor" if "advisor" in roles else next(iter(roles))
             notes.append(
-                f"role '{wanted}' is not defined ({', '.join(sorted(roles))}); used 'advisor'"
+                f"role '{wanted}' is not defined ({', '.join(sorted(roles))}); "
+                f"used '{fallback}'"
             )
-            wanted = "advisor" if "advisor" in roles else next(iter(roles))
+            wanted = fallback
         system_prompt = roles.get(wanted) or _DEFAULTS_ADVISOR
 
     parts: list[str] = []
@@ -1655,6 +1670,33 @@ def _thread_path(name: str) -> Path:
     return path
 
 
+def usable_turns(messages: Iterable[Any]) -> list[dict[str, Any]]:
+    """Turns fit to replay, with null content stripped out.
+
+    A transcript written before ask() kept the recovered question can hold a null content
+    string, or a text part whose text is null. Replaying either sends JSON null to the
+    provider. Dropping them here means an existing thread repairs itself the first time it is
+    read, with no migration and no change to the stored format.
+    """
+    out: list[dict[str, Any]] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if isinstance(content, list):
+            parts = [
+                part for part in content
+                if isinstance(part, dict)
+                and (part.get("type") != "text" or isinstance(part.get("text"), str))
+            ]
+            if not parts:
+                continue
+            out.append(dict(message, content=parts))
+        elif isinstance(content, str) and content:
+            out.append(message)
+    return out
+
+
 def load_thread(name: str | None) -> list[dict[str, Any]]:
     if not name:
         return []
@@ -1663,8 +1705,7 @@ def load_thread(name: str | None) -> list[dict[str, Any]]:
         return []
     try:
         blob = json.loads(path.read_text(encoding="utf-8"))
-        messages = blob.get("messages") or []
-        return [m for m in messages if isinstance(m, dict) and m.get("content")]
+        return usable_turns(blob.get("messages") or [])
     except (OSError, json.JSONDecodeError):
         return []
 
@@ -1834,6 +1875,17 @@ def ask(
     started = time.monotonic()
 
     notes: list[str] = []
+    # Recover a misplaced question here rather than only inside build_messages, so the question
+    # that reaches the thread transcript is the real one. Storing the untouched argument wrote
+    # a null user turn, and with an attachment on the same turn it put a null text part on the
+    # wire. The split is idempotent, so build_messages re-running it changes nothing.
+    question, context, shape_note = split_embedded_question(question, context)
+    if shape_note:
+        notes.append(shape_note)
+    if not question or not question.strip():
+        raise OpenRouterError(MISSING_QUESTION)
+    question = question.strip()
+
     if model and category:
         # An explicit model is a deliberate choice; the category is the looser
         # of the two requests, so it loses rather than silently overriding.
@@ -2133,10 +2185,23 @@ def ask_panel(
     if not wanted:
         wanted = [cfg.get("default_model") or "kimi"]
 
+    # Deduplicated on the resolved slug, not on the spelling: "kimi" and its full slug are one
+    # model and one opinion, but two bills. A spec that will not resolve keeps its own slot so
+    # ask() can report it there, because one bad model must never take the panel down.
     seen: list[str] = []
+    already: set[str] = set()
     for entry in wanted:
-        if entry.lower() not in [s.lower() for s in seen]:
-            seen.append(entry)
+        try:
+            slug, _ = resolve_model(entry)
+        except OpenRouterError:
+            slug = entry.strip().lower()
+        if slug in already:
+            panel_notes.append(
+                f"'{entry}' resolves to {slug}, which is already on the panel; asked once"
+            )
+            continue
+        already.add(slug)
+        seen.append(entry)
 
     if kwargs.pop("thread", None):
         # Silently dropping it would leave the caller believing the panel was
