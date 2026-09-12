@@ -29,11 +29,29 @@ SUBCOMMANDS = {"ask", "panel", "models", "info", "usage", "threads", "log", "doc
                "categories", "guide"}
 
 
-def _fmt_money(value: Any) -> str:
+def _cost_value(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
     try:
-        return f"${float(value):.4f}"
-    except (TypeError, ValueError):
-        return "$?"
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if math.isfinite(number) and number >= 0 else None
+
+
+def _fmt_money(value: Any) -> str:
+    number = _cost_value(value)
+    return f"${number:.4f}" if number is not None else "$?"
+
+
+def _fmt_timestamp(value: Any, pattern: str) -> str:
+    try:
+        stamp = float(value)
+        if isinstance(value, bool) or not math.isfinite(stamp):
+            return "?"
+        return time.strftime(pattern, time.localtime(stamp))
+    except (TypeError, ValueError, OSError, OverflowError):
+        return "?"
 
 
 def _print_result(result: dict[str, Any], show_reasoning: bool) -> None:
@@ -137,9 +155,10 @@ def read_stdin_safely(wait: float | None = None) -> str:
         try:
             ready, _, _ = select.select([fd], [], [],
                                         remaining if drainable else min(wait, remaining))
-        except (OSError, ValueError) as exc:
+        except (OSError, ValueError, OverflowError) as exc:
             raise core.OpenRouterError(
-                f"cannot read stdin safely; no call was sent: {exc}"
+                "cannot read stdin safely; no call was sent. Check ORASK_STDIN_WAIT "
+                f"and ORASK_STDIN_DEADLINE: {exc}"
             ) from exc
         if not ready:
             # An idle socket is normal for agent shells, including one carrying no input.
@@ -458,11 +477,8 @@ def _cmd_threads(args: argparse.Namespace) -> int:
         print("no threads yet (pass --thread NAME to orask ask to start one)")
         return 0
     for row in rows:
-        stamp = (
-            time.strftime("%Y-%m-%d %H:%M", time.localtime(row["updated_at"]))
-            if row.get("updated_at") else "?"
-        )
-        print(f"{row['name']:30} {row['messages']:>3} messages   last {stamp}")
+        stamp = _fmt_timestamp(row.get("updated_at"), "%Y-%m-%d %H:%M")
+        print(f"{row['name']!s:30} {row['messages']!s:>3} messages   last {stamp}")
     return 0
 
 
@@ -475,18 +491,22 @@ def _cmd_log(args: argparse.Namespace) -> int:
         print("no calls logged yet")
         return 0
     for row in rows:
-        stamp = time.strftime("%m-%d %H:%M:%S", time.localtime(row.get("ts", 0)))
+        stamp = _fmt_timestamp(row.get("ts"), "%m-%d %H:%M:%S")
         if row.get("ok"):
             print(
                 f"{stamp}  {str(row.get('model'))[:34]:34} "
                 f"{row.get('effort') or '-'!s:6} "
-                f"in={row.get('prompt_tokens') or 0:>7} out={row.get('completion_tokens') or 0:>6} "
+                f"in={row.get('prompt_tokens') or 0!s:>7} "
+                f"out={row.get('completion_tokens') or 0!s:>6} "
                 f"{_fmt_money(row.get('cost_usd')):>9} {row.get('latency_s')}s"
             )
         else:
             print(f"{stamp}  {str(row.get('model'))[:34]:34} FAILED  {str(row.get('error'))[:70]}")
-    total = sum(float(r.get("cost_usd") or 0) for r in rows)
-    print(f"\n{len(rows)} shown, {_fmt_money(total)} total")
+    costs = [_cost_value(row.get("cost_usd")) for row in rows]
+    total = sum(cost for cost in costs if cost is not None)
+    unknown = sum(cost is None for cost in costs)
+    suffix = f" known cost; {unknown} unknown" if unknown else " total"
+    print(f"\n{len(rows)} shown, {_fmt_money(total)}{suffix}")
     return 0
 
 

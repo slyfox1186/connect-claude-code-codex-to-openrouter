@@ -9,6 +9,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -125,13 +126,38 @@ finally:
 
 # ---- hard limits fail before the provider sees an incomplete prompt -------
 for command in ("ask", "panel"):
-    for body, succeeds in (("x" * 64, True), ("x" * 65, False)):
+    for body, succeeds in (("x" * 64, True), ("x" * 65, False),
+                           ("π" * 32, True), ("π" * 33, False)):
         proc = run_cli([command, "question", "--json"], data=body,
                        setup="\ncli.STDIN_MAX_BYTES = 64\n")
-        check(f"{command} {'accepts exact' if succeeds else 'refuses over'} stdin byte limit",
+        check(f"{command} {'accepts exact' if succeeds else 'refuses over'} stdin byte limit "
+              f"({len(body)} characters, {len(body.encode())} bytes)",
               (proc.returncode == 0 and "PROVIDER_CALLED" in proc.stderr) if succeeds else
               (proc.returncode == 1 and "PROVIDER_CALLED" not in proc.stderr
                and "stdin" in proc.stderr and "64" in proc.stderr))
+
+read_fd, write_fd = os.pipe()
+
+
+def slow_producer() -> None:
+    try:
+        os.write(write_fd, b"first ")
+        time.sleep(0.15)
+        os.write(write_fd, b"second")
+    finally:
+        os.close(write_fd)
+
+
+producer = threading.Thread(target=slow_producer)
+producer.start()
+try:
+    proc = run_cli(["ask", "question", "--json"], stdin=read_fd,
+                   extra_env={"ORASK_STDIN_WAIT": "0.01", "ORASK_STDIN_DEADLINE": "1"})
+    check("slow pipe producer is fully drained beyond the socket idle wait",
+          proc.returncode == 0 and (payload(proc) or {}).get("context") == "first second")
+finally:
+    producer.join(timeout=2)
+    os.close(read_fd)
 
 for body in (b"", b"incomplete context"):
     read_fd, write_fd = os.pipe()
@@ -156,6 +182,12 @@ for name in ("ORASK_STDIN_WAIT", "ORASK_STDIN_DEADLINE"):
         check(f"{name}={value} yields actionable refusal before provider call",
               proc.returncode == 1 and name in proc.stderr
               and "Traceback" not in proc.stderr and "PROVIDER_CALLED" not in proc.stderr)
+
+proc = run_cli(["ask", "question", "--json"], data="context",
+               extra_env={"ORASK_STDIN_DEADLINE": "1e308"})
+check("platform timeout overflow is actionable and cannot reach provider",
+      proc.returncode == 1 and "ORASK_STDIN_DEADLINE" in proc.stderr
+      and "Traceback" not in proc.stderr and "PROVIDER_CALLED" not in proc.stderr)
 
 # ---- maintenance must prove live availability, not cached availability ----
 proc = run_cli(["doctor"], data="", setup="""
@@ -182,6 +214,26 @@ core.verify_categories = lambda: [{{'category': 'test', 'slug': 'test/model',
         expected = 0 if available and not excluded else 1
         check(f"category verification exit status reflects availability={available}, "
               f"excluded={excluded}, json={'--json' in args}", proc.returncode == expected)
+
+# ---- malformed historical records must not take down text rendering -------
+for timestamp in (None, "bad", "nan", "inf", 1e308, {}, [], True):
+    for command in ("log", "threads"):
+        proc = run_cli([command], data="", setup=f"""
+core.read_log = lambda **kwargs: [{{'ts': {timestamp!r}, 'ok': True,
+    'model': 'fixture/model', 'prompt_tokens': 'bad', 'completion_tokens': [], 'cost_usd': 0}}]
+core.list_threads = lambda: [{{'name': 'fixture', 'messages': 2, 'updated_at': {timestamp!r}}}]
+""")
+        check(f"{command} renders invalid timestamp {timestamp!r} as unknown",
+              proc.returncode == 0 and "?" in proc.stdout and "Traceback" not in proc.stderr)
+
+for cost in ("bad", "nan", "inf", None, True, -1, {}, []):
+    proc = run_cli(["log"], data="", setup=f"""
+core.read_log = lambda **kwargs: [{{'ts': 0, 'model': 'fixture/model', 'ok': True,
+    'cost_usd': {cost!r}}}, {{'ts': 0, 'model': 'fixture/paid', 'ok': False, 'cost_usd': 0.25}}]
+""")
+    check(f"log preserves known billed cost and labels invalid cost {cost!r}",
+          proc.returncode == 0 and "$?" in proc.stdout and "$0.2500" in proc.stdout
+          and "unknown" in proc.stdout and "Traceback" not in proc.stderr)
 
 # ---- registration checks inspect parsed config, never similarly named text ----
 DOCTOR_SETUP = """
