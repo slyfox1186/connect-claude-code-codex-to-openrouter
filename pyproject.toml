@@ -1,0 +1,31 @@
+# Tool configuration only. There is deliberately no [project] table: core.py finds its
+# packaged config with Path(__file__).resolve().parents[2], which assumes the repository
+# layout. Declaring a package here would invite `pip install -e .`, and config/models.json
+# would then be missing at runtime with no error to say so.
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+src = ["src"]
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "B", "C4", "ISC", "PIE", "RUF", "SIM", "UP", "PLW", "TID"]
+ignore = [
+    # ruff's own formatter owns this one, and we do not run the formatter: the source is
+    # hand-aligned (the magic-byte table, the media maps, the printed column widths) and a
+    # wholesale reformat would bury every real change in 2000 lines of churn.
+    "ISC001",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# The test files are flat scripts by design (see CLAUDE.md): they set up a stub catalogue and
+# monkeypatch module state before importing anything else, so imports cannot all sit at the top.
+"tests/*" = ["E402"]
+
+[tool.mypy]
+python_version = "3.10"
+files = ["src/orask"]
+ignore_missing_imports = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+no_implicit_optional = true
