@@ -125,7 +125,8 @@ CALL_SHAPE = (
 def _shape(tool: str, question: str | None, context: str | None, files: Any) -> str:
     """The error a model can act on: what arrived, and the shape that works."""
     received = [
-        "question=" + (f"{len(question.strip())} chars" if question and question.strip() else "MISSING"),
+        "question="
+        + (f"{len(question.strip())} chars" if question and question.strip() else "MISSING"),
         "context=" + (f"{len(context)} chars" if context else "none"),
         f"files={len(core.as_list(files))}",
     ]
@@ -448,9 +449,9 @@ async def list_llm_categories(verify: bool = False) -> str:
     if excluded:
         lines += [
             "",
-            f"Category picks never return {' or '.join(excluded)} models: this bridge is for "
+            (f"Category picks never return {' or '.join(excluded)} models: this bridge is for "
             "an opinion from outside the agent asking. Ask for one of those by full slug if "
-            "you specifically want it.",
+            "you specifically want it."),
         ]
     return "\n".join(lines)
 

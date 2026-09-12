@@ -27,7 +27,7 @@ os.environ["ORASK_STATE_DIR"] = str(SCRATCH / "state")
 os.environ["ORASK_CACHE_DIR"] = str(SCRATCH / "cache")
 os.environ.pop("OPENROUTER_API_KEY", None)
 
-from orask import core  # noqa: E402
+from orask import core
 
 FAILS = []
 CHECKS = 0
@@ -149,7 +149,8 @@ check(
     "xhigh snaps up to max",
     core.clamp_effort("z-ai/glm-5.3", "xhigh")[0] == "max",
 )
-check("a supported effort is left alone", core.clamp_effort("z-ai/glm-5.3", "high") == ("high", None))
+check("a supported effort is left alone",
+      core.clamp_effort("z-ai/glm-5.3", "high") == ("high", None))
 check("minimal snaps to low", core.clamp_effort("moonshotai/kimi-k3", "minimal")[0] == "low")
 check(
     "a model without reasoning gets no effort",
@@ -363,7 +364,7 @@ with tempfile.TemporaryDirectory() as tmp:
             os.environ["OPENROUTER_API_KEY"] = saved_env
 
 # ---- retry policy: a POST must not be retried into a double bill ----------
-check("POST retries exclude 5xx", core.RETRY_STATUS_POST == {408, 429})
+check("POST retries exclude 5xx", {408, 429} == core.RETRY_STATUS_POST)
 check("GET retries still cover 5xx", 502 in core.RETRY_STATUS_GET)
 
 # ---- panel refuses a thread instead of dropping it ------------------------
@@ -425,7 +426,7 @@ with tempfile.TemporaryDirectory() as tmp:
     check("two threads stay separate", len(core.list_threads()) == 2)
 
     # concurrent turns on one thread must not lose an exchange
-    import concurrent.futures as _cf  # noqa: E402
+    import concurrent.futures as _cf
     with _cf.ThreadPoolExecutor(max_workers=6) as pool:
         list(pool.map(
             lambda i: core.save_thread("shared", f"q{i}", f"a{i}", "m"), range(6)
@@ -496,7 +497,7 @@ with tempfile.TemporaryDirectory() as tmp:
     try:
         wrote = core.save_thread("t", "q", "a", "m")
         check("an unwritable thread dir returns False, never raises", wrote is False)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         check("an unwritable thread dir returns False, never raises", False, repr(exc))
     finally:
         core.THREAD_DIR = saved
@@ -524,8 +525,8 @@ core._config_cache = cfg
 core.get_catalog = _saved_catalog
 
 # ---- stdin must never hang the CLI (regression: fd 0 as an open socket) ----
-import socket as _socket  # noqa: E402
-import subprocess as _sp  # noqa: E402
+import socket as _socket
+import subprocess as _sp
 
 _LAUNCHER = str(Path(__file__).resolve().parents[1] / "bin" / "orask")
 
@@ -542,7 +543,8 @@ try:
 except _sp.TimeoutExpired:
     check("an open socket on stdin does not hang the CLI", False, "timed out")
 finally:
-    _parent.close(); _child.close()
+    _parent.close()
+    _child.close()
 
 # a socket carrying data but never closing: take the data, then stop waiting
 _parent, _child = _socket.socketpair()
@@ -558,7 +560,8 @@ try:
 except _sp.TimeoutExpired:
     check("a socket that never closes still returns", False, "timed out")
 finally:
-    _parent.close(); _child.close()
+    _parent.close()
+    _child.close()
 
 # the ergonomic path must keep working: a real pipe is drained in full
 proc = _sp.run(
@@ -616,7 +619,9 @@ check("a well formed call passes through with no note",
       (q, c, note) == ("what broke?", "some background", None))
 
 q, c, note = core.split_embedded_question(
-    None, "SaidProof is a SaaS app.\n</context>\n<question>Is the plan sound?</question>\n</invoke>",
+    None,
+    "SaidProof is a SaaS app.\n</context>\n"
+    "<question>Is the plan sound?</question>\n</invoke>",
 )
 check("a question buried in context is recovered", q == "Is the plan sound?", repr(q))
 check("the recovered context keeps the background", c == "SaidProof is a SaaS app.", repr(c))
@@ -669,7 +674,8 @@ _cat_cfg = dict(
                    "aka": ["code", "programming"], "why": "x", "measured": "2026-09-10"},
         "long_context": {"models": ["z-ai/glm-5.3"], "aka": ["long context", "whole codebase"],
                          "why": "x", "measured": "2026-09-10"},
-        "retired": {"models": ["moonshotai/kimi-k9-retired"], "aka": [], "why": "x", "measured": "x"},
+        "retired": {"models": ["moonshotai/kimi-k9-retired"], "aka": [],
+                    "why": "x", "measured": "x"},
         "banned": {"models": ["openai/gpt-6-astra", "z-ai/glm-5.3"], "aka": [],
                    "why": "x", "measured": "x"},
         "gone": {"models": ["openai/gpt-6-astra"], "aka": [], "why": "x", "measured": "x"},
@@ -963,7 +969,7 @@ for _bad_key in ("max_file_chars", "max_input_chars", "default_max_tokens",
         core.build_messages("q")
         core.estimate_call_cost("moonshotai/kimi-k3", 100, 100)
         check(f"a non-numeric {_bad_key} falls back instead of raising", True)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         check(f"a non-numeric {_bad_key} falls back instead of raising", False, repr(exc))
 core._config_cache = cfg
 
@@ -979,7 +985,7 @@ with tempfile.TemporaryDirectory() as tmp:
         check("and the answer is actually there",
               any(m.get("content") == "an answer already paid for"
                   for m in core.load_thread("paid")))
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         check("a bad thread_max_messages cannot lose a paid answer", False, repr(exc))
     core._config_cache = cfg
 
@@ -1131,7 +1137,7 @@ core.get_catalog = lambda refresh=False, allow_stale=True: FAKE
 check("the catalogue index follows a replaced cache rather than going stale",
       core._find("z-ai/glm-5.3").get("name") == "Z.AI: GLM 5.3")
 
-from orask import cli as _cli  # noqa: E402
+from orask import cli as _cli
 
 
 class _FakeStdin:

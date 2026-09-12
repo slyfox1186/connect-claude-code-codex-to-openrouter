@@ -51,7 +51,7 @@ async def main() -> int:
 
         tools = await client.list_tools()
         names = {t.name for t in tools.tools}
-        check("all tools listed", EXPECTED_TOOLS <= names, ", ".join(sorted(names)))
+        check("all tools listed", names >= EXPECTED_TOOLS, ", ".join(sorted(names)))
 
         ask = next((t for t in tools.tools if t.name == "ask_llm"), None)
         if ask:
@@ -109,11 +109,11 @@ async def main() -> int:
                                       "long_context", "creative", "agentic")))
         check("every pinned category model is still listed by OpenRouter",
               "NO LONGER LISTED" not in text,
-              next((l for l in text.splitlines() if "NO LONGER" in l), "")[:90])
+              next((line for line in text.splitlines() if "NO LONGER" in line), "")[:90])
         check("category picks exclude the asking agent's own vendors",
               "openai/" not in text and "anthropic/" not in text and "google/" not in text,
-              next((l for l in text.splitlines()
-                    if any(v in l for v in ("openai/", "anthropic/", "google/"))), "")[:90])
+              next((line for line in text.splitlines()
+                    if any(v in line for v in ("openai/", "anthropic/", "google/"))), "")[:90])
         check("each category shows the evidence behind it", "Why each pick:" in text)
 
         # an unknown capability must not silently pick something
@@ -154,11 +154,11 @@ async def main() -> int:
             },
         )
         text = "".join(getattr(c, "text", "") for c in res.content)
-        check("ask_panel returns both models", 
+        check("ask_panel returns both models",
               "moonshotai/kimi-k3" in text and "z-ai/glm-5.3" in text)
         check("ask_panel reports a combined cost", "total cost $" in text)
         check("ask_panel answered from both", "2/2 answered" in text,
-              next((l for l in text.splitlines() if "answered" in l), "")[:90])
+              next((line for line in text.splitlines() if "answered" in line), "")[:90])
 
         # a panel with one bad model must still return the good one
         res = await client.call_tool(
@@ -172,10 +172,10 @@ async def main() -> int:
         text = "".join(getattr(c, "text", "") for c in res.content)
         check("one bad model does not lose the others",
               "moonshotai/kimi-k3" in text and "1/2 answered" in text,
-              next((l for l in text.splitlines() if "answered" in l), "")[:90])
+              next((line for line in text.splitlines() if "answered" in line), "")[:90])
         check("an unreachable model is labelled FAILED, not NO ANSWER",
               "no-such-model-xyz - FAILED" in text,
-              next((l for l in text.splitlines() if "no-such-model" in l), "")[:90])
+              next((line for line in text.splitlines() if "no-such-model" in line), "")[:90])
 
         # An attachment has to survive the whole path: tool argument, base64,
         # the wire, and the model actually seeing it. A codeword the model can

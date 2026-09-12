@@ -20,8 +20,7 @@ import sys
 import time
 from typing import Any
 
-from . import __version__
-from . import core
+from . import __version__, core
 
 SUBCOMMANDS = {"ask", "panel", "models", "info", "usage", "threads", "log", "doctor",
                "categories"}
@@ -400,7 +399,7 @@ def _cmd_log(args: argparse.Namespace) -> int:
         if row.get("ok"):
             print(
                 f"{stamp}  {str(row.get('model'))[:34]:34} "
-                f"{str(row.get('effort') or '-'):6} "
+                f"{row.get('effort') or '-'!s:6} "
                 f"in={row.get('prompt_tokens') or 0:>7} out={row.get('completion_tokens') or 0:>6} "
                 f"{_fmt_money(row.get('cost_usd')):>9} {row.get('latency_s')}s"
             )

@@ -15,6 +15,10 @@ ignore = [
     # hand-aligned (the magic-byte table, the media maps, the printed column widths) and a
     # wholesale reformat would bury every real change in 2000 lines of churn.
     "ISC001",
+    # The catalogue, config and index caches are module-level on purpose, and the CLI must
+    # stay importable with no third-party help. Rewriting that into a class to satisfy a
+    # style rule would be a refactor in search of a defect.
+    "PLW0603",
 ]
 
 [tool.ruff.lint.per-file-ignores]

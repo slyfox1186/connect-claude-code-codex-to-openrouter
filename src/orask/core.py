@@ -9,50 +9,52 @@ from __future__ import annotations
 
 import base64
 import concurrent.futures
+import contextlib
 import fcntl
 import fnmatch
 import hashlib
 import json
 import os
+import random
+import re
 import socket
 import stat
 import threading
-import uuid
-import random
-import re
 import time
 import urllib.error
 import urllib.request
+import uuid
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 __all__ = [
-    "OpenRouterError",
     "Config",
-    "load_config",
-    "get_api_key",
-    "get_catalog",
-    "resolve_model",
-    "resolve_category",
-    "category_models",
-    "list_categories",
-    "verify_categories",
+    "OpenRouterError",
+    "account_usage",
     "as_list",
-    "strip_call_syntax",
-    "split_embedded_question",
-    "classify_attachment",
-    "expand_paths",
-    "text_chars",
-    "attachment_summary",
-    "summarize_parts",
-    "sent_attachments",
-    "usable_turns",
     "ask",
     "ask_panel",
+    "attachment_summary",
+    "category_models",
+    "classify_attachment",
+    "expand_paths",
+    "get_api_key",
+    "get_catalog",
+    "list_categories",
     "list_models",
+    "load_config",
     "model_info",
-    "account_usage",
     "read_log",
+    "resolve_category",
+    "resolve_model",
+    "sent_attachments",
+    "split_embedded_question",
+    "strip_call_syntax",
+    "summarize_parts",
+    "text_chars",
+    "usable_turns",
+    "verify_categories",
 ]
 
 API_BASE = "https://openrouter.ai/api/v1"
@@ -299,10 +301,10 @@ def _request(
             return parsed
         except urllib.error.HTTPError as exc:
             detail = ""
-            try:
+            # Any failure to read the body is fine: the status line alone is enough to
+            # build a useful message, and the body is often already gone.
+            with contextlib.suppress(Exception):
                 detail = exc.read().decode("utf-8", "replace")[:2000]
-            except Exception:  # noqa: BLE001 - body already gone, status is enough
-                pass
             message = _http_message(exc.code, detail)
             if exc.code in retryable and attempt < retries:
                 last_error = OpenRouterError(message)
@@ -406,16 +408,18 @@ def get_catalog(refresh: bool = False, allow_stale: bool = True) -> list[dict[st
     Never raises on a network failure when a cached copy exists: model lookup
     degrading to a stale catalogue beats the whole tool going down.
     """
-    global _catalog_cache, _catalog_fetched_at, _catalog_failed_at
     ttl = _float_setting("catalog_ttl_s", 21600.0)
 
     # The MCP server is long-lived: without a TTL on the in-memory copy it would
     # serve the catalogue it started with for as long as the process lives, and
     # silently use stale prices, efforts and model lists.
     def _fresh() -> list[dict[str, Any]] | None:
-        if _catalog_cache is not None and not refresh:
-            if (time.time() - _catalog_fetched_at) < ttl:
-                return _catalog_cache
+        if (
+            _catalog_cache is not None
+            and not refresh
+            and (time.time() - _catalog_fetched_at) < ttl
+        ):
+            return _catalog_cache
         return None
 
     hit = _fresh()
@@ -513,10 +517,8 @@ def _write_json_atomic(
         return False
     finally:
         if tmp is not None and tmp.exists():
-            try:
+            with contextlib.suppress(OSError):
                 tmp.unlink(missing_ok=True)
-            except OSError:
-                pass
 
 
 def _catalog_or_empty() -> list[dict[str, Any]]:
@@ -587,7 +589,9 @@ def resolve_model(spec: str) -> tuple[str, str | None]:
     if "/" in spec:
         bare = spec.lstrip("~")
         if not known or spec in known or f"~{bare}" in known or bare in known:
-            exact = spec if (not known or spec in known) else (bare if bare in known else f"~{bare}")
+            exact = spec if (not known or spec in known) else (
+                bare if bare in known else f"~{bare}"
+            )
             return _enforce_allowed(exact, allowed), None
         slug, match_note = _fuzzy(bare.split("/", 1)[1], catalog)
         if slug:
@@ -642,7 +646,8 @@ def _vendor(slug: str) -> str:
 
 def excluded_vendors() -> list[str]:
     cfg = load_config()
-    return [str(v).strip().lower() for v in (cfg.get("category_exclude_vendors") or []) if str(v).strip()]
+    listed = cfg.get("category_exclude_vendors") or []
+    return [str(v).strip().lower() for v in listed if str(v).strip()]
 
 
 def resolve_category(term: str) -> tuple[str, dict[str, Any]] | None:
@@ -669,7 +674,7 @@ def resolve_category(term: str) -> tuple[str, dict[str, Any]] | None:
     # labels appear in it. Longest label wins, so "long context" beats "context".
     best: tuple[int, str, dict[str, Any]] | None = None
     for name, spec in cats.items():
-        for label in [name] + list(spec.get("aka") or []):
+        for label in [name, *list(spec.get("aka") or [])]:
             token = _norm_category(label)
             if token and token in wanted and (best is None or len(token) > best[0]):
                 best = (len(token), name, spec)
@@ -713,7 +718,7 @@ def category_models(term: str) -> tuple[list[str], list[str]]:
 
     name, spec = match
     catalog = _catalog_or_empty()
-    known = {m.get("id") for m in catalog}
+    listed = {m.get("id") for m in catalog}
     banned = excluded_vendors()
     slugs: list[str] = []
     notes: list[str] = []
@@ -725,7 +730,7 @@ def category_models(term: str) -> tuple[list[str], list[str]]:
                 "from category picks; skipped it."
             )
             continue
-        if not known or slug in known:
+        if not listed or slug in listed:
             slugs.append(slug)
             continue
         replacement = _heal_slug(slug, catalog, banned)
@@ -736,7 +741,9 @@ def category_models(term: str) -> tuple[list[str], list[str]]:
                 f"used '{replacement}'. Update config/models.json to make this permanent."
             )
         else:
-            notes.append(f"category '{name}' pins {slug}, which is no longer available; skipped it.")
+            notes.append(
+                f"category '{name}' pins {slug}, which is no longer available; skipped it."
+            )
 
     if not slugs:
         raise OpenRouterError(
@@ -841,7 +848,7 @@ def _fuzzy(term: str, catalog: list[dict[str, Any]]) -> tuple[str | None, str | 
             quality = 1
         else:
             continue
-        scored.append(((quality,) + _rank_key(model), model))
+        scored.append(((quality, *_rank_key(model)), model))
 
     if not scored:
         return None, None
@@ -914,7 +921,10 @@ def clamp_effort(slug: str, effort: str | None) -> tuple[str | None, str | None]
         return fallback, f"effort '{effort}' is not a known level; used '{fallback}'"
 
     want = EFFORT_LADDER.index(effort)
-    best = min(supported, key=lambda e: (abs(EFFORT_LADDER.index(e) - want), -EFFORT_LADDER.index(e)))
+    best = min(
+        supported,
+        key=lambda e: (abs(EFFORT_LADDER.index(e) - want), -EFFORT_LADDER.index(e)),
+    )
     return best, f"{slug} accepts only {'/'.join(supported)}; effort '{effort}' snapped to '{best}'"
 
 
@@ -1227,14 +1237,17 @@ def strip_call_syntax(value: str | None) -> str | None:
             )
             if tail:
                 text = text[opening.end():tail.start()].strip()
+        # An orphan closer with no matching opener means the call was truncated.
         closing = _CLOSE_TAG.search(text)
-        if closing and closing.group(1).lower() in CALL_SYNTAX_TAGS:
-            # An orphan closer with no matching opener: the call was truncated.
-            if not re.search(
+        if (
+            closing
+            and closing.group(1).lower() in CALL_SYNTAX_TAGS
+            and not re.search(
                 rf"<\s*{re.escape(closing.group(1))}(\s[^<>]*)?>", text[: closing.start()],
                 re.IGNORECASE,
-            ):
-                text = text[: closing.start()].strip()
+            )
+        ):
+            text = text[: closing.start()].strip()
         if text == before:
             break
     return text
@@ -1278,24 +1291,25 @@ def split_embedded_question(
             return (
                 strip_call_syntax(inner),
                 strip_call_syntax(rest) or None,
-                f"`question` was empty and a <{tag}> block was found inside `context`; "
-                "used that as the question. Send `question` as its own argument next time.",
+                (f"`question` was empty and a <{tag}> block was found inside `context`; "
+                "used that as the question. Send `question` as its own argument next time."),
             )
 
-    context = strip_call_syntax(context)
+    # The input was checked non-empty above, so this cannot come back as None.
+    stripped = strip_call_syntax(context) or ""
     heading = None
-    for match in _QUESTION_HEADING.finditer(context):
+    for match in _QUESTION_HEADING.finditer(stripped):
         heading = match  # the last heading wins; earlier ones are background
-    if heading and context[heading.end():].strip():
+    if heading and stripped[heading.end():].strip():
         return (
-            strip_call_syntax(context[heading.end():]),
-            strip_call_syntax(context[: heading.start()]) or None,
-            "`question` was empty and a 'Question' heading was found inside `context`; "
+            strip_call_syntax(stripped[heading.end():]),
+            strip_call_syntax(stripped[: heading.start()]) or None,
+            ("`question` was empty and a 'Question' heading was found inside `context`; "
             "used the text under it as the question. Send `question` as its own "
-            "argument next time.",
+            "argument next time."),
         )
 
-    return None, context, None
+    return None, stripped, None
 
 
 MISSING_QUESTION = (
@@ -1567,7 +1581,7 @@ def build_messages(
     # reliably than one that arrives before the instruction about it.
     if attachments:
         messages.append(
-            {"role": "user", "content": [{"type": "text", "text": user_content}] + attachments}
+            {"role": "user", "content": [{"type": "text", "text": user_content}, *attachments]}
         )
     else:
         messages.append({"role": "user", "content": user_content})
@@ -1787,7 +1801,9 @@ def save_thread(
     lock_handle = None
     try:
         THREAD_DIR.mkdir(parents=True, exist_ok=True)
-        lock_handle = open(path.with_suffix(".lock"), "a+")
+        # Not a context manager: the handle has to stay open for the whole read-modify-write
+        # below, and it is closed in the finally block after the lock is released.
+        lock_handle = open(path.with_suffix(".lock"), "a+")  # noqa: SIM115
         fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
     except OSError:
         if lock_handle is not None:
@@ -1797,8 +1813,10 @@ def save_thread(
         return _save_thread_locked(
             path, name, question, answer, slug, annotations, attachments
         )
-    except Exception:  # noqa: BLE001 - this runs after the call has been billed, so no
-        return False   # transcript problem may be allowed to destroy the answer
+    except Exception:
+        # This runs after the call has been billed. No transcript problem, of any kind, may
+        # be allowed to destroy an answer the user has already paid for.
+        return False
     finally:
         if lock_handle is not None:
             try:
@@ -1825,7 +1843,7 @@ def _save_thread_locked(
         history.append(
             {
                 "role": "user",
-                "content": [{"type": "text", "text": question}] + attachments,
+                "content": [{"type": "text", "text": question}, *attachments],
             }
         )
     else:
@@ -1959,7 +1977,9 @@ def ask(
     if category:
         picks, cat_notes = category_models(category)
         notes.extend(cat_notes)
-        name, _ = resolve_category(category)
+        # category_models has already refused an unknown category, so this always matches.
+        matched = resolve_category(category)
+        name = matched[0] if matched else category
         slug, resolve_note = resolve_model(picks[0])
         notes.append(f"category '{name}' -> {slug}")
     else:
@@ -2286,7 +2306,9 @@ def ask_panel(
             spec = seen[index]
             try:
                 results[index] = future.result()
-            except Exception as exc:  # noqa: BLE001 - report, never propagate
+            except Exception as exc:
+                # Reported in this model's own slot and never re-raised: one model failing
+                # must not lose the answers the others paid for.
                 results[index] = {
                     "ok": False,
                     "requested": spec,
@@ -2317,7 +2339,7 @@ def list_models(
     needle = (search or "").strip().lower()
     vendor_needle = (vendor or "").strip().lower().rstrip("/")
 
-    rows = []
+    rows: list[dict[str, Any]] = []
     for model in catalog:
         slug = model.get("id") or ""
         low = slug.lower()
