@@ -8,8 +8,8 @@ It ships two front-ends over one engine: an MCP stdio server and a CLI.
 ## Commands
 
 Always invoke Python by absolute path. The interpreter this machine resolved is pinned in
-`.orask-python` (gitignored, machine-specific); it is currently
-`/home/jman/miniconda3/envs/openrouter-mcp/bin/python`.
+`.orask-python` (gitignored, machine-specific): read it, do not hardcode it. On a typical
+install it points into the project's own conda env, `envs/openrouter-mcp/bin/python`.
 
 ```bash
 PY=$(cat .orask-python)
