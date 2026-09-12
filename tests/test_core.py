@@ -1239,6 +1239,8 @@ with tempfile.TemporaryDirectory() as tmp:
     except core.OpenRouterError as exc:
         check("an ocr page charge is counted by the cost guard",
               "over the" in str(exc), str(exc)[:80])
+        check("and the refusal says the page charge is why",
+              "mistral-ocr page charges" in str(exc), str(exc)[:110])
     except AssertionError:
         check("an ocr page charge is counted by the cost guard", False,
               "reached the network, so the charge was not priced")

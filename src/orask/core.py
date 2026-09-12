@@ -2099,6 +2099,7 @@ def ask(
     guard = _float_setting("max_cost_usd_per_call", 1.0)
     estimate, priced = estimate_call_cost(slug, billable, limit)
 
+    ocr = 0.0
     pdf_bytes = int(attached.get("pdf_bytes") or 0)
     if engine == "mistral-ocr" and pdf_bytes:
         rate = _float_setting("mistral_ocr_usd_per_1k_pages", MISTRAL_OCR_USD_PER_1K_PAGES)
@@ -2121,6 +2122,15 @@ def ask(
                     "cost_guard_on_unknown_pricing is 'block'. Pass allow_expensive "
                     "to send anyway."
                 )
+            if ocr > guard:
+                # The token side is unknowable, but the page charge is not, and it alone is
+                # already over the line.
+                raise OpenRouterError(
+                    f"refusing to send: the mistral-ocr page charge alone is about "
+                    f"{fmt_usd(ocr)}, over the {fmt_usd(guard)} per-call guard. Use "
+                    "pdf_engine='cloudflare-ai' if the PDF has real text in it, send fewer "
+                    "pages, or pass allow_expensive to override."
+                )
             notes.append(
                 f"no catalogue pricing for {slug}, so the {fmt_usd(guard)} per-call "
                 "cost guard could not be checked (cost_guard_on_unknown_pricing="
@@ -2129,9 +2139,13 @@ def ask(
         elif estimate > guard:
             raise OpenRouterError(
                 f"refusing to send: worst-case cost for {slug} is about "
-                f"{fmt_usd(estimate)} ({billable} chars in, up to {limit} tokens out), over "
-                f"the {fmt_usd(guard)} per-call guard. Trim the context, lower "
-                "max_tokens, or pass allow_expensive to override."
+                f"{fmt_usd(estimate)} ({billable} chars in, up to {limit} tokens out"
+                + (f", plus about {fmt_usd(ocr)} of mistral-ocr page charges" if ocr else "")
+                + f"), over the {fmt_usd(guard)} per-call guard. Trim the context, lower "
+                "max_tokens, "
+                + ("use pdf_engine='cloudflare-ai' if the PDF has real text in it, "
+                   if ocr else "")
+                + "or pass allow_expensive to override."
             )
 
     payload: dict[str, Any] = {
