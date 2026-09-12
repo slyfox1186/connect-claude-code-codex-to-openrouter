@@ -27,6 +27,7 @@ import time
 import urllib.error
 import urllib.request
 from collections.abc import Iterable
+from datetime import date
 from pathlib import Path
 from typing import Any
 
@@ -1138,7 +1139,7 @@ def _open_regular_fd(path: Path, flags: int = os.O_RDONLY) -> int:
         raise
 
 
-def _slurp(path: Path, ceiling: int) -> tuple[bytes, str | None]:
+def _slurp(path: Path, ceiling: int, *, deny_key: bool = False) -> tuple[bytes, str | None]:
     """Read a regular file up to `ceiling` bytes, or say why it was skipped.
 
     A FIFO, device or socket would block a plain read forever (or return
@@ -1155,6 +1156,13 @@ def _slurp(path: Path, ceiling: int) -> tuple[bytes, str | None]:
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode):
             return b"", f"{path} is not a regular file (fifo, device or socket); skipped"
+        if deny_key:
+            try:
+                key_info = ENV_FILE.stat()
+            except OSError:
+                key_info = None
+            if key_info and (info.st_dev, info.st_ino) == (key_info.st_dev, key_info.st_ino):
+                return b"", f"REFUSED to send {path}: it is the API key file (possibly a hardlink)"
         if info.st_size > ceiling:
             return b"", (
                 f"{path} is {_human_bytes(info.st_size)}, over the "
@@ -1339,8 +1347,8 @@ def _expand_paths(
     return out, notes
 
 
-def _read_file(path: Path, limit: int) -> tuple[str, str | None]:
-    raw, problem = _slurp(path, MAX_FILE_BYTES)
+def _read_file(path: Path, limit: int, *, deny_key: bool = False) -> tuple[str, str | None]:
+    raw, problem = _slurp(path, MAX_FILE_BYTES, deny_key=deny_key)
     if problem:
         return "", problem
     if not raw:
@@ -1414,7 +1422,7 @@ def as_list(value: Any) -> list[str]:
                 return [str(item).strip() for item in parsed if str(item).strip()]
         pieces = text.splitlines() if "\n" in text else text.split(",")
         return [piece.strip() for piece in pieces if piece.strip()]
-    if isinstance(value, (list, tuple, set)):
+    if isinstance(value, Iterable) and not isinstance(value, (dict, bytes)):
         return [str(item).strip() for item in value if str(item).strip()]
     return [str(value).strip()] if str(value).strip() else []
 
@@ -1658,7 +1666,7 @@ def _gather_files(
 
         classified = classify_attachment(candidate)
         if classified is None:
-            text, warning = _read_file(candidate, file_limit)
+            text, warning = _read_file(candidate, file_limit, deny_key=not allow_secret_files)
             if warning:
                 notes.append(warning)
             if not text:
@@ -1686,7 +1694,7 @@ def _gather_files(
             )
             continue
 
-        raw, problem = _slurp(candidate, per_file)
+        raw, problem = _slurp(candidate, per_file, deny_key=not allow_secret_files)
         if problem:
             notes.append(problem)
             continue
@@ -1798,7 +1806,7 @@ def build_messages(
 
     messages: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}]
     replayed = 0
-    for message in history or []:
+    for message in usable_turns(history or []):
         if message.get("role") in ("user", "assistant") and message.get("content"):
             turn: dict[str, Any] = {
                 "role": message["role"], "content": message["content"]
@@ -1827,6 +1835,7 @@ def build_messages(
         )
     else:
         messages.append({"role": "user", "content": user_content})
+    _validate_attachment_limits(messages, model_slug)
     return messages, notes
 
 
@@ -1855,6 +1864,59 @@ def sent_attachments(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         part for part in content
         if isinstance(part, dict) and part.get("type") != "text"
     ]
+
+
+def _attachment_blob(part: dict[str, Any]) -> str | None:
+    kind = part.get("type")
+    field = {"file": "file_data", "image_url": "url", "input_audio": "data"}.get(
+        kind if isinstance(kind, str) else ""
+    )
+    nested = part.get(kind) if isinstance(kind, str) else None
+    if field is None or not isinstance(nested, dict) or not isinstance(nested.get(field), str):
+        return None
+    value = nested[field]
+    if kind != "input_audio":
+        if not value.startswith("data:") or ";base64," not in value:
+            return None
+        value = value.split(";base64,", 1)[1]
+    return value
+
+
+def _valid_content_part(part: Any) -> bool:
+    if not isinstance(part, dict):
+        return False
+    if part.get("type") == "text":
+        return isinstance(part.get("text"), str)
+    return _attachment_blob(part) is not None
+
+
+def _all_attachments(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [part for message in messages if isinstance(message.get("content"), list)
+            for part in message["content"] if isinstance(part, dict) and part.get("type") != "text"]
+
+
+def _validate_attachment_limits(messages: list[dict[str, Any]], slug: str | None) -> None:
+    """Apply current limits to the complete wire payload, including historical attachments."""
+    parts = _all_attachments(messages)
+    if len(parts) > _setting("max_attachments", 20):
+        raise OpenRouterError("new and replayed files exceed max_attachments; use a new thread "
+                              "or explicitly raise the configured limit")
+    sizes = []
+    modalities = _model_modalities(slug)
+    for part in parts:
+        blob = _attachment_blob(part)
+        if blob is None:
+            raise OpenRouterError("thread contains an unsupported attachment; repair it first")
+        padding = len(blob) - len(blob.rstrip("="))
+        sizes.append(max(0, len(blob) * 3 // 4 - padding))
+        kind = {"image_url": "image", "input_audio": "audio"}.get(part["type"])
+        if kind and modalities and kind not in modalities:
+            raise OpenRouterError(f"{slug} cannot accept the thread's {kind} attachment; "
+                                  "choose a compatible model or a new thread")
+    if any(size > _setting("max_attachment_bytes", MAX_ATTACHMENT_BYTES) for size in sizes):
+        raise OpenRouterError("replayed file exceeds the current max_attachment_bytes limit")
+    if sum(sizes) > _setting("max_attachment_total_bytes", MAX_ATTACHMENT_TOTAL_BYTES):
+        raise OpenRouterError("new and replayed files exceed max_attachment_total_bytes")
 
 
 def summarize_parts(parts: Iterable[dict[str, Any]]) -> dict[str, Any]:
@@ -2130,11 +2192,7 @@ def usable_turns(messages: Iterable[Any]) -> list[dict[str, Any]]:
             continue
         content = message.get("content")
         if isinstance(content, list):
-            parts = [
-                part for part in content
-                if isinstance(part, dict)
-                and (part.get("type") != "text" or isinstance(part.get("text"), str))
-            ]
+            parts = [part for part in content if _valid_content_part(part)]
             if not parts:
                 continue
             out.append(dict(message, content=parts))
@@ -2244,6 +2302,9 @@ def _save_thread_locked(
     keep = _setting("thread_max_messages", 20)
     if keep > 0:
         history = history[-keep:]
+    weight = sum(len(json.dumps(part)) for part in _all_attachments(history))
+    if weight > _setting("thread_attachment_bytes", 4 * 1024 * 1024):
+        return False
     return _write_json_atomic(
         path,
         {"name": name, "updated_at": time.time(), "messages": history},
@@ -2642,7 +2703,9 @@ def ask(
         # kept. Past that the caller is told to pass the files again rather than
         # left with a follow-up the model cannot see the document for.
         budget = _setting("thread_attachment_bytes", 4 * 1024 * 1024)
-        weight = sum(len(json.dumps(part)) for part in parts)
+        keep = _setting("thread_max_messages", 20)
+        retained = history[-max(0, keep - 2):] if keep > 2 else ([] if keep else history)
+        weight = sum(len(json.dumps(part)) for part in [*_all_attachments(retained), *parts])
         if weight <= budget:
             carried = parts
             notes.append(
@@ -2738,6 +2801,8 @@ def ask_panel(
     independent houses rather than one lab asked twice.
     """
     cfg = load_config()
+    if "files" in kwargs:
+        kwargs["files"] = as_list(kwargs["files"])  # consume a generator once before workers race
     panel_notes: list[str] = []
     wanted = as_list(models)
     if not wanted and category:
@@ -3034,7 +3099,7 @@ def _guide_path(topic: str) -> Path | None:
 def _guide_read(path: Path, limit: int = MAX_GUIDE_BYTES) -> str:
     """Bounded read. utf-8-sig so a BOM cannot hide the front matter."""
     try:
-        with path.open("rb") as handle:
+        with os.fdopen(_open_regular_fd(path), "rb") as handle:
             raw = handle.read(limit + 1)
     except OSError as exc:
         raise OpenRouterError(f"Cannot read guide {path.name}: {exc}") from exc
@@ -3080,10 +3145,11 @@ def _guide_headings(body: str) -> list[tuple[int, re.Match[str]]]:
     for index, line in enumerate(body.splitlines()):
         marker = _GUIDE_FENCE.match(line)
         if marker:
-            token = marker.group(1)[:3]
+            token = marker.group(1)
             if not fence:
                 fence = token
-            elif line.lstrip().startswith(fence):
+            elif (token[0] == fence[0] and len(token) >= len(fence)
+                  and not line[marker.end():].strip()):
                 fence = ""
             continue
         if fence:
@@ -3092,6 +3158,13 @@ def _guide_headings(body: str) -> list[tuple[int, re.Match[str]]]:
         if heading:
             starts.append((index, heading))
     return starts
+
+
+def _valid_guide_date(value: str) -> bool:
+    try:
+        return bool(_GUIDE_DATE.fullmatch(value)) and date.fromisoformat(value) <= date.today()
+    except ValueError:
+        return False
 
 
 def list_guides() -> list[dict]:
@@ -3108,7 +3181,7 @@ def list_guides() -> list[dict]:
             "topic": slug,
             "triggers": meta.get("triggers", "") or _guide_title(body),
             "verified": meta.get("verified", ""),
-            "stale": not _GUIDE_DATE.match(meta.get("verified", "")),
+            "stale": not _valid_guide_date(meta.get("verified", "")),
             "path": str(path),
         })
     return rows

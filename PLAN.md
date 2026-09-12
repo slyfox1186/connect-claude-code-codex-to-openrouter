@@ -183,3 +183,11 @@ is in the full gate, alongside the CLI subprocess suite. No dependency or model
 version changed. Public correction: malformed/absent choices return incomplete
 with usage rather than a raw-payload exception. Collection config type errors
 are refused early; negative/boolean numeric limits no longer disable guards.
+
+Replay/path audit: ten failures reproduced for aggregate attachment ceilings,
+cumulative thread budgets, known-key hardlinks, malformed saved parts, iterable
+files, and guide symlink/fence handling. Date validation reproduced another failure.
+All pass in tests/test_boundaries.py and the full gate. Historical attachment
+overflow now refuses before billing; fresh-file skip behavior remains documented.
+Known-key inode checks occur on the open descriptor. Arbitrary copied credential
+content cannot be guaranteed safe by a filename denylist and is explicitly deferred.

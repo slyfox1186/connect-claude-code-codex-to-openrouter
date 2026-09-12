@@ -599,3 +599,15 @@ Category verification exits nonzero for missing or excluded pins.
 CLI input that exceeds its byte limit or fails to reach EOF by the deadline now
 refuses the consultation before billing, instead of silently sending a partial
 prompt. Idle sockets still finish normally after their bounded idle wait.
+
+Attachment byte/count limits cover new files and replayed thread files together.
+A follow-up that no longer fits the current limits, or switches to a model unable
+to read a stored image/audio file, is refused before billing. The transcript's
+attachment budget is cumulative across retained turns. The known API-key file
+is refused even when reached through an innocently named hardlink; filename
+policies cannot detect arbitrary copied secrets, so callers must still inspect
+the files they choose to send. Iterable file lists are consumed once per panel.
+
+Guide reads use the same descriptor safety checks as attachments. Section lookup
+respects longer code fences and valid closing fences, and impossible or future
+verification dates are marked as needing verification.

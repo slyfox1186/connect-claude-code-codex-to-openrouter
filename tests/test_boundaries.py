@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import io
 import json
 import os
@@ -152,6 +153,70 @@ class Boundaries(unittest.TestCase):
                                                'finish_reason': 'content_filter'}]})
         self.assertFalse(result['ok'])
         self.assertEqual(result['answer'], 'partial')
+
+    def test_replayed_attachments_obey_current_limits(self):
+        part = {'type': 'file', 'file': {'filename': 'a.pdf',
+                'file_data': 'data:application/pdf;base64,' + base64.b64encode(b'12345').decode()}}
+        history = [{'role': 'user', 'content': [part, part]}]
+        for limits in [{'max_attachments': 1}, {'max_attachment_total_bytes': 9},
+                       {'max_attachment_bytes': 4}]:
+            with self.subTest(limits=limits), \
+                    patch.object(core, '_config_cache', {**core.load_config(), **limits}), \
+                    self.assertRaises(core.OpenRouterError):
+                core.build_messages('follow up', history=history, model_slug='test/model')
+
+    def test_known_key_hardlink_cannot_be_attached(self):
+        core.ENV_FILE.write_text('OPENROUTER_API_KEY=PRIVATE_TEST_KEY')
+        alias = Path(SCRATCH.name) / 'innocent.txt'
+        alias.unlink(missing_ok=True)
+        os.link(core.ENV_FILE, alias)
+        try:
+            messages, notes = core.build_messages('review', files=[str(alias)])
+            self.assertNotIn('PRIVATE_TEST_KEY', json.dumps(messages))
+            self.assertTrue(any('key' in n.lower() for n in notes))
+        finally:
+            core.ENV_FILE.unlink()
+            alias.unlink()
+
+    def test_thread_attachment_budget_is_total_across_turns(self):
+        part = {'type': 'file', 'file': {'filename': 'a.pdf',
+                'file_data': 'data:application/pdf;base64,JVBERi0='}}
+        core._config_cache = {**core.load_config(),
+                              'thread_attachment_bytes': len(json.dumps(part))}
+        with patch.object(core, 'THREAD_DIR', Path(SCRATCH.name) / 'budget-thread'):
+            self.assertTrue(core.save_thread('budget', 'first', 'a', 'test/model',
+                                             attachments=[part]))
+            self.assertFalse(core.save_thread('budget', 'second', 'b', 'test/model',
+                                              attachments=[part]))
+            self.assertEqual(len(core.load_thread('budget')), 2)
+
+    def test_malformed_thread_parts_are_not_replayed(self):
+        bad = [{'role': ['user'], 'content': 'x'}, {'role': 'user', 'content': [
+            {'type': 'file', 'file': 42}, {'type': 'input_audio', 'input_audio': 'bad'}]}]
+        self.assertEqual(core.usable_turns(bad), [])
+
+    def test_iterable_files_are_materialized(self):
+        self.assertEqual(core.as_list(iter(['a.py', 'b.py'])), ['a.py', 'b.py'])
+
+    def test_guide_fences_do_not_expose_code_as_headings(self):
+        for body in ['````markdown\n```\n## hidden\n````\n## visible',
+                     '```python\n```not-a-close\n## hidden\n```\n## visible']:
+            with self.subTest(body=body):
+                self.assertEqual([m.group(2) for _, m in core._guide_headings(body)], ['visible'])
+
+    def test_guide_read_refuses_swapped_symlink(self):
+        path = Path(SCRATCH.name) / 'guide.md'
+        path.unlink(missing_ok=True)
+        path.symlink_to(ROOT / 'README.md')
+        with self.assertRaises(core.OpenRouterError):
+            core._guide_read(path)
+
+    def test_invalid_and_future_guide_dates_need_verification(self):
+        path = Path(SCRATCH.name) / 'dated.md'
+        for value in ['2026-99-99', '9999-01-01']:
+            path.write_text(f'---\nverified: {value}\n---\n# Fixture')
+            with patch.object(core, '_guide_map', return_value={'fixture': path}):
+                self.assertTrue(core.list_guides()[0]['stale'])
 
 
 if __name__ == '__main__':
