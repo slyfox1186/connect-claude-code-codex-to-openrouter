@@ -41,6 +41,7 @@ run "offline tests" env \
     ORASK_CACHE_DIR="$SCRATCH/cache" \
     OPENROUTER_API_KEY="" \
     "$PYTHON" "$PROJECT/tests/test_core.py"
+run "offline MCP protocol" "$PYTHON" "$PROJECT/tests/test_mcp_offline.py"
 
 printf '\n'
 if ((${#FAILED[@]})); then

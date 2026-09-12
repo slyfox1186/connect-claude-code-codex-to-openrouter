@@ -1578,6 +1578,67 @@ core.get_catalog = lambda refresh=False, allow_stale=True: FAKE
 check("reported zero cost is authoritative",
       core.actual_cost(FAKE[0]["id"], {"cost": 0, "prompt_tokens": 1000}) == 0)
 
+
+# ---- audit: output exhaustion must not masquerade as a completed review ----
+from unittest.mock import patch
+
+for _content, _reasoning, _finish in (("", "unfinished analysis", "length"),
+                                      ("partial findings", "analysis", "length"),
+                                      ("", "reasoning only", "stop")):
+    _response = {
+        "choices": [{"message": {"content": _content, "reasoning": _reasoning},
+                     "finish_reason": _finish}],
+        "usage": {"prompt_tokens": 100, "completion_tokens": 1000, "cost": 0.02,
+                  "completion_tokens_details": {"reasoning_tokens": 900}},
+    }
+    with patch.object(core, "_request", return_value=_response), \
+            patch.object(core, "save_thread") as _save:
+        _result = core.ask("review", model="kimi", max_tokens=1000, thread="unfinished")
+    check(f"unfinished reply is not success ({_content!r}, {_finish})",
+          _result["ok"] is False and _result.get("incomplete") is True)
+    check("reasoning never replaces the final answer", _result["answer"] == _content)
+    check("unfinished reply retains usage and diagnostic recovery",
+          _result["usage"]["cost_usd"] == 0.02
+          and any("max_tokens" in n for n in _result["notes"]))
+    check("unfinished reply is not saved as a completed thread turn", not _save.called)
+with patch.object(core, "_request", return_value=_answered):
+    _result = core.ask("review", model="kimi", max_tokens=1000)
+check("a complete final answer remains successful",
+      _result["ok"] and _result.get("incomplete") is False)
+_info = core.model_info("kimi")
+check("model discovery exposes bridge budget defaults and cost guard",
+      _info.get("bridge_limits", {}).get("default_max_tokens") == cfg["default_max_tokens"]
+      and _info.get("bridge_limits", {}).get("max_cost_usd_per_call")
+      == cfg["max_cost_usd_per_call"])
+
+
+# ---- MCP effort is enforced, not entrusted to caller prose -----------------
+for _effort, _reason in (("low", None), ("minimal", None), ("none", None),
+                         ("off", None), ("medium", None), ("medium", "   ")):
+    with patch.object(core, "_request", return_value=_answered) as _transport:
+        try:
+            core.ask("q", model="kimi", effort=_effort, effort_reason=_reason, _mcp_call=True)
+            check(f"MCP refuses disallowed effort {_effort!r}", False)
+        except core.OpenRouterError:
+            check(f"MCP refuses disallowed effort {_effort!r}", not _transport.called)
+        except TypeError:
+            check(f"MCP refuses disallowed effort {_effort!r}", False)
+try:
+    with patch.object(core, "_request", return_value=_answered) as _transport:
+        _result = core.ask("q", model="kimi", _mcp_call=True)
+    check("MCP defaults to max regardless of lower configured defaults",
+          _transport.call_args.args[2]["reasoning"]["effort"] == "max")
+except TypeError:
+    check("MCP defaults to max regardless of lower configured defaults", False)
+try:
+    with patch.object(core, "_request", return_value=_answered) as _transport:
+        core.ask("q", model="kimi", effort="medium", effort_reason="Bounded syntax check",
+                 _mcp_call=True)
+    check("justified medium never maps down to low",
+          _transport.call_args.args[2]["reasoning"]["effort"] == "high")
+except TypeError:
+    check("justified medium never maps down to low", False)
+
 print()
 if FAILS:
     print(f"{len(FAILS)} of {CHECKS} checks failed: {', '.join(FAILS)}")

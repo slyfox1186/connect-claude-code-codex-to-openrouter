@@ -65,13 +65,37 @@ always its own argument:
 Never wrap a value in XML tags, and never fold the question into `context`.
 A long `context` is fine and expected; length is not what breaks a call.
 
-Prompt and answer share the model's context window, and no argument makes it
-bigger. `max_context_tokens` budgets below it (anything above is clamped down),
-`max_tokens` is lowered automatically to whatever room the prompt leaves, and a
-prompt with no room left for a reply is refused before it is billed. Pass
-`context_compression: true` on that refusal only when a partial view of the
-material is acceptable: OpenRouter then drops text from the middle of the prompt
-until it fits, so the model answers without having read all of it.
+Budget each consultation for a completed answer. Before a large review or a
+retry after truncation, inspect llm_model_info for every selected model; for a
+category panel, list_llm_categories identifies its models first. Use the returned
+context_length, max_output_tokens, reasoning_efforts and bridge_limits to choose
+max_tokens and effort for the task. MCP defaults to max: prefer max or xhigh.
+Medium is permitted only with a concrete task-specific effort_reason. Low,
+minimal and disabled reasoning are refused. The requested level maps to the
+model's supported levels, but never below medium; a model whose strongest level
+is high can therefore run at high. Do not reduce effort to solve a budget refusal:
+raise output room within limits or split the work first.
+max_tokens includes BOTH reasoning and the
+final answer, even when reasoning is hidden. A short requested answer does not
+justify a tiny output cap on a hard reasoning task. The configured default is a
+starting point, not a universal optimum; select more room when the scope needs it.
+
+max_context_tokens budgets input plus output inside the model's fixed window.
+Leave it unset to use the published window unless a smaller task budget is wanted.
+Raising it cannot raise max_tokens or the model's capacity. Keep required source
+material intact; context_compression drops text from the middle and is unsuitable
+when the review requires every file. Ask for final findings, evidence, fixes and
+unresolved gaps; do not request an exhaustive narration of the review process.
+
+Check finish_reason, completion and reasoning usage, notes and the final answer.
+INCOMPLETE or NO ANSWER is a failed consultation even if it contains useful partial
+findings, and may still cost money. Inspect the actual output cap: the bridge may
+have lowered it to fit the remaining context. For a retry, change the limiting
+factor: raise max_tokens within the model/window/cost limits, split the task while
+preserving relevant evidence, or use justified medium when appropriate. Do not retry
+unchanged, retry successful panel members, automatically bypass guards, or claim
+that increasing the context alone fixes output exhaustion. Explain the revised
+budget and count the failed call's cost. Stop if no authorized change can fit.
 
 Two safety overrides exist but are off for tool calls: `allow_secret_files`
 (send a file matching the credential denylist) and `allow_expensive` (bypass
@@ -174,7 +198,8 @@ def _render(result: dict[str, Any], include_reasoning: bool = False) -> str:
         billed_call = bool(usage)
         lines = [
             f"### {result.get('model') or result.get('requested')} - "
-            + ("NO ANSWER" if billed_call else "FAILED"),
+            + ("INCOMPLETE" if result.get("incomplete") else
+               ("NO ANSWER" if billed_call else "FAILED")),
             "",
             str(result.get("error")),
         ]
@@ -184,6 +209,10 @@ def _render(result: dict[str, Any], include_reasoning: bool = False) -> str:
             lines += ["", f"`billed ${billed:.4f} anyway`"]
         for note in result.get("notes") or []:
             lines.append(f"> note: {note}")
+        if result.get("answer"):
+            lines += ["", "Partial answer:", result["answer"]]
+        if include_reasoning and result.get("reasoning"):
+            lines += ["", "Reasoning (not a final answer):", result["reasoning"]]
         return "\n".join(lines)
 
     bits = [f"model: {result['model']}"]
@@ -309,6 +338,7 @@ async def ask_llm(
     files: list[str] | str | None = None,
     role: str | None = None,
     effort: str | None = None,
+    effort_reason: str | None = None,
     system: str | None = None,
     max_tokens: int | None = None,
     max_context_tokens: int | None = None,
@@ -351,11 +381,14 @@ async def ask_llm(
             debugger (rank root causes), architect (assess a design), redteam
             (attack the plan). Left unset it follows default_role in the config,
             which is advisor unless it has been changed.
-        effort: Reasoning effort - low, medium, high (default), xhigh, max, or
-            'none'. Automatically snapped to what the target model supports.
+        effort: max (default) or xhigh. Medium requires effort_reason. Lower or
+            disabled reasoning is refused; model mapping never goes below medium.
+        effort_reason: Concrete task-specific justification when requesting medium.
         system: Replace the role prompt entirely with your own system prompt.
-        max_tokens: Cap the answer. Leave unset unless you need a short reply;
-            reasoning models spend this budget thinking before answering.
+        max_tokens: Total output allowance for reasoning AND final answer.
+            Choose for task complexity, not just the desired visible answer length.
+            Inspect llm_model_info before a large review; leave unset for the configured
+            default. A larger context window does not increase this allowance.
         max_context_tokens: Budget prompt and answer together into this many
             tokens. A model's context window is fixed and cannot be raised from
             here, so a number above it is clamped back down to what the model
@@ -364,7 +397,7 @@ async def ask_llm(
         context_compression: What to do when the prompt does not fit the window.
             true lets OpenRouter drop text from the middle until it does, false
             refuses instead. Left unset the prompt is refused with the numbers,
-            except on the small endpoints OpenRouter already compresses for you.
+            before sending. Omitted leaves the provider plugin setting unchanged.
         temperature: Sampling temperature. Leave unset for the model default.
         thread: Name a conversation to keep, so a later call with the same name
             is a follow-up the model remembers.
@@ -392,6 +425,7 @@ async def ask_llm(
         temperature=temperature,
         thread=thread, cwd=cwd, pdf_engine=pdf_engine, allow_expensive=allow_expensive,
         allow_secret_files=allow_secret_files, include_reasoning=show_reasoning,
+        effort_reason=effort_reason, _mcp_call=True,
     )
     return _note(_render(result, show_reasoning), shape_note, expensive_note, secret_note)
 
@@ -420,6 +454,7 @@ async def ask_panel(
     files: list[str] | str | None = None,
     role: str | None = None,
     effort: str | None = None,
+    effort_reason: str | None = None,
     system: str | None = None,
     max_tokens: int | None = None,
     max_context_tokens: int | None = None,
@@ -449,14 +484,18 @@ async def ask_panel(
             the files inside it. Never paste a file into `question` instead.
         role: advisor, reviewer, debugger, architect or redteam. Left unset it
             follows default_role in the config.
-        effort: Reasoning effort, snapped per model to what each supports.
+        effort: max (default) or xhigh; medium requires effort_reason. Every
+            model must advertise supported reasoning at medium or stronger.
+        effort_reason: Concrete task-specific justification when requesting medium.
         system: Replace the role prompt with your own.
-        max_tokens: Cap each answer.
+        max_tokens: Total reasoning plus final-answer allowance per model. Use
+            llm_model_info to size it for the task; a shared panel cap must work for
+            every member. Use separate ask_llm calls when budgets should differ.
         max_context_tokens: Budget prompt and answer together into this many
             tokens per model, clamped down to each model's own window.
         context_compression: true lets OpenRouter drop text from the middle of a
             prompt that does not fit; false refuses it. Unset refuses with the
-            numbers, except where OpenRouter compresses by default.
+            numbers before sending; omission leaves the provider plugin unchanged.
         temperature: Sampling temperature. Leave unset for the model default.
         cwd: Directory that relative `files` paths resolve against.
         pdf_engine: How an attached PDF is read: 'cloudflare-ai' (default, free),
@@ -478,7 +517,7 @@ async def ask_panel(
         max_context_tokens=max_context_tokens, context_compression=context_compression,
         temperature=temperature, cwd=cwd, pdf_engine=pdf_engine,
         allow_expensive=allow_expensive, allow_secret_files=allow_secret_files,
-        include_reasoning=show_reasoning,
+        include_reasoning=show_reasoning, effort_reason=effort_reason, _mcp_call=True,
     )
     # Every result, not just the ones that answered: an empty completion is ok: False and is
     # still billed, so filtering on ok reports a total lower than the invoice.

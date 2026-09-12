@@ -2168,11 +2168,22 @@ def ask(
     allow_expensive: bool = False,
     allow_secret_files: bool = False,
     include_reasoning: bool = False,
+    effort_reason: str | None = None,
+    _mcp_call: bool = False,
 ) -> dict[str, Any]:
     """Ask one model and return a structured result."""
     cfg = load_config()
     started = time.monotonic()
 
+    if _mcp_call:
+        effort = (effort or "max").strip().lower()
+        if effort not in {"max", "xhigh", "medium"}:
+            raise OpenRouterError(
+                "MCP calls require max or xhigh effort, or medium with effort_reason. "
+                "Low, minimal and disabled reasoning are not permitted."
+            )
+        if effort == "medium" and not (effort_reason and effort_reason.strip()):
+            raise OpenRouterError("MCP medium effort requires a non-empty effort_reason.")
     notes: list[str] = []
     # Recover a misplaced question here rather than only inside build_messages, so the question
     # that reaches the thread transcript is the real one. Storing the untouched argument wrote
@@ -2240,6 +2251,7 @@ def ask(
     limit = int(max_tokens) if max_tokens is not None else _setting("default_max_tokens", 32000)
     ceiling = int(((_find(slug).get("top_provider") or {}).get("max_completion_tokens")) or 0)
     if limit and ceiling and limit > ceiling:
+        notes.append(f"max_tokens={limit} exceeds {slug}'s output ceiling; using {ceiling}.")
         limit = ceiling
     if not limit:
         # Neither the config nor the catalogue gave a cap. Sending no max_tokens would price
@@ -2340,6 +2352,16 @@ def ask(
 
     wanted_effort = effort if effort is not None else cfg.get("default_effort")
     final_effort, effort_note = clamp_effort(slug, wanted_effort)
+    if _mcp_call:
+        declared = ((_find(slug).get("reasoning") or {}).get("supported_efforts") or [])
+        if (not declared or final_effort not in EFFORT_LADDER
+                or EFFORT_LADDER.index(final_effort) < EFFORT_LADDER.index("medium")):
+            raise OpenRouterError(
+                f"{slug} cannot satisfy the MCP reasoning policy with its published efforts. "
+                "Choose a model advertising medium or stronger reasoning; low is never used."
+            )
+        if effort == "medium":
+            notes.append(f"medium effort requested because: {(effort_reason or '').strip()}")
     if effort_note:
         notes.append(effort_note)
     if final_effort:
@@ -2408,28 +2430,19 @@ def ask(
     reasoning = (message.get("reasoning") or "").strip()
     finish = choices[0].get("finish_reason") or choices[0].get("native_finish_reason")
 
-    if not answer and reasoning:
-        answer = reasoning
-        notes.append(
-            "the model returned only reasoning text and no final answer "
-            "(often means max_tokens was consumed while thinking); showing the reasoning"
-        )
-        reasoning = ""
     empty = not answer
-    if empty:
+    incomplete = empty or finish == "length"
+    if incomplete:
         notes.append(
-            f"{slug} returned no answer at all (finish_reason={finish}); "
-            "the call was still billed"
+            f"incomplete response (finish_reason={finish}, max_tokens={limit}): "
+            "max_tokens covers reasoning plus the final answer; a larger context window "
+            "alone does not increase that output allowance. Inspect usage.reasoning_tokens "
+            "and llm_model_info, then choose a larger max_tokens within the model and cost "
+            "limits, or narrow the task. MCP calls require max/xhigh, or justified medium. "
+            "Do not retry unchanged or treat partial analysis as a completed review."
         )
-
-    if finish == "length":
-        cap = payload.get("max_tokens")
-        notes.append(
-            f"answer was cut off at the {cap} token limit; ask for a shorter answer "
-            "or raise max_tokens"
-            if cap
-            else "answer was cut off by the provider's own output limit"
-        )
+        if empty:
+            notes.append("the model returned no final answer; the call may still be billed")
 
     usage = response.get("usage") or {}
     prompt_detail = usage.get("prompt_tokens_details") or {}
@@ -2461,7 +2474,7 @@ def ask(
             "OpenRouter parsed the attached file for this call. Pass a `thread` name "
             "to keep following up on it without sending or parsing it again."
         )
-    if thread and answer and not save_thread(
+    if thread and not incomplete and not save_thread(
         thread, question, answer, slug, annotations, carried
     ):
         notes.append(
@@ -2471,7 +2484,8 @@ def ask(
 
     log_call(
         {
-            "model": slug, "requested": model, "ok": not empty, "empty": empty,
+            "model": slug, "requested": model, "ok": not incomplete, "empty": empty,
+            "incomplete": incomplete, "finish_reason": finish,
             "effort": final_effort, "role": role or cfg.get("default_role"),
             "prompt_tokens": usage.get("prompt_tokens"),
             "completion_tokens": usage.get("completion_tokens"),
@@ -2484,11 +2498,12 @@ def ask(
     )
 
     return {
-        # An empty completion is reported as a failure: a caller keying on `ok`
-        # must not treat "no answer" as a second opinion.
-        "ok": not empty,
+        # Only a final answer that finished normally counts as a completed opinion.
+        "ok": not incomplete,
+        "incomplete": incomplete,
         "error": (
-            f"{slug} returned an empty answer (finish_reason={finish})" if empty else None
+            f"{slug} returned an incomplete response (finish_reason={finish})"
+            if incomplete else None
         ),
         "model": slug,
         "requested": model,
@@ -2672,6 +2687,14 @@ def model_info(spec: str) -> dict[str, Any]:
         "description": (model.get("description") or "")[:1200],
         "context_length": model.get("context_length"),
         "max_output_tokens": top.get("max_completion_tokens"),
+        "bridge_limits": {
+            "default_max_tokens": _setting("default_max_tokens", 32000),
+            "default_effort": load_config().get("default_effort"),
+            "mcp_default_effort": "max",
+            "mcp_medium_requires_reason": True,
+            "max_context_tokens": _setting("max_context_tokens", 0),
+            "max_cost_usd_per_call": _float_setting("max_cost_usd_per_call", 1.0),
+        },
         "moderated": top.get("is_moderated"),
         "usd_per_m_input": round(_price(model, "prompt") * 1_000_000, 3),
         "usd_per_m_output": round(_price(model, "completion") * 1_000_000, 3),

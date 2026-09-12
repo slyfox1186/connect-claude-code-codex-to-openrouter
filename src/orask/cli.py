@@ -36,11 +36,18 @@ def _fmt_money(value: Any) -> str:
 
 
 def _print_result(result: dict[str, Any], show_reasoning: bool) -> None:
-    if result.get("error") and not result.get("answer"):
-        print(f"── {result.get('model') or result.get('requested')}  NO ANSWER")
+    if not result.get("ok"):
+        label = "INCOMPLETE" if result.get("incomplete") else "NO ANSWER"
+        print(f"── {result.get('model') or result.get('requested')}  {label}")
         print(f"   {result['error']}")
         for note in result.get("notes") or []:
             print(f"   note: {note}")
+        if result.get("usage"):
+            print(f"   billed {_fmt_money(result['usage'].get('cost_usd'))}")
+        if result.get("answer"):
+            print("\nPartial answer:\n" + result["answer"])
+        if show_reasoning and result.get("reasoning"):
+            print("\nReasoning (not a final answer):\n" + result["reasoning"])
         return
     usage = result.get("usage") or {}
     head = f"── {result['model']}"
@@ -148,7 +155,10 @@ def _shared_ask_args(parser: argparse.ArgumentParser) -> None:
         help="advisor (default) | reviewer | debugger | architect | redteam",
     )
     parser.add_argument("-s", "--system", help="override the system prompt entirely")
-    parser.add_argument("--max-tokens", type=int, help="cap the answer length")
+    parser.add_argument(
+        "--max-tokens", type=int,
+        help="cap reasoning plus final-answer tokens; size for task complexity",
+    )
     parser.add_argument(
         "--max-context-tokens", type=int, metavar="N",
         help="budget prompt plus answer into N tokens; capped at the model's own window",
@@ -339,13 +349,7 @@ def _cmd_panel(args: argparse.Namespace) -> int:
         # Counted whether or not it answered: a model that returns nothing is ok: False and
         # was still billed for it.
         total += float((result.get("usage") or {}).get("cost_usd") or 0)
-        if result.get("ok"):
-            _print_result(result, args.show_reasoning)
-        else:
-            print(f"── {result.get('requested')}  FAILED")
-            print(f"   {result.get('error')}")
-            for note in result.get("notes") or []:
-                print(f"   note: {note}")
+        _print_result(result, args.show_reasoning)
         print()
     print(
         f"── panel of {len(results)} in {time.monotonic() - started:.1f}s, "

@@ -1,0 +1,59 @@
+Second-opinion bridge to other frontier LLMs through OpenRouter.
+
+Use ask_llm when the user asks you to consult another model ("ask Kimi",
+"see what GLM thinks", "get a second opinion"), or when you are stuck and an
+independent take would help. Use ask_panel to ask several models at once and
+compare. The other model cannot see the repository, so pass the relevant code
+with `files` and the situation with `context` - a question with no context
+gets a generic answer.
+
+Never paste a file's contents into `question` or `context`. Put its path in
+`files` and the bridge sends the file itself: source and prose go in as text,
+while a PDF, screenshot, diagram or sound file is attached to the message as
+a real attachment. A directory path in `files` sends the files inside it.
+
+When the user names a capability instead of a model, pass it as `category` and
+leave `model` and `models` unset. Which tool depends on how they said it:
+
+  singular - "ask an LLM that is good at coding", "something strong at math"
+             -> ask_llm with category
+  plural   - "use the coding LLMs", "ask the reasoning models", "what do the
+             debugging ones say" -> ask_panel with category
+
+Pass the user's own words as `category`. It is matched against the category
+names, their synonyms, and any phrase containing one, so "use the coding LLMs
+to review this" resolves on its own. A phrase matching nothing is refused
+rather than guessed at, so you do not need to map it yourself first.
+
+Each category resolves to the current benchmark leaders for it, two different
+vendors on purpose; list_llm_categories shows the evidence behind each pick.
+
+Category picks never return an OpenAI, Anthropic or Google model: this bridge
+exists to fetch a view from outside the agent asking. Ask for one of those by
+full slug if you specifically want it.
+
+Any OpenRouter model can be reached by passing its full slug; use
+list_llm_models to find one. Short aliases are configured for these:
+
+Arguments are flat JSON, one plain string per argument, and `question` is
+always its own argument:
+
+    {"question": "...", "context": "...", "files": ["/abs/path.py"],
+     "role": "architect"}
+
+Never wrap a value in XML tags, and never fold the question into `context`.
+A long `context` is fine and expected; length is not what breaks a call.
+
+Prompt and answer share the model's context window, and no argument makes it
+bigger. `max_context_tokens` budgets below it (anything above is clamped down),
+`max_tokens` is lowered automatically to whatever room the prompt leaves, and a
+prompt with no room left for a reply is refused before it is billed. Pass
+`context_compression: true` on that refusal only when a partial view of the
+material is acceptable: OpenRouter then drops text from the middle of the prompt
+until it fits, so the model answers without having read all of it.
+
+Two safety overrides exist but are off for tool calls: `allow_secret_files`
+(send a file matching the credential denylist) and `allow_expensive` (bypass
+the per-call cost guard). Passing either is refused with a note unless the
+user has turned it on in their config. Relay that note rather than retrying:
+the user has to make that decision, not you.

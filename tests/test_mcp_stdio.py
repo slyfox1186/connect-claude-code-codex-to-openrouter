@@ -1,7 +1,7 @@
 """End-to-end MCP protocol test: spawn the real launcher over stdio.
 
 Run:  python tests/test_mcp_stdio.py   (needs the mcp package and a live API key)
-Costs a few cents - it makes one real model call.
+Makes five billed completions at max effort; needs a live API key.
 """
 
 import asyncio
@@ -138,7 +138,7 @@ async def main() -> int:
             "ask_llm",
             {
                 "question": "Reply with exactly the word: ACKNOWLEDGED",
-                "model": "kimi", "effort": "low", "max_tokens": 4000,
+                "model": "kimi", "effort": "max", "max_tokens": 16000,
             },
         )
         text = "".join(getattr(c, "text", "") for c in res.content)
@@ -150,7 +150,7 @@ async def main() -> int:
             "ask_panel",
             {
                 "question": "Reply with exactly one word: PANEL",
-                "models": ["kimi", "glm"], "effort": "low", "max_tokens": 6000,
+                "models": ["kimi", "glm"], "effort": "max", "max_tokens": 16000,
             },
         )
         text = "".join(getattr(c, "text", "") for c in res.content)
@@ -166,7 +166,7 @@ async def main() -> int:
             {
                 "question": "Reply with exactly one word: PARTIAL",
                 "models": ["kimi", "no-such-model-xyz"],
-                "effort": "low", "max_tokens": 6000,
+                "effort": "max", "max_tokens": 16000,
             },
         )
         text = "".join(getattr(c, "text", "") for c in res.content)
@@ -188,7 +188,7 @@ async def main() -> int:
                 {
                     "question": "What codeword is in the attached PDF? Reply with just it.",
                     "model": "kimi", "files": [str(pdf)],
-                    "effort": "low", "max_tokens": 4000,
+                    "effort": "max", "max_tokens": 16000,
                 },
             )
             text = "".join(getattr(c, "text", "") for c in res.content)

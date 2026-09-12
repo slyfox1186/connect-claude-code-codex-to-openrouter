@@ -28,8 +28,10 @@ install.sh                idempotent registration for both agents
 check.sh                  the gate: lint, types, shell syntax, offline tests
 pyproject.toml            ruff and mypy config (no [project] table, on purpose)
 guides/                   local best-practice cheat sheets, served by read_guide
-tests/test_core.py        285 offline checks, no network or key needed
-tests/test_mcp_stdio.py   end-to-end MCP protocol test (spends a few cents)
+tests/test_core.py        offline engine checks, no network or key needed
+tests/test_mcp_offline.py offline MCP protocol and safety checks
+tests/test_mcp_stdio.py   live MCP protocol test (five billed completions)
+tests/eval_budget.py      opt-in paid baseline/candidate caller-prompt evaluation
 ```
 
 Runtime paths: key at `~/.config/openrouter/env` (0600), catalogue cache at
@@ -330,6 +332,23 @@ accept `max`/`high`/`low` and reject `medium`, Grok 4.6 accepts
 requested effort onto what the target model actually advertises, rounding up on a
 tie, and says so in the response notes. Verified against the live catalogue.
 
+MCP calls default to `max` independently of the CLI's configurable default.
+Claude Code and Codex must request `max` or `xhigh`; `medium` requires a concrete
+task-specific `effort_reason`. Low, minimal and disabled reasoning are rejected
+before billing. A preferred effort maps to the model's published levels; a model
+whose strongest level is `high` can use that level, and mapping never drops below
+medium. Models without published compatible reasoning levels are refused by MCP.
+The CLI retains its existing effort choices.
+
+**Choosing a reply budget.** `max_tokens` covers reasoning and the final answer
+together. A large context window does not prevent a small output cap from being
+used entirely for reasoning. Before a substantial consultation, the caller uses
+`llm_model_info` (including `bridge_limits`) to choose output and context budgets
+for the actual task. The configured default is a starting point. If a call ends
+with `length`, inspect its usage, increase the output allowance within the model
+and cost limits, or split the work. Retry only the incomplete model in a panel.
+There is no automatic paid retry, and exhaustive reviews must not use compression.
+
 **Self-healing aliases.** Aliases are pinned to concrete slugs so cost is
 auditable. If a pinned slug disappears from OpenRouter, resolution falls back to
 the best live match for the alias name and reports the substitution rather than
@@ -434,10 +453,12 @@ cold panel makes one `/models` request rather than one per worker.
 failure in the body, which used to surface as "returned no choices" plus a raw dump.
 It goes through the same typed-error translation as any other failure.
 
-**Empty completions are failures.** A billed call that returns no content comes
-back `ok: False` with the usage preserved, so a caller keying on `ok` cannot
-mistake "no answer" for a second opinion. If a model returns only reasoning text
-and no answer, the reasoning is surfaced with an explanation.
+**Incomplete completions are failures.** Empty answers, reasoning-only responses,
+and `finish_reason: length` return `ok: false` and `incomplete: true`, preserving
+usage and any partial answer. They do not count as answered panel members or enter
+completed thread history. Reasoning is visible only with `include_reasoning`.
+This intentionally corrects the earlier behavior that counted unfinished reasoning
+or truncated text as a successful consultation.
 
 **Piped stdin never hangs.** `git diff | orask ask ...` works, but fd 0 is not
 always a pipe: launched from a background job, daemon or agent shell tool it is
@@ -486,7 +507,8 @@ forever when launched from a background job, because fd 0 was an open socket and
 ```
 ./check.sh                      # the gate: ruff, mypy, bash -n, offline tests
 python tests/test_core.py       # offline, free, no mcp package needed
-python tests/test_mcp_stdio.py  # live, a few cents, needs mcp and a key
+python tests/test_mcp_stdio.py  # live, five billed completions, needs mcp and a key
+python tests/eval_budget.py --live  # paid prompt comparison, 16 calls by default
 orask doctor                    # installed-state check
 ```
 

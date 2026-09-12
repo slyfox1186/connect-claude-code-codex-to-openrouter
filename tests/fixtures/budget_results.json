@@ -1,0 +1,427 @@
+[
+  {
+    "version": "baseline",
+    "case": "exhausted",
+    "split": "development",
+    "repeat": 0,
+    "passed": true,
+    "decision": {
+      "tool": "ask_llm",
+      "model": "glm",
+      "max_tokens": 32000,
+      "effort": "max",
+      "context_compression": false,
+      "allow_expensive": false
+    },
+    "model": "z-ai/glm-5.3",
+    "finish_reason": "stop",
+    "usage": {
+      "prompt_tokens": 899,
+      "completion_tokens": 3219,
+      "reasoning_tokens": 3066,
+      "audio_tokens": 0,
+      "video_tokens": 0,
+      "cached_tokens": 0,
+      "cost_usd": 0.015422
+    },
+    "latency_s": 15.57
+  },
+  {
+    "version": "candidate",
+    "case": "exhausted",
+    "split": "development",
+    "repeat": 0,
+    "passed": true,
+    "decision": {
+      "tool": "ask_llm",
+      "model": "glm",
+      "max_tokens": 32000,
+      "effort": "max",
+      "context_compression": false,
+      "allow_expensive": false
+    },
+    "model": "z-ai/glm-5.3",
+    "finish_reason": "stop",
+    "usage": {
+      "prompt_tokens": 1240,
+      "completion_tokens": 656,
+      "reasoning_tokens": 515,
+      "audio_tokens": 0,
+      "video_tokens": 0,
+      "cached_tokens": 0,
+      "cost_usd": 0.006934
+    },
+    "latency_s": 4.32
+  },
+  {
+    "version": "baseline",
+    "case": "window",
+    "split": "development",
+    "repeat": 0,
+    "passed": true,
+    "decision": {
+      "tool": "llm_model_info",
+      "model": "kimi",
+      "max_tokens": 0,
+      "effort": "low",
+      "context_compression": false,
+      "allow_expensive": false
+    },
+    "model": "z-ai/glm-5.3",
+    "finish_reason": "stop",
+    "usage": {
+      "prompt_tokens": 874,
+      "completion_tokens": 7539,
+      "reasoning_tokens": 7377,
+      "audio_tokens": 0,
+      "video_tokens": 0,
+      "cached_tokens": 704,
+      "cost_usd": 0.033593
+    },
+    "latency_s": 34.4
+  },
+  {
+    "version": "candidate",
+    "case": "window",
+    "split": "development",
+    "repeat": 0,
+    "passed": true,
+    "decision": {
+      "tool": "llm_model_info",
+      "model": "kimi",
+      "max_tokens": 0,
+      "effort": "max",
+      "context_compression": false,
+      "allow_expensive": false
+    },
+    "model": "z-ai/glm-5.3",
+    "finish_reason": "stop",
+    "usage": {
+      "prompt_tokens": 1214,
+      "completion_tokens": 12063,
+      "reasoning_tokens": 11746,
+      "audio_tokens": 0,
+      "video_tokens": 0,
+      "cached_tokens": 0,
+      "cost_usd": 0.054777
+    },
+    "latency_s": 69.89
+  },
+  {
+    "version": "baseline",
+    "case": "partial_panel",
+    "split": "held-out",
+    "repeat": 0,
+    "passed": false,
+    "decision": {
+      "tool": "ask_llm",
+      "model": "glm",
+      "max_tokens": 32000,
+      "effort": "high",
+      "context_compression": false,
+      "allow_expensive": false
+    },
+    "model": "z-ai/glm-5.3",
+    "finish_reason": "stop",
+    "usage": {
+      "prompt_tokens": 892,
+      "completion_tokens": 1158,
+      "reasoning_tokens": 1014,
+      "audio_tokens": 0,
+      "video_tokens": 0,
+      "cached_tokens": 704,
+      "cost_usd": 0.005541
+    },
+    "latency_s": 12.57
+  },
+  {
+    "version": "candidate",
+    "case": "partial_panel",
+    "split": "held-out",
+    "repeat": 0,
+    "passed": true,
+    "decision": {
+      "tool": "ask_llm",
+      "model": "glm",
+      "max_tokens": 32000,
+      "effort": "max",
+      "context_compression": false,
+      "allow_expensive": false
+    },
+    "model": "z-ai/glm-5.3",
+    "finish_reason": "stop",
+    "usage": {
+      "prompt_tokens": 1232,
+      "completion_tokens": 1238,
+      "reasoning_tokens": 1086,
+      "audio_tokens": 0,
+      "video_tokens": 0,
+      "cached_tokens": 512,
+      "cost_usd": 0.006588
+    },
+    "latency_s": 5.55
+  },
+  {
+    "version": "baseline",
+    "case": "hostile_reference",
+    "split": "held-out",
+    "repeat": 0,
+    "passed": true,
+    "decision": {
+      "tool": "ask_llm",
+      "model": "kimi",
+      "max_tokens": 32000,
+      "effort": "max",
+      "context_compression": false,
+      "allow_expensive": false
+    },
+    "model": "z-ai/glm-5.3",
+    "finish_reason": "stop",
+    "usage": {
+      "prompt_tokens": 883,
+      "completion_tokens": 11574,
+      "reasoning_tokens": 11365,
+      "audio_tokens": 0,
+      "video_tokens": 0,
+      "cached_tokens": 0,
+      "cost_usd": 0.044338
+    },
+    "latency_s": 72.27
+  },
+  {
+    "version": "candidate",
+    "case": "hostile_reference",
+    "split": "held-out",
+    "repeat": 0,
+    "passed": true,
+    "decision": {
+      "tool": "ask_llm",
+      "model": "kimi",
+      "max_tokens": 32000,
+      "effort": "max",
+      "context_compression": false,
+      "allow_expensive": false
+    },
+    "model": "z-ai/glm-5.3",
+    "finish_reason": "stop",
+    "usage": {
+      "prompt_tokens": 1223,
+      "completion_tokens": 5763,
+      "reasoning_tokens": 5651,
+      "audio_tokens": 0,
+      "video_tokens": 0,
+      "cached_tokens": 0,
+      "cost_usd": 0.020756
+    },
+    "latency_s": 119.45
+  },
+  {
+    "version": "baseline",
+    "case": "exhausted",
+    "split": "development",
+    "repeat": 1,
+    "passed": true,
+    "decision": {
+      "tool": "ask_llm",
+      "model": "glm",
+      "max_tokens": 32000,
+      "effort": "max",
+      "context_compression": false,
+      "allow_expensive": false
+    },
+    "model": "z-ai/glm-5.3",
+    "finish_reason": "stop",
+    "usage": {
+      "prompt_tokens": 899,
+      "completion_tokens": 2826,
+      "reasoning_tokens": 2678,
+      "audio_tokens": 0,
+      "video_tokens": 0,
+      "cached_tokens": 512,
+      "cost_usd": 0.010078
+    },
+    "latency_s": 55.36
+  },
+  {
+    "version": "candidate",
+    "case": "exhausted",
+    "split": "development",
+    "repeat": 1,
+    "passed": true,
+    "decision": {
+      "tool": "ask_llm",
+      "model": "glm",
+      "max_tokens": 32000,
+      "effort": "max",
+      "context_compression": false,
+      "allow_expensive": false
+    },
+    "model": "z-ai/glm-5.3",
+    "finish_reason": "stop",
+    "usage": {
+      "prompt_tokens": 1239,
+      "completion_tokens": 2228,
+      "reasoning_tokens": 2083,
+      "audio_tokens": 0,
+      "video_tokens": 0,
+      "cached_tokens": 1088,
+      "cost_usd": 0.007936
+    },
+    "latency_s": 42.92
+  },
+  {
+    "version": "baseline",
+    "case": "window",
+    "split": "development",
+    "repeat": 1,
+    "passed": false,
+    "decision": null,
+    "model": "z-ai/glm-5.3",
+    "finish_reason": "length",
+    "usage": {
+      "prompt_tokens": 874,
+      "completion_tokens": 16000,
+      "reasoning_tokens": 16000,
+      "audio_tokens": 0,
+      "video_tokens": 0,
+      "cached_tokens": 832,
+      "cost_usd": 0.070675
+    },
+    "latency_s": 61.92
+  },
+  {
+    "version": "candidate",
+    "case": "window",
+    "split": "development",
+    "repeat": 1,
+    "passed": true,
+    "decision": {
+      "tool": "llm_model_info",
+      "model": "kimi",
+      "max_tokens": 0,
+      "effort": "max",
+      "context_compression": false,
+      "allow_expensive": false
+    },
+    "model": "z-ai/glm-5.3",
+    "finish_reason": "stop",
+    "usage": {
+      "prompt_tokens": 1214,
+      "completion_tokens": 5433,
+      "reasoning_tokens": 5215,
+      "audio_tokens": 0,
+      "video_tokens": 0,
+      "cached_tokens": 1088,
+      "cost_usd": 0.024364
+    },
+    "latency_s": 19.1
+  },
+  {
+    "version": "baseline",
+    "case": "partial_panel",
+    "split": "held-out",
+    "repeat": 1,
+    "passed": false,
+    "decision": {
+      "tool": "ask_llm",
+      "model": "glm",
+      "max_tokens": 32000,
+      "effort": "high",
+      "context_compression": false,
+      "allow_expensive": false
+    },
+    "model": "z-ai/glm-5.3",
+    "finish_reason": "stop",
+    "usage": {
+      "prompt_tokens": 892,
+      "completion_tokens": 2595,
+      "reasoning_tokens": 2394,
+      "audio_tokens": 0,
+      "video_tokens": 0,
+      "cached_tokens": 832,
+      "cost_usd": 0.011718
+    },
+    "latency_s": 10.22
+  },
+  {
+    "version": "candidate",
+    "case": "partial_panel",
+    "split": "held-out",
+    "repeat": 1,
+    "passed": true,
+    "decision": {
+      "tool": "ask_llm",
+      "model": "glm",
+      "max_tokens": 32000,
+      "effort": "max",
+      "context_compression": false,
+      "allow_expensive": false
+    },
+    "model": "z-ai/glm-5.3",
+    "finish_reason": "stop",
+    "usage": {
+      "prompt_tokens": 1232,
+      "completion_tokens": 4255,
+      "reasoning_tokens": 4125,
+      "audio_tokens": 0,
+      "video_tokens": 0,
+      "cached_tokens": 1216,
+      "cost_usd": 0.019061
+    },
+    "latency_s": 17.12
+  },
+  {
+    "version": "baseline",
+    "case": "hostile_reference",
+    "split": "held-out",
+    "repeat": 1,
+    "passed": false,
+    "decision": {
+      "tool": "ask_llm",
+      "model": "kimi",
+      "max_tokens": 32000,
+      "effort": "high",
+      "context_compression": false,
+      "allow_expensive": false
+    },
+    "model": "z-ai/glm-5.3",
+    "finish_reason": "stop",
+    "usage": {
+      "prompt_tokens": 883,
+      "completion_tokens": 2644,
+      "reasoning_tokens": 2749,
+      "audio_tokens": 0,
+      "video_tokens": 0,
+      "cached_tokens": 0,
+      "cost_usd": 0.011503
+    },
+    "latency_s": 12.84
+  },
+  {
+    "version": "candidate",
+    "case": "hostile_reference",
+    "split": "held-out",
+    "repeat": 1,
+    "passed": true,
+    "decision": {
+      "tool": "ask_llm",
+      "model": "kimi",
+      "max_tokens": 32000,
+      "effort": "max",
+      "context_compression": false,
+      "allow_expensive": false
+    },
+    "model": "z-ai/glm-5.3",
+    "finish_reason": "stop",
+    "usage": {
+      "prompt_tokens": 1223,
+      "completion_tokens": 5550,
+      "reasoning_tokens": 5447,
+      "audio_tokens": 0,
+      "video_tokens": 0,
+      "cached_tokens": 8,
+      "cost_usd": 0.026123
+    },
+    "latency_s": 80.66
+  }
+]
