@@ -6,6 +6,7 @@
 set -uo pipefail
 
 PROJECT="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$PROJECT" || exit 1
 source "$PROJECT/bin/_python-env.sh"
 
 if ! orask_find_python "$PROJECT"; then
@@ -14,6 +15,9 @@ if ! orask_find_python "$PROJECT"; then
 fi
 
 FAILED=()
+SCRATCH="$(mktemp -d)" || { echo "check: cannot allocate scratch directory" >&2; exit 1; }
+[[ -n $SCRATCH && -d $SCRATCH ]] || exit 1
+trap 'rm -rf "$SCRATCH"' EXIT
 run() {
     local label="$1"; shift
     printf '\n== %s\n' "$label"
@@ -33,8 +37,6 @@ run "bash -n (shell syntax)" bash -c '
         bash -n "$f" || exit 1
     done' _ "$PROJECT"
 
-SCRATCH="$(mktemp -d)"
-trap 'rm -rf "$SCRATCH"' EXIT
 run "offline tests" env \
     ORASK_CONFIG_DIR="$SCRATCH/config" \
     ORASK_STATE_DIR="$SCRATCH/state" \
@@ -44,6 +46,7 @@ run "offline tests" env \
 run "offline MCP protocol" "$PYTHON" "$PROJECT/tests/test_mcp_offline.py"
 run "CLI subprocess tests" "$PYTHON" "$PROJECT/tests/test_cli.py"
 run "provider and config boundaries" "$PYTHON" "$PROJECT/tests/test_boundaries.py"
+run "offline installer/launchers" "$PYTHON" "$PROJECT/tests/test_install.py"
 
 printf '\n'
 if ((${#FAILED[@]})); then

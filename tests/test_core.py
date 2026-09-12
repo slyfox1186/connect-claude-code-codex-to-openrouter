@@ -24,7 +24,8 @@ sys.path.insert(0, str(ROOT / "src"))
 # core reads these into module-level constants at import time, so they have to be set first.
 # Without this a run reads the real API key and appends fabricated entries to the real call
 # log, which then feeds `orask log` and `orask usage`.
-SCRATCH = Path(tempfile.mkdtemp(prefix="orask-tests-"))
+SCRATCH_OWNER = tempfile.TemporaryDirectory(prefix="orask-tests-")
+SCRATCH = Path(SCRATCH_OWNER.name)
 os.environ["ORASK_CONFIG_DIR"] = str(SCRATCH / "config")
 os.environ["ORASK_STATE_DIR"] = str(SCRATCH / "state")
 os.environ["ORASK_CACHE_DIR"] = str(SCRATCH / "cache")
@@ -92,7 +93,7 @@ FAKE = [
 
 REAL_GET_CATALOG = core.get_catalog
 core._catalog_cache = FAKE
-core.get_catalog = lambda refresh=False, allow_stale=True: FAKE  # type: ignore[assignment]
+core.get_catalog = lambda refresh=False, allow_stale=True: FAKE
 core._config_cache = None
 
 
@@ -103,7 +104,7 @@ def _no_network(method, path, payload=None, timeout=60.0, retries=3):
     )
 
 
-core._request = _no_network  # type: ignore[assignment]
+core._request = _no_network
 cfg = core.load_config()
 
 # ---- alias + slug resolution ----------------------------------------------
@@ -588,7 +589,7 @@ check(
 # catalogue. mistral-large IS priced in FAKE, so the earlier version of this check sailed past
 # the guard, sent a real billed POST, and then asserted on a refusal that could never happen.
 _saved_catalog = core.get_catalog
-core.get_catalog = lambda refresh=False, allow_stale=True: []  # type: ignore[assignment]
+core.get_catalog = lambda refresh=False, allow_stale=True: []
 core._config_cache = dict(cfg, cost_guard_on_unknown_pricing="block")
 try:
     core.ask("q", model="unpriced/model-x")
@@ -1720,6 +1721,7 @@ with tempfile.TemporaryDirectory() as tmp:
           core._slurp(directory / "small", 20)[1] is not None)
 
 
+SCRATCH_OWNER.cleanup()
 print()
 if FAILS:
     print(f"{len(FAILS)} of {CHECKS} checks failed: {', '.join(FAILS)}")

@@ -315,7 +315,7 @@ if [[ $CHANGED == 1 ]]; then
 else
     say "Registrations were already current. The launchers are symlinks into"
     say "$PROJECT, so project code updates are live without re-registering;"
-    say "restart an agent only if its tool list changed."
+    say "restart running agents after updating server code or instructions."
 fi
 
 cat <<'DONE'
