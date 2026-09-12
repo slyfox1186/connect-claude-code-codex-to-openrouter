@@ -1663,7 +1663,7 @@ with tempfile.TemporaryDirectory() as tmp:
     _res = core.ask("q", model="kimi", files=[str(_scan)], pdf_engine="mistral-ocr", max_tokens=100)
     check(
         "and the ocr estimate says it is inferred from the file size",
-        any("upper bound" in n for n in _res["notes"]),
+        any("heuristic can under- or overestimate" in n for n in _res["notes"]),
         str(_res["notes"])[:90],
     )
     core._request = _no_network

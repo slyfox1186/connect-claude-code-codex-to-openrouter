@@ -2230,7 +2230,7 @@ def fit_context(
 
 
 def estimate_call_cost(slug: str, chars: int, max_tokens: int | None) -> tuple[float, bool]:
-    """Worst-case cost of a call: whole prompt in, max_tokens out.
+    """Estimated cost: approximate prompt tokens plus the full output allowance.
 
     Returns (usd, priced). `priced` is False when the model is not in the
     catalogue, so the caller can say the guard could not be evaluated instead
@@ -2720,7 +2720,7 @@ def ask(
             f"mistral-ocr bills per page on top of tokens. About {pages} page(s) estimated "
             f"from {_human_bytes(pdf_bytes)} of PDF, roughly {fmt_usd(ocr)}, which is included "
             "in the cost guard. That page count is inferred from the file size, not from "
-            "parsing the document, so treat it as an upper bound rather than an invoice."
+            "parsing the document; this heuristic can under- or overestimate the actual charge."
         )
     if guard and not allow_expensive:
         if not priced:
@@ -2748,7 +2748,7 @@ def ask(
             )
         elif estimate > guard:
             raise OpenRouterError(
-                f"refusing to send: worst-case cost for {slug} is about "
+                f"refusing to send: estimated cost for {slug} is about "
                 f"{fmt_usd(estimate)} ({billable} chars in, up to {limit} tokens out"
                 + (f", plus about {fmt_usd(ocr)} of mistral-ocr page charges" if ocr else "")
                 + f"), over the {fmt_usd(guard)} per-call guard. Trim the context, lower "
