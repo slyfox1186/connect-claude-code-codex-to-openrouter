@@ -16,11 +16,11 @@ import datetime as dt
 import json
 import math
 import os
-import re
 import select
 import stat
 import sys
 import time
+from pathlib import Path
 from typing import Any
 
 from . import __version__, core
@@ -490,6 +490,69 @@ def _cmd_log(args: argparse.Namespace) -> int:
     return 0
 
 
+def _registration_issues(server: Any, *, codex: bool = False) -> list[str]:
+    """Check the managed local server without launching commands from a config file."""
+    if not isinstance(server, dict):
+        return ["openrouter registration is missing or is not an object"]
+    issues = []
+    command = server.get("command")
+    launcher = core.PROJECT_ROOT / "bin" / "openrouter-mcp"
+    try:
+        current = (isinstance(command, str) and Path(command).is_absolute()
+                   and Path(command).resolve() == launcher.resolve()
+                   and launcher.is_file() and os.access(launcher, os.X_OK))
+    except (OSError, ValueError):
+        current = False
+    if not current:
+        issues.append("launch command does not point to this checkout's executable server")
+    if server.get("args", []) != []:
+        issues.append("launcher args must be empty")
+    if server.get("type", "stdio") != "stdio" or "url" in server:
+        issues.append("registration must use local stdio transport")
+    env = server.get("env", {})
+    if not isinstance(env, dict) or any(not isinstance(v, str) for v in env.values()):
+        issues.append("server env must be an object of strings")
+    elif "ORASK_PYTHON" in env:
+        interpreter = env["ORASK_PYTHON"]
+        try:
+            matches = (Path(interpreter).is_absolute()
+                       and Path(interpreter).resolve() == Path(sys.executable).resolve())
+        except (OSError, ValueError):
+            matches = False
+        if not matches:
+            issues.append("ORASK_PYTHON differs from the interpreter running this doctor")
+    if codex:
+        if server.get("enabled", True) is not True:
+            issues.append("server is disabled or enabled is not a boolean")
+        enabled = server.get("enabled_tools", list(core.MCP_TOOLS))
+        disabled = server.get("disabled_tools", [])
+        if (not isinstance(enabled, list) or not isinstance(disabled, list)
+                or any(not isinstance(t, str) for t in [*enabled, *disabled])):
+            issues.append("enabled_tools and disabled_tools must be arrays of strings")
+        else:
+            available = set(enabled) - set(disabled)
+            missing = [tool for tool in core.MCP_TOOLS if tool not in available]
+            if missing:
+                issues.append("tools unavailable: " + ", ".join(missing))
+    return issues
+
+
+def _codex_registration(path: Path) -> Any:
+    # Keep the CLI stdlib-only and Python 3.10-compatible. Without a real TOML parser,
+    # doctor cannot distinguish a table from text in a comment or multiline string.
+    try:
+        import tomllib
+    except ImportError as exc:
+        raise core.OpenRouterError(
+            "Codex TOML validation is unavailable on this Python; run doctor with "
+            "Python 3.11+ to validate it (other CLI commands still support Python 3.10)"
+        ) from exc
+    with path.open("rb") as handle:
+        data = tomllib.load(handle)
+    servers = data.get("mcp_servers", {})
+    return servers.get("openrouter") if isinstance(servers, dict) else None
+
+
 def _cmd_doctor(_args: argparse.Namespace) -> int:
     ok = True
 
@@ -540,39 +603,33 @@ def _cmd_doctor(_args: argparse.Namespace) -> int:
     except core.OpenRouterError as exc:
         check("account reachable", False, str(exc))
 
-    # registration in both harnesses
-    claude_json = os.path.expanduser("~/.claude.json")
-    if os.path.isfile(claude_json):
-        try:
-            with open(claude_json, encoding="utf-8") as handle:
-                servers = json.load(handle).get("mcpServers") or {}
-            check(
-                "registered as an MCP server in Claude Code",
-                "openrouter" in servers,
-                "run install.sh if missing",
-            )
-        except (OSError, json.JSONDecodeError) as exc:
-            check("Claude Code config readable", False, str(exc))
+    # These are the installer's user-scope registrations. Project overrides, trust
+    # policy and a running client's MCP handshake need checking in that client.
+    claude_dir = os.environ.get("CLAUDE_CONFIG_DIR")
+    claude_json = (Path(claude_dir).expanduser() / ".claude.json" if claude_dir
+                   else Path.home() / ".claude.json")
+    try:
+        with claude_json.open(encoding="utf-8") as handle:
+            data = json.load(handle)
+        servers = data.get("mcpServers", {}) if isinstance(data, dict) else None
+        server = servers.get("openrouter") if isinstance(servers, dict) else None
+        issues = _registration_issues(server)
+        check("Claude Code user-scope registration", not issues,
+              "; ".join(issues) + "; run install.sh, then restart Claude Code" if issues
+              else "configured for this checkout")
+    except (OSError, ValueError) as exc:
+        check("Claude Code user-scope registration", False, f"{claude_json}: {exc}")
 
-    codex_toml = os.path.expanduser("~/.codex/config.toml")
-    if os.path.isfile(codex_toml):
-        with open(codex_toml, encoding="utf-8") as handle:
-            body = handle.read()
-        registered = "[mcp_servers.openrouter]" in body
-        check("registered as an MCP server in Codex", registered, "run install.sh if missing")
-        if registered:
-            # Codex enforces enabled_tools, so a block written by an older install
-            # lists fewer tools than the server now has and those tools simply do
-            # not exist there. Nothing reports it, which is why doctor does.
-            block = body.split("[mcp_servers.openrouter]", 1)[1].split("\n[", 1)[0]
-            listed = set(re.findall(r'"([a-z_]+)"', block.split("enabled_tools", 1)[-1]))
-            missing = [t for t in core.MCP_TOOLS if t not in listed]
-            check(
-                "Codex registration lists every tool this server has",
-                not missing,
-                f"missing {', '.join(missing)} - run install.sh, then restart Codex"
-                if missing else f"{len(core.MCP_TOOLS)} tools",
-            )
+    codex_dir = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex").expanduser()
+    codex_toml = codex_dir / "config.toml"
+    try:
+        server = _codex_registration(codex_toml)
+        issues = _registration_issues(server, codex=True)
+        check("Codex user-scope registration", not issues,
+              "; ".join(issues) + "; run install.sh, then restart Codex" if issues
+              else f"configured for this checkout; {len(core.MCP_TOOLS)} tools enabled")
+    except (OSError, ValueError, core.OpenRouterError) as exc:
+        check("Codex user-scope registration", False, f"{codex_toml}: {exc}")
 
     print("\n" + ("all checks passed" if ok else "some checks failed - see above"))
     return 0 if ok else 1

@@ -56,6 +56,8 @@ def run_cli(argv: list[str], *, setup: str = "", data: str | None = None,
                    ORASK_CONFIG_DIR=str(base / "config"),
                    ORASK_STATE_DIR=str(base / "state"),
                    ORASK_CACHE_DIR=str(base / "cache"), OPENROUTER_API_KEY="")
+        env.pop("CODEX_HOME", None)
+        env.pop("CLAUDE_CONFIG_DIR", None)
         env.pop("ORASK_STDIN_WAIT", None)
         env.pop("ORASK_STDIN_DEADLINE", None)
         env.update(extra_env or {})
@@ -180,6 +182,94 @@ core.verify_categories = lambda: [{{'category': 'test', 'slug': 'test/model',
         expected = 0 if available and not excluded else 1
         check(f"category verification exit status reflects availability={available}, "
               f"excluded={excluded}, json={'--json' in args}", proc.returncode == expected)
+
+# ---- registration checks inspect parsed config, never similarly named text ----
+DOCTOR_SETUP = """
+core.get_api_key = lambda: 'test-key'
+core.get_catalog = lambda **kwargs: [{'id': 'test/model'}]
+core._config_cache = {'aliases': {}}
+core.account_usage = lambda: {}
+"""
+
+
+def doctor_fixture(claude, codex, *, extra_env=None, setup=""):
+    with tempfile.TemporaryDirectory() as scratch:
+        base = Path(scratch)
+        if claude is not None:
+            (base / ".claude.json").write_text(claude)
+        (base / ".codex").mkdir()
+        if codex is not None:
+            (base / ".codex/config.toml").write_text(codex)
+        return run_cli(["doctor"], data="", setup=DOCTOR_SETUP + setup,
+                       scratch=scratch, extra_env=extra_env)
+
+
+SERVER = {"command": str(ROOT / "bin/openrouter-mcp"), "args": [],
+          "env": {"ORASK_PYTHON": sys.executable}}
+CLAUDE_CONFIG = json.dumps({"mcpServers": {"openrouter": SERVER}})
+CODEX_CONFIG = ("[mcp_servers.openrouter]\n"
+                f"command = {json.dumps(SERVER['command'])}\nargs = []\n"
+                f"env = {{ ORASK_PYTHON = {json.dumps(sys.executable)} }}\n")
+proc = doctor_fixture(CLAUDE_CONFIG, CODEX_CONFIG)
+check("Codex omitted allowlist permits all bridge tools", proc.returncode == 0, proc.stdout[-100:])
+
+for name, body in (("quoted header", CODEX_CONFIG.replace("mcp_servers.openrouter",
+                                                       '\"mcp_servers\".\"openrouter\"')),
+                   ("commented header", CODEX_CONFIG.replace("]\n", "] # managed\n", 1)),
+                   ("multiline allowlist", CODEX_CONFIG + "enabled_tools = [\n"
+                    + "\n".join(f"{json.dumps(tool)}," for tool in
+                                ("ask_llm", "ask_panel", "list_llm_categories", "list_llm_models",
+                                 "llm_model_info", "openrouter_usage", "read_guide")) + "\n]\n")):
+    proc = doctor_fixture(CLAUDE_CONFIG, body)
+    check(f"doctor accepts semantic Codex {name}", proc.returncode == 0, proc.stdout[-100:])
+
+CODEX_WITH_TOOLS = CODEX_CONFIG + "enabled_tools = " + json.dumps([
+    "ask_llm", "ask_panel", "list_llm_categories", "list_llm_models", "llm_model_info",
+    "openrouter_usage", "read_guide",
+]) + "\n"
+for name, claude, codex in (
+    ("missing files", None, None),
+    ("missing Claude server", "{}", CODEX_WITH_TOOLS),
+    ("non-object Claude config", "[]", CODEX_WITH_TOOLS),
+    ("non-object Claude servers", '{"mcpServers": ["openrouter"]}', CODEX_WITH_TOOLS),
+    ("non-object Claude server", '{"mcpServers": {"openrouter": []}}', CODEX_WITH_TOOLS),
+    ("stale Claude command", CLAUDE_CONFIG.replace("bin/openrouter-mcp", "bin/old-server"),
+     CODEX_WITH_TOOLS),
+    ("stale Codex command", CLAUDE_CONFIG,
+     CODEX_WITH_TOOLS.replace("bin/openrouter-mcp", "bin/old-server")),
+    ("stale Codex interpreter", CLAUDE_CONFIG,
+     CODEX_WITH_TOOLS.replace(sys.executable, "/missing/python")),
+    ("nonempty launcher arguments", CLAUDE_CONFIG,
+     CODEX_WITH_TOOLS.replace("args = []", 'args = ["x"]')),
+    ("missing Codex server", CLAUDE_CONFIG, "[mcp_servers.other]\ncommand = 'other'\n"),
+    ("comment-only Codex server", CLAUDE_CONFIG, "# [mcp_servers.openrouter]\n"),
+    ("malformed Codex config", CLAUDE_CONFIG, "[mcp_servers.openrouter]\ncommand = [\n"),
+    ("disabled Codex server", CLAUDE_CONFIG, CODEX_WITH_TOOLS + "enabled = false\n"),
+    ("empty allowlist", CLAUDE_CONFIG, CODEX_CONFIG + "enabled_tools = []\n"),
+    ("disabled bridge tool", CLAUDE_CONFIG, CODEX_WITH_TOOLS + 'disabled_tools = ["ask_llm"]\n'),
+    ("invalid allowlist type", CLAUDE_CONFIG, CODEX_CONFIG + 'enabled_tools = "ask_llm"\n'),
+    ("fake table inside multiline text", CLAUDE_CONFIG, "text = '''" + CODEX_WITH_TOOLS + "'''\n"),
+):
+    proc = doctor_fixture(claude, codex)
+    check(f"doctor reports {name} as failed without a traceback",
+          proc.returncode == 1 and "[FAIL]" in proc.stdout and "Traceback" not in proc.stderr,
+          proc.stdout[-100:] or proc.stderr[:100])
+
+proc = doctor_fixture(CLAUDE_CONFIG, CODEX_CONFIG, setup="\nsys.modules['tomllib'] = None\n")
+check("doctor reports unavailable TOML parser without breaking Python 3.10 CLI",
+      proc.returncode == 1 and "TOML" in proc.stdout and "Traceback" not in proc.stderr)
+
+with tempfile.TemporaryDirectory() as scratch:
+    base = Path(scratch)
+    claude_dir = base / "claude-custom"
+    codex_dir = base / "codex-custom"
+    claude_dir.mkdir()
+    codex_dir.mkdir()
+    (claude_dir / ".claude.json").write_text(CLAUDE_CONFIG)
+    (codex_dir / "config.toml").write_text(CODEX_WITH_TOOLS)
+    proc = run_cli(["doctor"], data="", scratch=scratch, setup=DOCTOR_SETUP,
+                   extra_env={"CLAUDE_CONFIG_DIR": str(claude_dir), "CODEX_HOME": str(codex_dir)})
+check("doctor inspects relocated client config paths", proc.returncode == 0)
 
 print(f"\n{CHECKS - len(FAILURES)}/{CHECKS} CLI checks passed")
 raise SystemExit(bool(FAILURES))
