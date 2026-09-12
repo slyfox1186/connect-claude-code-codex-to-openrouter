@@ -218,6 +218,50 @@ class Boundaries(unittest.TestCase):
             with patch.object(core, '_guide_map', return_value={'fixture': path}):
                 self.assertTrue(core.list_guides()[0]['stale'])
 
+    def test_annotation_content_counts_for_replay_and_storage(self):
+        image = {'type': 'image_url', 'image_url': {
+            'url': 'data:image/png;base64,' + base64.b64encode(b'X' * 100).decode()}}
+        annotation = {'type': 'file', 'file': {'hash': 'fixture', 'content': [
+            {'type': 'text', 'text': 'parsed text' * 20}, image]}}
+        history = [{'role': 'assistant', 'content': 'answer', 'annotations': [annotation]}]
+        self.assertEqual(core.attachment_summary(history)['image'], 1)
+        self.assertGreater(core.text_chars(history), 100)
+        core._config_cache = {**core.load_config(), 'max_attachment_bytes': 10,
+                              'thread_attachment_bytes': 100}
+        with self.assertRaises(core.OpenRouterError):
+            core.build_messages('follow up', history=history)
+        with patch.object(core, 'THREAD_DIR', Path(SCRATCH.name) / 'annotation-thread'):
+            self.assertFalse(core.save_thread('budget', 'q', 'a', 'test/model',
+                                              annotations=[annotation]))
+
+    def test_long_displayed_name_resumes_original_thread(self):
+        name = '2026-09-12_Connection_Bridge_Complete_Repository_Review_and_Reconciliation'
+        with patch.object(core, 'THREAD_DIR', Path(SCRATCH.name) / 'long-name'):
+            self.assertTrue(core.save_thread(name, 'q', 'a', 'test/model'))
+            listed = core.list_threads()[0]['name']
+            self.assertEqual(core.load_thread(listed), core.load_thread(name))
+
+    def test_oversized_transcript_does_not_replace_readable_history(self):
+        with patch.object(core, 'THREAD_DIR', Path(SCRATCH.name) / 'size-thread'), \
+                patch.object(core, 'MAX_FILE_BYTES', 2000):
+            self.assertTrue(core.save_thread('size', 'q', 'a', 'test/model'))
+            before = core._thread_path('size').read_bytes()
+            self.assertFalse(core.save_thread('size', '🙂' * 1000, 'a', 'test/model'))
+            self.assertEqual(core._thread_path('size').read_bytes(), before)
+
+    def test_malformed_base64_cannot_understate_size(self):
+        blob = base64.b64encode(b'X' * 100).decode() + '=' * 1000
+        part = {'type': 'file', 'file': {'file_data': 'data:application/pdf;base64,' + blob}}
+        core._config_cache = {**core.load_config(), 'max_attachment_bytes': 10}
+        with self.assertRaises(core.OpenRouterError):
+            core.build_messages('review', history=[{'role': 'user', 'content': [part]}])
+
+    def test_partial_log_tail_does_not_consume_new_record(self):
+        with patch.object(core, 'CALL_LOG', Path(SCRATCH.name) / 'partial.jsonl'):
+            core.CALL_LOG.write_text('{"ts":')
+            core.log_call({'ok': True, 'cost_usd': 0.25})
+            self.assertEqual(len(core.read_log()), 1)
+
 
 if __name__ == '__main__':
     try:

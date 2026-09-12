@@ -168,8 +168,8 @@ are private under umask 000; failed locks never permit writes, corrupt transcrip
 shapes and symlinks are handled safely, temporary replacement cleanup preserves
 old data, and growth/ancestor-symlink reads are refused. Existing six-worker
 concurrent transcript test still passes. Full gate passes after this change.
-The thread-name concern was rejected: listed legacy-compatible names already
-resume the same stored conversation, confirmed by the regression.
+The initial short-name regression passed, but a later long-name reproduction
+confirmed that truncation broke listed-name replay; that finding is now fixed.
 
 Live protocol validation after budget changes passed every check: real max-effort
 single calls, complete and partial panels, discovery, malformed-argument recovery,
@@ -199,3 +199,12 @@ and five tests assuming stdlib tomllib. Explicit stdio_client transport fixes
 SDK compatibility; tests verify the explicit unavailable doctor result on3.10.
 Full gate passes on both3.10/MCP2.0 and3.13/MCP2.2. No dependency range changed;
 full semantic doctor validation on3.10 is deliberately unavailable, documented.
+
+Second persistence review reproduced five further failures, now passing: parsed
+PDF annotations participate in text/image and storage accounting; malformed
+base64 padding cannot evade byte limits; long displayed thread names resume;
+serialized transcripts cannot exceed the reader's 32 MiB limit; and an incomplete
+JSONL tail cannot consume the next billed record. OpenRouter's current PDF schema
+confirms annotations contain parsed content, contradicting the old code comment.
+Corrected that comment and report attachment retention only after a confirmed save.
+Full gate passes: 354 core assertions, 93 CLI checks, 25 boundary tests and offline MCP.

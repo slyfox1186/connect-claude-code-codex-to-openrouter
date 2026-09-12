@@ -638,7 +638,8 @@ def _fetch_catalog(
 
 
 def _write_json_atomic(
-    target: Path, payload: dict[str, Any], indent: int | None = None
+    target: Path, payload: dict[str, Any], indent: int | None = None,
+    max_bytes: int | None = None,
 ) -> bool:
     """Write via a per-process temp file so concurrent writers cannot collide.
 
@@ -652,18 +653,21 @@ def _write_json_atomic(
     """
     tmp: Path | None = None
     try:
+        encoded = json.dumps(payload, indent=indent, ensure_ascii=False).encode("utf-8")
+        if max_bytes is not None and len(encoded) > max_bytes:
+            return False
         target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         if target.is_symlink():
             return False
         fd, filename = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp", dir=target.parent)
         tmp = Path(filename)
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, indent=indent)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(encoded)
             handle.flush()
             os.fsync(handle.fileno())
         tmp.replace(target)
         return True
-    except OSError:
+    except (OSError, ValueError, TypeError):
         return False
     finally:
         if tmp is not None and tmp.exists():
@@ -1824,8 +1828,8 @@ def build_messages(
             messages.append(turn)
     if replayed:
         notes.append(
-            f"carried {replayed} earlier attachment(s) forward with their parse "
-            "annotations, so the document is still in view and is not parsed again"
+            f"carried {replayed} earlier attachment(s) and any saved parse annotations; "
+            "OpenRouter can reuse matching annotations instead of parsing again"
         )
     # Text first, then the attachments: providers parse a trailing image more
     # reliably than one that arrives before the instruction about it.
@@ -1850,7 +1854,8 @@ def text_chars(messages: list[dict[str, Any]]) -> int:
             for part in content:
                 if isinstance(part, dict) and part.get("type") == "text":
                     total += len(part.get("text") or "")
-    return total
+    return total + sum(len(part["text"]) for part in _annotation_parts(messages)
+                       if part.get("type") == "text" and isinstance(part.get("text"), str))
 
 
 def sent_attachments(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1890,9 +1895,35 @@ def _valid_content_part(part: Any) -> bool:
     return _attachment_blob(part) is not None
 
 
-def _all_attachments(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _annotation_parts(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """PDF annotations carry extracted text/images, not merely parsing receipts."""
+    parts: list[dict[str, Any]] = []
+    for message in messages:
+        annotations = message.get("annotations")
+        if not isinstance(annotations, list):
+            continue
+        for annotation in annotations:
+            file = annotation.get("file") if isinstance(annotation, dict) else None
+            content = file.get("content") if isinstance(file, dict) else None
+            if isinstance(content, list):
+                parts.extend(part for part in content if isinstance(part, dict))
+    return parts
+
+
+def _direct_attachments(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [part for message in messages if isinstance(message.get("content"), list)
             for part in message["content"] if isinstance(part, dict) and part.get("type") != "text"]
+
+
+def _all_attachments(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [*_direct_attachments(messages),
+            *(part for part in _annotation_parts(messages) if part.get("type") != "text")]
+
+
+def _thread_attachment_weight(messages: list[dict[str, Any]]) -> int:
+    values = [*_direct_attachments(messages),
+              *(m["annotations"] for m in messages if m.get("annotations"))]
+    return sum(len(json.dumps(value, ensure_ascii=False).encode("utf-8")) for value in values)
 
 
 def _validate_attachment_limits(messages: list[dict[str, Any]], slug: str | None) -> None:
@@ -1908,7 +1939,13 @@ def _validate_attachment_limits(messages: list[dict[str, Any]], slug: str | None
         if blob is None:
             raise OpenRouterError("thread contains an unsupported attachment; repair it first")
         padding = len(blob) - len(blob.rstrip("="))
-        sizes.append(max(0, len(blob) * 3 // 4 - padding))
+        if (len(blob) % 4 or padding > 2
+                or re.search(r"[^A-Za-z0-9+/]", blob[:-padding] if padding else blob)):
+            raise OpenRouterError("thread contains malformed base64 attachment data")
+        sizes.append(len(blob) * 3 // 4 - padding)
+    # OpenRouter strips PDF-extracted images for text-only models. Direct image/audio
+    # inputs still require model support; annotation bytes still count against limits.
+    for part in _direct_attachments(messages):
         kind = {"image_url": "image", "input_audio": "audio"}.get(part["type"])
         if kind and modalities and kind not in modalities:
             raise OpenRouterError(f"{slug} cannot accept the thread's {kind} attachment; "
@@ -1958,12 +1995,7 @@ def attachment_summary(messages: list[dict[str, Any]]) -> dict[str, Any]:
     All of it is re-sent on the wire and priced again, so the cost guard has to
     see the replayed parts as well as the new ones.
     """
-    parts: list[dict[str, Any]] = []
-    for message in messages:
-        content = message.get("content")
-        if isinstance(content, list):
-            parts.extend(p for p in content if isinstance(p, dict))
-    return summarize_parts(parts)
+    return summarize_parts(_all_attachments(messages))
 
 
 _DEFAULTS_ADVISOR = (
@@ -2167,6 +2199,12 @@ def _thread_path(name: str) -> Path:
     raw name keeps distinct threads in distinct files.
     """
     raw = name.strip()
+    # Older list_threads output exposed the complete on-disk stem. Accept that exact,
+    # bounded basename before truncation so long displayed names can resume their file.
+    if re.fullmatch(r"[A-Za-z0-9._-]{1,60}-[0-9a-f]{8}", raw):
+        displayed = THREAD_DIR / f"{raw}.json"
+        if displayed.is_file():
+            return displayed
     safe = re.sub(r"[^A-Za-z0-9._-]+", "-", raw)[:60].strip("-") or "thread"
     digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:8]
     path = THREAD_DIR / f"{safe}-{digest}.json"
@@ -2282,10 +2320,8 @@ def _save_thread_locked(
     if blob is None and (path.exists() or path.is_symlink()):
         return False  # preserve an unreadable/corrupt transcript for recovery
     history = usable_turns(blob["messages"]) if blob else []
-    # The attachments ride on the user turn, which is where they were sent, so
-    # a follow-up still has the document in front of it. Annotations alone do
-    # not carry content: they only tell OpenRouter it has already parsed this
-    # file, so it can skip the parse and its cost.
+    # Keep the original attachment on its user turn and the extracted PDF content on
+    # the assistant turn, matching OpenRouter's documented annotation replay format.
     if attachments:
         history.append(
             {
@@ -2302,13 +2338,14 @@ def _save_thread_locked(
     keep = _setting("thread_max_messages", 20)
     if keep > 0:
         history = history[-keep:]
-    weight = sum(len(json.dumps(part)) for part in _all_attachments(history))
+    weight = _thread_attachment_weight(history)
     if weight > _setting("thread_attachment_bytes", 4 * 1024 * 1024):
         return False
     return _write_json_atomic(
         path,
         {"name": name, "updated_at": time.time(), "messages": history},
         indent=1,
+        max_bytes=MAX_FILE_BYTES,
     )
 
 
@@ -2338,10 +2375,14 @@ def list_threads() -> list[dict[str, Any]]:
 def log_call(entry: dict[str, Any]) -> None:
     try:
         CALL_LOG.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        fd = _open_regular_fd(CALL_LOG, os.O_WRONLY | os.O_APPEND | os.O_CREAT)
-        with os.fdopen(fd, "a", encoding="utf-8") as handle:
+        fd = _open_regular_fd(CALL_LOG, os.O_RDWR | os.O_APPEND | os.O_CREAT)
+        with os.fdopen(fd, "a+b") as handle:
             _lock_exclusive(handle.fileno())
-            handle.write(json.dumps({"ts": time.time(), **entry}) + "\n")
+            if os.fstat(handle.fileno()).st_size:
+                handle.seek(-1, os.SEEK_END)
+                if handle.read(1) != b"\n":
+                    handle.write(b"\n")  # preserve a damaged tail without losing this record
+            handle.write((json.dumps({"ts": time.time(), **entry}) + "\n").encode("utf-8"))
     except (OSError, ValueError, TypeError):
         pass  # metadata logging must not destroy a billed answer
 
@@ -2705,13 +2746,10 @@ def ask(
         budget = _setting("thread_attachment_bytes", 4 * 1024 * 1024)
         keep = _setting("thread_max_messages", 20)
         retained = history[-max(0, keep - 2):] if keep > 2 else ([] if keep else history)
-        weight = sum(len(json.dumps(part)) for part in [*_all_attachments(retained), *parts])
+        weight = _thread_attachment_weight([
+            *retained, {"content": parts}, {"annotations": annotations}])
         if weight <= budget:
             carried = parts
-            notes.append(
-                f"kept {len(parts)} attachment(s) on thread '{thread}', so a follow-up "
-                "still sees them without you sending them again"
-            )
         else:
             notes.append(
                 f"the attachments are {_human_bytes(weight)}, over the "
@@ -2721,15 +2759,19 @@ def ask(
     elif fresh["total"] and annotations and not thread:
         notes.append(
             "OpenRouter parsed the attached file for this call. Pass a `thread` name "
-            "to keep following up on it without sending or parsing it again."
+            "to retain it and reuse parse annotations for follow-ups within storage limits."
         )
-    if thread and not incomplete and not save_thread(
-        thread, question, answer, slug, annotations, carried
-    ):
-        notes.append(
-            f"could not write the thread transcript to {THREAD_DIR}; this answer "
-            "will not be part of the next follow-up"
-        )
+    if thread and not incomplete:
+        if not save_thread(thread, question, answer, slug, annotations, carried):
+            notes.append(
+                f"could not write the thread transcript to {THREAD_DIR} (check permissions "
+                "and thread size limits); this answer will not be part of the next follow-up"
+            )
+        elif carried:
+            notes.append(
+                f"kept {len(carried)} attachment(s) on thread '{thread}'; follow-ups "
+                "resend the saved content without requiring files again"
+            )
 
     log_call(
         {
