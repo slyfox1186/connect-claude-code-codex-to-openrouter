@@ -434,6 +434,11 @@ def _request(
                 "and raise request_timeout_s if appropriate. No automatic retry was made."
             )
             raise last_error from exc
+        except OverflowError as exc:
+            raise OpenRouterError(
+                "request_timeout_s exceeds this platform's supported timeout; "
+                "choose a smaller finite value. No automatic retry was made."
+            ) from exc
         except (OSError, http.client.HTTPException) as exc:
             # A reset or incomplete read can happen after generation starts. It is not
             # evidence that repeating this POST is free, so return an actionable failure.
@@ -2453,6 +2458,14 @@ def ask(
     cfg = load_config()
     started = time.monotonic()
 
+    for key, value in (("max_tokens", max_tokens), ("max_context_tokens", max_context_tokens)):
+        if value is not None and (isinstance(value, bool) or not isinstance(value, int)):
+            raise OpenRouterError(f"{key} must be an integer; omit it to use the default")
+    if temperature is not None:
+        temperature_value = _nonnegative_number(temperature)
+        if temperature_value is None or temperature_value > 2:
+            raise OpenRouterError("temperature must be a finite number from 0 to 2")
+
     if _mcp_call:
         effort = (effort or "max").strip().lower()
         if effort not in {"max", "xhigh", "medium"}:
@@ -2638,6 +2651,8 @@ def ask(
                 f"{slug} cannot satisfy the MCP reasoning policy with its published efforts. "
                 "Choose a model advertising medium or stronger reasoning; low is never used."
             )
+        # Otherwise OpenRouter may route to providers that silently ignore reasoning.
+        payload["provider"] = {"require_parameters": True}
         if effort == "medium":
             notes.append(f"medium effort requested because: {(effort_reason or '').strip()}")
     if effort_note:
@@ -2978,7 +2993,7 @@ def model_info(spec: str) -> dict[str, Any]:
         "note": note,
         "name": model.get("name"),
         "description": (model.get("description") or "")[:1200],
-        "context_length": model.get("context_length"),
+        "context_length": context_window(slug),
         "max_output_tokens": top.get("max_completion_tokens"),
         "bridge_limits": {
             "default_max_tokens": _setting("default_max_tokens", 32000),

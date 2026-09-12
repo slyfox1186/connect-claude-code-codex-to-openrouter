@@ -262,6 +262,33 @@ class Boundaries(unittest.TestCase):
             core.log_call({'ok': True, 'cost_usd': 0.25})
             self.assertEqual(len(core.read_log()), 1)
 
+    def test_mcp_requires_provider_parameter_support(self):
+        response = {'choices': [{'message': {'content': 'final'}, 'finish_reason': 'stop'}]}
+        with patch.object(core, '_request', return_value=response) as request:
+            core.ask('review', model='test/model', _mcp_call=True)
+        self.assertEqual(request.call_args.args[2]['provider'], {'require_parameters': True})
+
+    def test_invalid_request_numbers_are_refused_before_transport(self):
+        cases = [('temperature', value) for value in [float('nan'), float('inf'), -1, 3, True]]
+        cases += [(key, value) for key in ['max_tokens', 'max_context_tokens']
+                  for value in [float('nan'), float('inf'), True, 3.5, 'oops']]
+        for key, value in cases:
+            with self.subTest(key=key, value=value), patch.object(core, '_request') as request:
+                with self.assertRaises(core.OpenRouterError):
+                    core.ask('review', model='test/model', **{key: value})
+                request.assert_not_called()
+
+    def test_model_info_exposes_effective_context_window(self):
+        model = {**CATALOG[0], 'top_provider': {'context_length': 50000}}
+        with patch.object(core, 'get_catalog', return_value=[model]):
+            self.assertEqual(core.model_info('test/model')['context_length'], 50000)
+
+    def test_unrepresentable_timeout_has_actionable_error(self):
+        with patch.object(core, 'get_api_key', return_value='fake'), \
+                patch.object(core.urllib.request, 'urlopen', side_effect=OverflowError), \
+                self.assertRaises(core.OpenRouterError):
+            core._request('POST', '/chat/completions', {}, timeout=1e100)
+
 
 if __name__ == '__main__':
     try:
