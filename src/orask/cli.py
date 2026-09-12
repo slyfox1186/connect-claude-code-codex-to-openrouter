@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import math
 import os
 import re
 import select
@@ -73,15 +74,26 @@ def _print_result(result: dict[str, Any], show_reasoning: bool) -> None:
 
 
 # How long to wait for data on a stdin we cannot trust to ever close.
-STDIN_WAIT_S = float(os.environ.get("ORASK_STDIN_WAIT", "0.5"))
+STDIN_WAIT_S = 0.5
 # Hard ceilings for every shape of stdin. Generous enough that a real `git diff | orask` goes
 # through untouched, small enough that a producer which never stops - `yes | orask ask ...` -
 # cannot hold the CLI open or grow the buffer without bound.
 STDIN_MAX_BYTES = 32 * 1024 * 1024
-STDIN_DEADLINE_S = float(os.environ.get("ORASK_STDIN_DEADLINE", "30"))
+STDIN_DEADLINE_S = 30.0
 
 
-def read_stdin_safely(wait: float = STDIN_WAIT_S) -> str:
+def _stdin_seconds(name: str, default: float) -> float:
+    """Validate only when stdin is read, so bad settings cannot break --help/import."""
+    try:
+        value = float(os.environ.get(name, default))
+        if math.isfinite(value) and value > 0:
+            return value
+    except (TypeError, ValueError, OverflowError):
+        pass
+    raise core.OpenRouterError(f"{name} must be a finite positive number of seconds")
+
+
+def read_stdin_safely(wait: float | None = None) -> str:
     """Read piped stdin without ever hanging.
 
     A plain `sys.stdin.read()` here is a trap: when orask is launched by a
@@ -91,7 +103,8 @@ def read_stdin_safely(wait: float = STDIN_WAIT_S) -> str:
     Every shape goes through select, so nothing can block indefinitely. A regular file or a
     real pipe is waited on until the deadline, because a slow producer is normal and a
     redirect has a genuine EOF. Anything else - a socket, a character device - is read only
-    while data keeps arriving. Both are bounded by the byte ceiling and the deadline.
+    while data keeps arriving. Both are bounded by the byte ceiling and the deadline;
+    reaching a hard limit refuses the call rather than billing for a partial prompt.
     """
     if sys.stdin is None or sys.stdin.isatty():
         return ""
@@ -101,29 +114,54 @@ def read_stdin_safely(wait: float = STDIN_WAIT_S) -> str:
     except (OSError, ValueError, AttributeError):
         return ""
 
+    wait = _stdin_seconds("ORASK_STDIN_WAIT", STDIN_WAIT_S) if wait is None else wait
+    if not math.isfinite(wait) or wait <= 0:
+        raise core.OpenRouterError("stdin wait must be a finite positive number of seconds")
+    duration = _stdin_seconds("ORASK_STDIN_DEADLINE", STDIN_DEADLINE_S)
     drainable = stat.S_ISREG(mode) or stat.S_ISFIFO(mode)
-    deadline = time.monotonic() + STDIN_DEADLINE_S
+    deadline = time.monotonic() + duration
     chunks: list[bytes] = []
     total = 0
-    while total < STDIN_MAX_BYTES:
+
+    def timed_out() -> None:
+        raise core.OpenRouterError(
+            f"stdin did not finish within {duration:g}s; no call was sent. "
+            "Finish the producer or save its output to a file before calling orask; "
+            "increase ORASK_STDIN_DEADLINE if a slower producer is intentional."
+        )
+
+    while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            break
+            timed_out()
         try:
-            ready, _, _ = select.select([fd], [], [], remaining if drainable else wait)
-        except (OSError, ValueError):
-            break
+            ready, _, _ = select.select([fd], [], [],
+                                        remaining if drainable else min(wait, remaining))
+        except (OSError, ValueError) as exc:
+            raise core.OpenRouterError(
+                f"cannot read stdin safely; no call was sent: {exc}"
+            ) from exc
         if not ready:
+            # An idle socket is normal for agent shells, including one carrying no input.
+            if drainable or (total and remaining <= wait):
+                timed_out()
             break
         try:
-            data = os.read(fd, 65536)
-        except OSError:
-            break
+            # Read one byte beyond the ceiling to distinguish exact-sized input from
+            # truncation, while never allocating an unbounded chunk.
+            data = os.read(fd, min(65536, STDIN_MAX_BYTES - total + 1))
+        except OSError as exc:
+            raise core.OpenRouterError(f"cannot read stdin; no call was sent: {exc}") from exc
         if not data:  # EOF
             break
-        chunks.append(data)
         total += len(data)
-    return b"".join(chunks)[:STDIN_MAX_BYTES].decode("utf-8", "replace")
+        if total > STDIN_MAX_BYTES:
+            raise core.OpenRouterError(
+                f"stdin exceeds the {STDIN_MAX_BYTES:,}-byte limit; no call was sent. "
+                "Narrow the input or pass selected files with --file."
+            )
+        chunks.append(data)
+    return b"".join(chunks).decode("utf-8", "replace")
 
 
 def _gather_context(args: argparse.Namespace) -> str | None:
@@ -255,13 +293,16 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _cmd_categories(args: argparse.Namespace) -> int:
     rows = core.list_categories()
+    status = 0
     if args.verify:
         checks = {(r["category"], r["slug"]): r for r in core.verify_categories()}
+        status = int(any(not r.get("available") or r.get("excluded_vendor")
+                         for r in checks.values()))
     if args.json:
         payload = rows if not args.verify else {"categories": rows,
                                                 "verified": list(checks.values())}
         print(json.dumps(payload, indent=2))
-        return 0
+        return status
 
     for row in rows:
         print(f"\n{row['category']}")
@@ -270,7 +311,8 @@ def _cmd_categories(args: argparse.Namespace) -> int:
             if args.verify:
                 check = checks.get((row["category"], slug)) or {}
                 iq = check.get("intelligence_index")
-                state = "ok" if check.get("available") else "NO LONGER LISTED"
+                state = ("EXCLUDED VENDOR" if check.get("excluded_vendor") else
+                         "ok" if check.get("available") else "NO LONGER LISTED")
                 line += f"    [{state}" + (f", index {iq:.1f}" if iq is not None else "") + "]"
             print(line)
         if row["aka"]:
@@ -282,7 +324,7 @@ def _cmd_categories(args: argparse.Namespace) -> int:
     if banned:
         print(f"\nCategory picks never return {' or '.join(banned)} models: this bridge is for")
         print("an opinion from outside the agent asking. Ask by full slug to override.")
-    return 0
+    return status
 
 
 def _cmd_ask(args: argparse.Namespace) -> int:
@@ -315,7 +357,8 @@ def _cmd_ask(args: argparse.Namespace) -> int:
 def _cmd_panel(args: argparse.Namespace) -> int:
     models = [m.strip() for m in (args.models or "").split(",") if m.strip()] or None
     started = time.monotonic()
-    if getattr(args, "category", None) and not getattr(args, "models", None):
+    if (getattr(args, "category", None) and not getattr(args, "models", None)
+            and not args.json):
         match = core.resolve_category(args.category)
         if match:
             name, spec = match
@@ -472,7 +515,7 @@ def _cmd_doctor(_args: argparse.Namespace) -> int:
         check(f"key file permissions ({core.ENV_FILE})", mode == "600", f"mode {mode}")
 
     try:
-        catalog = core.get_catalog(refresh=True)
+        catalog = core.get_catalog(refresh=True, allow_stale=False)
         check("OpenRouter catalogue reachable", True, f"{len(catalog)} models")
     except core.OpenRouterError as exc:
         check("OpenRouter catalogue reachable", False, str(exc))

@@ -1237,10 +1237,13 @@ _read_fd, _write_fd = os.pipe()
 os.write(_write_fd, b"y\n" * 2000)
 sys.stdin = _FakeStdin(_read_fd)
 _started = time.monotonic()
-_got = _cli.read_stdin_safely(wait=0.05)
-_elapsed = time.monotonic() - _started
-check("a pipe that never closes is drained and then let go",
-      len(_got) == 4000 and _elapsed < 5, f"{len(_got)} chars in {_elapsed:.1f}s")
+try:
+    _cli.read_stdin_safely(wait=0.05)
+    check("a pipe that never closes refuses an incomplete prompt", False)
+except core.OpenRouterError as exc:
+    _elapsed = time.monotonic() - _started
+    check("a pipe that never closes refuses an incomplete prompt",
+          "ORASK_STDIN_DEADLINE" in str(exc) and _elapsed < 5, str(exc)[:100])
 os.close(_read_fd)
 os.close(_write_fd)
 
@@ -1249,8 +1252,11 @@ _read_fd, _write_fd = os.pipe()
 os.write(_write_fd, b"z" * 4000)
 sys.stdin = _FakeStdin(_read_fd)
 _cli.STDIN_MAX_BYTES = 100
-_got = _cli.read_stdin_safely(wait=0.05)
-check("the stdin byte ceiling holds", len(_got) == 100, f"{len(_got)} chars")
+try:
+    _cli.read_stdin_safely(wait=0.05)
+    check("the stdin byte ceiling refuses truncation", False)
+except core.OpenRouterError as exc:
+    check("the stdin byte ceiling refuses truncation", "100-byte limit" in str(exc), str(exc)[:100])
 os.close(_read_fd)
 os.close(_write_fd)
 
