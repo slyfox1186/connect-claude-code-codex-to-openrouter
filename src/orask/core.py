@@ -14,6 +14,7 @@ import fcntl
 import fnmatch
 import hashlib
 import json
+import math
 import os
 import random
 import re
@@ -1125,9 +1126,24 @@ def expand_paths(entries: Iterable[str], base: Path, limit: int) -> tuple[list[P
     should not mean listing forty paths by hand. Build output, dependency trees
     and VCS metadata are pruned, because nobody means those.
     """
+    return _expand_paths(entries, base, limit, [])
+
+
+def _expand_paths(
+    entries: Iterable[str], base: Path, limit: int, patterns: list[str]
+) -> tuple[list[Path], list[str]]:
     out: list[Path] = []
     notes: list[str] = []
     seen: set[str] = set()
+
+    def refused(candidate: Path) -> bool:
+        matched = denied_by_policy(candidate, patterns)
+        if matched:
+            notes.append(
+                f"REFUSED to send {candidate} to a third-party API: "
+                f"it matches the deny pattern {matched!r}."
+            )
+        return matched is not None
 
     def take(candidate: Path) -> None:
         key = candidate.as_posix()
@@ -1141,6 +1157,9 @@ def expand_paths(entries: Iterable[str], base: Path, limit: int) -> tuple[list[P
         candidate = Path(str(entry).strip()).expanduser()
         if not candidate.is_absolute():
             candidate = base / candidate
+        # Check the requested name before resolution discards a denied symlink alias.
+        if refused(candidate):
+            continue
         # Resolve absolute paths too, not just relative ones: an unresolved
         # absolute path lets a symlink (or a "..") slip past the denylist.
         try:
@@ -1185,6 +1204,8 @@ def expand_paths(entries: Iterable[str], base: Path, limit: int) -> tuple[list[P
             )
         notes.append(f"expanded directory {candidate} to {len(found)} files")
         for item in found:
+            if refused(item):
+                continue
             try:
                 take(item.resolve())
             except (OSError, RuntimeError):
@@ -1388,7 +1409,7 @@ def _setting(key: str, default: int) -> int:
         return default
     try:
         return max(0, int(value))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return default
 
 
@@ -1415,7 +1436,7 @@ def override_allowed(key: str, requested: bool) -> tuple[bool, str | None]:
     """
     if not requested:
         return False, None
-    if load_config().get(key):
+    if load_config().get(key) is True:
         return True, None
     return False, (
         f"`{key.removeprefix('mcp_')}` was requested but is not honoured for tool calls. Set "
@@ -1437,8 +1458,9 @@ def _float_setting(key: str, default: float) -> float:
     if value is None:
         return default
     try:
-        return max(0.0, float(value))
-    except (TypeError, ValueError):
+        number = float(value)
+        return max(0.0, number) if math.isfinite(number) else default
+    except (TypeError, ValueError, OverflowError):
         return default
 
 
@@ -1471,12 +1493,17 @@ def _gather_files(
     # Union by default. Replace semantics on a safety list is a footgun: adding
     # one project pattern would silently drop every credential pattern.
     deny = cfg.get("deny_file_patterns") or []
-    if cfg.get("deny_file_patterns_replace"):
+    if cfg.get("deny_file_patterns_replace") is True:
         patterns = list(deny)
     else:
         patterns = sorted(set(DEFAULT_DENY_PATTERNS) | set(deny))
 
-    candidates, walk_notes = expand_paths(as_list(files), base, _setting("max_dir_files", 50))
+    if not allow_secret_files:
+        patterns.append(ENV_FILE.resolve().as_posix())
+    candidates, walk_notes = _expand_paths(
+        as_list(files), base, _setting("max_dir_files", 50),
+        [] if allow_secret_files else patterns,
+    )
     notes.extend(walk_notes)
 
     per_file = _setting("max_attachment_bytes", MAX_ATTACHMENT_BYTES)
@@ -1770,10 +1797,21 @@ def fmt_usd(value: float) -> str:
 
 
 def _price(model: dict[str, Any], field: str) -> float:
+    return _known_price(model, field) or 0.0
+
+
+def _known_price(model: dict[str, Any], field: str) -> float | None:
+    pricing = model.get("pricing")
+    if not isinstance(pricing, dict) or field not in pricing:
+        return None
+    value = pricing[field]
+    if isinstance(value, bool):
+        return None
     try:
-        return float((model.get("pricing") or {}).get(field) or 0.0)
-    except (TypeError, ValueError):
-        return 0.0
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if math.isfinite(number) and number >= 0 else None
 
 
 def context_window(slug: str) -> int:
@@ -1865,9 +1903,16 @@ def estimate_call_cost(slug: str, chars: int, max_tokens: int | None) -> tuple[f
     model = _find(slug)
     if not model:
         return 0.0, False
-    prompt = (chars / CHARS_PER_TOKEN) * _price(model, "prompt")
-    output = float(max_tokens or 0) * _price(model, "completion")
-    return prompt + output, True
+    prompt_price = _known_price(model, "prompt")
+    completion_price = _known_price(model, "completion")
+    if prompt_price is None or completion_price is None:
+        return 0.0, False
+    request_price = _known_price(model, "request")
+    if "request" in (model.get("pricing") or {}) and request_price is None:
+        return 0.0, False
+    prompt = (chars / CHARS_PER_TOKEN) * prompt_price
+    output = float(max_tokens or 0) * completion_price
+    return prompt + output + (request_price or 0.0), True
 
 
 def estimate_input_cost(slug: str, chars: int) -> float:
@@ -1879,7 +1924,8 @@ def actual_cost(slug: str, usage: dict[str, Any]) -> float:
     """Prefer OpenRouter's own cost; fall back to catalogue pricing."""
     for key in ("cost", "total_cost"):
         value = usage.get(key)
-        if isinstance(value, (int, float)) and value > 0:
+        if (isinstance(value, (int, float)) and not isinstance(value, bool)
+                and math.isfinite(value) and value >= 0):
             return float(value)
     model = _find(slug)
     if not model:

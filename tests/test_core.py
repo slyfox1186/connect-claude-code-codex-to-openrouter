@@ -1526,6 +1526,58 @@ check("a file with no front matter is indexed by its title",
 check("and it is flagged as undated rather than silently trusted", _plain["stale"])
 core._config_cache = cfg
 
+
+# ---- audit: safety switches and numeric bounds fail closed -----------------
+for _key in ("mcp_allow_secret_files", "mcp_allow_expensive"):
+    for _value in ("false", "true", 1, [True]):
+        core._config_cache = dict(cfg, **{_key: _value})
+        check(f"{_key} requires JSON true ({_value!r})",
+              core.override_allowed(_key, True)[0] is False)
+for _value in (float("nan"), float("inf"), float("-inf")):
+    core._config_cache = dict(cfg, max_cost_usd_per_call=_value, max_file_chars=_value)
+    check(f"non-finite cost setting uses safe default ({_value})",
+          core._float_setting("max_cost_usd_per_call", 1.0) == 1.0)
+    try:
+        check(f"non-finite integer setting uses safe default ({_value})",
+              core._setting("max_file_chars", 200000) == 200000)
+    except (ValueError, OverflowError):
+        check(f"non-finite integer setting uses safe default ({_value})", False)
+core._config_cache = cfg
+for _pricing in ({}, {"prompt": "0", "completion": "nan"},
+                 {"prompt": "0", "completion": "-1"}):
+    _entry = dict(FAKE[0], pricing=_pricing)
+    core.get_catalog = lambda refresh=False, allow_stale=True, entry=_entry: [entry]
+    check(f"incomplete or invalid pricing is unknown ({_pricing})",
+          core.estimate_call_cost(_entry["id"], 100, 100)[1] is False)
+core.get_catalog = lambda refresh=False, allow_stale=True: FAKE
+with tempfile.TemporaryDirectory() as tmp:
+    root = Path(tmp)
+    plain = root / "ordinary.txt"
+    plain.write_text("DENIED_ALIAS_CONTENT")
+    alias = root / ".env"
+    alias.symlink_to(plain)
+    messages, notes = core.build_messages("q", files=[str(alias)])
+    check("denied original symlink name stays denied after resolving",
+          "DENIED_ALIAS_CONTENT" not in str(messages) and any("REFUSED" in n for n in notes))
+    relocated = root / "custom-config" / "env"
+    relocated.parent.mkdir()
+    relocated.write_text("RELOCATED_KEY_CONTENT")
+    saved_env_file, core.ENV_FILE = core.ENV_FILE, relocated
+    messages, notes = core.build_messages("q", files=[str(relocated)])
+    check("relocated API key file is always denied",
+          "RELOCATED_KEY_CONTENT" not in str(messages) and any("REFUSED" in n for n in notes))
+    core.ENV_FILE = saved_env_file
+
+
+# ---- audit: complete prices and explicit zero usage ------------------------
+_entry = dict(FAKE[0], pricing={"prompt": "0", "completion": "0", "request": "2"})
+core.get_catalog = lambda refresh=False, allow_stale=True, entry=_entry: [entry]
+check("per-request price contributes to the cost guard",
+      core.estimate_call_cost(_entry["id"], 100, 100) == (2.0, True))
+core.get_catalog = lambda refresh=False, allow_stale=True: FAKE
+check("reported zero cost is authoritative",
+      core.actual_cost(FAKE[0]["id"], {"cost": 0, "prompt_tokens": 1000}) == 0)
+
 print()
 if FAILS:
     print(f"{len(FAILS)} of {CHECKS} checks failed: {', '.join(FAILS)}")

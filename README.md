@@ -342,7 +342,9 @@ answer in minutes) and `:free` tiers are never selected implicitly.
 
 **Cost control.** Worst-case cost, meaning the whole prompt in and `max_tokens`
 out, is computed before sending and refused above `max_cost_usd_per_call` ($1.00).
-When a model has no catalogue pricing the guard says it could not be evaluated
+Fixed per-request fees are included. Missing, invalid, or non-finite token prices
+are unknown prices, while explicit zero prices remain free. When a model has no
+catalogue pricing the guard says it could not be evaluated
 instead of treating unknown as free. Every call is logged with OpenRouter's own
 reported cost.
 
@@ -541,3 +543,11 @@ claude mcp remove openrouter -s user
 # then delete the [mcp_servers.openrouter] block from ~/.codex/config.toml
 rm ~/.local/bin/orask ~/.local/bin/openrouter-mcp
 ```
+
+## Audit safety corrections (2026-09-12)
+
+MCP safety overrides and denylist replacement require JSON `true`; strings such
+as `"false"` cannot grant permission. Non-finite numeric settings fall back to
+safe defaults. File policy checks both the requested name and resolved target,
+including the API key file when `ORASK_CONFIG_DIR` relocates it. Provider-reported
+zero cost is authoritative and is not replaced with an estimated charge.
