@@ -324,9 +324,9 @@ async def ask_panel(
         role=role, effort=effort, system=system, max_tokens=max_tokens, cwd=cwd,
         pdf_engine=pdf_engine, allow_expensive=allow_expensive,
     )
-    total = sum(
-        float((r.get("usage") or {}).get("cost_usd") or 0) for r in results if r.get("ok")
-    )
+    # Every result, not just the ones that answered: an empty completion is ok: False and is
+    # still billed, so filtering on ok reports a total lower than the invoice.
+    total = sum(float((r.get("usage") or {}).get("cost_usd") or 0) for r in results)
     body = "\n\n".join(_render(r) for r in results)
     agreed = [r["model"] for r in results if r.get("ok")]
     footer = (

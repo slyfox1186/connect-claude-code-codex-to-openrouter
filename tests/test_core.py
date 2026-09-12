@@ -935,6 +935,80 @@ check("a plain error still reports its status and message",
 
 
 
+# --------------------------------------------------------------------------
+# the cost guard, and config values that must never take a paid call down
+# --------------------------------------------------------------------------
+
+# With no cap from the config and none published by the model, the old code sent no
+# max_tokens and priced zero output, so any prompt passed the guard and the provider billed
+# to its own ceiling.
+core._config_cache = dict(cfg, default_max_tokens=None, max_cost_usd_per_call=0.10)
+try:
+    core.ask("q", model="moonshotai/kimi-k3:batch")
+    check("a missing output cap cannot price the answer at zero", False, "guard did not fire")
+except core.OpenRouterError as exc:
+    check("a missing output cap cannot price the answer at zero",
+          "over the" in str(exc), str(exc)[:80])
+except AssertionError:
+    check("a missing output cap cannot price the answer at zero", False,
+          "reached the network, so the guard was skipped")
+core._config_cache = cfg
+
+for _bad_key in ("max_file_chars", "max_input_chars", "default_max_tokens",
+                 "catalog_ttl_s", "request_timeout_s", "max_cost_usd_per_call"):
+    core._config_cache = dict(cfg, **{_bad_key: "not-a-number"})
+    try:
+        core.build_messages("q")
+        core.estimate_call_cost("moonshotai/kimi-k3", 100, 100)
+        check(f"a non-numeric {_bad_key} falls back instead of raising", True)
+    except Exception as exc:  # noqa: BLE001
+        check(f"a non-numeric {_bad_key} falls back instead of raising", False, repr(exc))
+core._config_cache = cfg
+
+# thread_max_messages is read AFTER the response has been billed, so a bad value there used
+# to destroy an answer the user had already paid for.
+with tempfile.TemporaryDirectory() as tmp:
+    core.THREAD_DIR = Path(tmp) / "threads"
+    core._config_cache = dict(cfg, thread_max_messages="lots")
+    try:
+        wrote = core.save_thread("paid", "q", "an answer already paid for", "m")
+        check("a bad thread_max_messages cannot lose a paid answer", wrote is True,
+              f"save_thread returned {wrote}")
+        check("and the answer is actually there",
+              any(m.get("content") == "an answer already paid for"
+                  for m in core.load_thread("paid")))
+    except Exception as exc:  # noqa: BLE001
+        check("a bad thread_max_messages cannot lose a paid answer", False, repr(exc))
+    core._config_cache = cfg
+
+# an error delivered in a 200 body is still an error, and gets the typed explanation
+core._request = lambda method, path, payload=None, timeout=60.0, retries=3: {
+    "error": {"code": 429, "message": "upstream rate limited",
+              "metadata": {"error_type": "rate_limited"}},
+}
+try:
+    core.ask("q", model="kimi")
+    check("an error inside a 200 body is raised, not read as an answer", False)
+except core.OpenRouterError as exc:
+    check("an error inside a 200 body is raised, not read as an answer",
+          "429" in str(exc) and "rate limited" in str(exc), str(exc)[:90])
+    check("and it carries the typed hint rather than a raw dump",
+          "rate_limited" in str(exc) or "rate limited by OpenRouter" in str(exc), str(exc)[:90])
+
+# spend is what was billed, not what answered: an empty completion logs ok: False with a cost
+core._request = lambda method, path, payload=None, timeout=60.0, retries=3: {
+    "data": {"label": "test-key", "usage": 1.0},
+}
+core.log_call({"model": "m", "ok": True, "cost_usd": 0.01})
+core.log_call({"model": "m", "ok": False, "empty": True, "cost_usd": 0.02})
+_usage = core.account_usage()
+check("bridge spend counts a billed non-answer",
+      abs(_usage["bridge_spend_usd"] - 0.03) < 1e-9, str(_usage["bridge_spend_usd"]))
+check("and reports how many calls were billed", _usage["bridge_calls_billed"] == 2,
+      str(_usage.get("bridge_calls_billed")))
+core._request = _no_network
+
+
 print()
 if FAILS:
     print(f"{len(FAILS)} of {CHECKS} checks failed: {', '.join(FAILS)}")

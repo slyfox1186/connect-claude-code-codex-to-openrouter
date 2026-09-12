@@ -297,9 +297,11 @@ def _cmd_panel(args: argparse.Namespace) -> int:
 
     total = 0.0
     for result in results:
+        # Counted whether or not it answered: a model that returns nothing is ok: False and
+        # was still billed for it.
+        total += float((result.get("usage") or {}).get("cost_usd") or 0)
         if result.get("ok"):
             _print_result(result, args.show_reasoning)
-            total += float((result.get("usage") or {}).get("cost_usd") or 0)
         else:
             print(f"── {result.get('requested')}  FAILED")
             print(f"   {result.get('error')}")

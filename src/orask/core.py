@@ -398,8 +398,7 @@ def get_catalog(refresh: bool = False, allow_stale: bool = True) -> list[dict[st
     degrading to a stale catalogue beats the whole tool going down.
     """
     global _catalog_cache, _catalog_fetched_at
-    cfg = load_config()
-    ttl = float(cfg.get("catalog_ttl_s") or 0)
+    ttl = _float_setting("catalog_ttl_s", 21600.0)
 
     # The MCP server is long-lived: without a TTL on the in-memory copy it would
     # serve the catalogue it started with for as long as the process lives, and
@@ -1254,6 +1253,22 @@ def _setting(key: str, default: int) -> int:
         return default
 
 
+def _float_setting(key: str, default: float) -> float:
+    """A float config value that cannot take a call down.
+
+    Same contract as _setting: a deliberate 0 means 0, and a value that is not a number falls
+    back to the default rather than raising. These are read on the paid path, and one of them
+    is the cost guard itself, so a typo in a config file must not become a traceback.
+    """
+    value = load_config().get(key)
+    if value is None:
+        return default
+    try:
+        return max(0.0, float(value))
+    except (TypeError, ValueError):
+        return default
+
+
 def _model_modalities(slug: str | None) -> set[str]:
     """What the model accepts as input. Empty means unknown, never "nothing"."""
     if not slug:
@@ -1279,8 +1294,7 @@ def _gather_files(
     cfg = load_config()
     notes: list[str] = []
 
-    limit_setting = cfg.get("max_file_chars")
-    file_limit = int(limit_setting) if limit_setting is not None else 200000
+    file_limit = _setting("max_file_chars", 200000)
     # Union by default. Replace semantics on a safety list is a footgun: adding
     # one project pattern would silently drop every credential pattern.
     deny = cfg.get("deny_file_patterns") or []
@@ -1446,7 +1460,7 @@ def build_messages(
     # Attachments are deliberately outside this cap: they are governed by the
     # byte ceilings instead, because base64 inflates a perfectly ordinary
     # screenshot past any sensible character limit.
-    cap = int(cfg.get("max_input_chars") or 600000)
+    cap = _setting("max_input_chars", 600000)
     if len(user_content) > cap:
         raise OpenRouterError(
             f"assembled prompt is {len(user_content)} chars, over the "
@@ -1685,6 +1699,8 @@ def save_thread(
         return _save_thread_locked(
             path, name, question, answer, slug, annotations, attachments
         )
+    except Exception:  # noqa: BLE001 - this runs after the call has been billed, so no
+        return False   # transcript problem may be allowed to destroy the answer
     finally:
         if lock_handle is not None:
             try:
@@ -1720,8 +1736,7 @@ def _save_thread_locked(
     if annotations:
         turn["annotations"] = annotations
     history.append(turn)
-    setting = load_config().get("thread_max_messages")
-    keep = int(setting) if setting is not None else 20
+    keep = _setting("thread_max_messages", 20)
     if keep > 0:
         history = history[-keep:]
     return _write_json_atomic(
@@ -1869,16 +1884,23 @@ def ask(
         raise OpenRouterError(
             "max_tokens must be 1 or more; omit it to use the configured default"
         )
-    limit = max_tokens if max_tokens is not None else cfg.get("default_max_tokens")
-    ceiling = ((_find(slug).get("top_provider") or {}).get("max_completion_tokens")) or 0
-    if limit and ceiling and int(limit) > int(ceiling):
-        limit = int(ceiling)
+    limit = int(max_tokens) if max_tokens is not None else _setting("default_max_tokens", 32000)
+    ceiling = int(((_find(slug).get("top_provider") or {}).get("max_completion_tokens")) or 0)
+    if limit and ceiling and limit > ceiling:
+        limit = ceiling
+    if not limit:
+        # Neither the config nor the catalogue gave a cap. Sending no max_tokens would price
+        # zero output against the guard while the provider generates to its own ceiling, so
+        # the packaged default stands in and is actually sent.
+        limit = ceiling or int(_DEFAULTS["default_max_tokens"])
+        notes.append(
+            f"no output cap was configured and {slug} publishes none, so {limit} was used: "
+            "without it the cost guard would price the answer at zero. Set default_max_tokens "
+            "or pass max_tokens to choose your own."
+        )
 
-    guard = float(cfg.get("max_cost_usd_per_call") or 0)
-    # With no cap of our own the provider's ceiling is what could actually be
-    # billed, so the guard is judged against that rather than against zero.
-    worst_output = int(limit) if limit else int(ceiling or 0)
-    estimate, priced = estimate_call_cost(slug, billable, worst_output)
+    guard = _float_setting("max_cost_usd_per_call", 1.0)
+    estimate, priced = estimate_call_cost(slug, billable, limit)
     if guard and not allow_expensive:
         if not priced:
             policy = str(cfg.get("cost_guard_on_unknown_pricing") or "warn").lower()
@@ -1944,9 +1966,17 @@ def ask(
                 )
             )
 
-    timeout = float(cfg.get("request_timeout_s") or 300)
+    timeout = _float_setting("request_timeout_s", 300.0) or 300.0
     try:
         response = _request("POST", "/chat/completions", payload, timeout=timeout)
+        # OpenRouter can answer 200 and put the failure in the body. Route it through the same
+        # translator as an HTTP error: otherwise the caller gets "returned no choices" plus a
+        # raw dump, and none of the typed-error guidance that exists for exactly this.
+        embedded = response.get("error")
+        if isinstance(embedded, dict):
+            raise OpenRouterError(
+                _http_message(int(embedded.get("code") or 200), json.dumps(response))
+            )
     except OpenRouterError as exc:
         log_call(
             {
@@ -2232,12 +2262,19 @@ def model_info(spec: str) -> dict[str, Any]:
 def account_usage() -> dict[str, Any]:
     data = _request("GET", "/key", timeout=30.0, retries=2).get("data") or {}
     entries = read_log(limit=100000)
-    spend = sum(float(e.get("cost_usd") or 0) for e in entries if e.get("ok"))
+
+    def _num(entry: dict[str, Any], key: str) -> float:
+        try:
+            return float(entry.get(key) or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    # Summed over every entry, not only the ones that answered: an empty completion logs
+    # ok: False and is still billed, so filtering on ok under-reports real spend.
+    spend = sum(_num(e, "cost_usd") for e in entries)
     day_cutoff = time.time() - 86400
     spend_day = sum(
-        float(e.get("cost_usd") or 0)
-        for e in entries
-        if e.get("ok") and float(e.get("ts") or 0) >= day_cutoff
+        _num(e, "cost_usd") for e in entries if _num(e, "ts") >= day_cutoff
     )
     return {
         "key_label": data.get("label"),
@@ -2246,6 +2283,7 @@ def account_usage() -> dict[str, Any]:
         "credit_remaining_usd": data.get("limit_remaining"),
         "free_tier": data.get("is_free_tier"),
         "bridge_calls_logged": len([e for e in entries if e.get("ok")]),
+        "bridge_calls_billed": len([e for e in entries if _num(e, "cost_usd") > 0]),
         "bridge_spend_usd": round(spend, 4),
         "bridge_spend_last_24h_usd": round(spend_day, 4),
         "log_file": str(CALL_LOG),
