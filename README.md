@@ -581,3 +581,21 @@ are bounded to ten seconds. Malformed transcripts are readable as empty history
 but are not overwritten until repaired. State reads refuse symlinks, and log
 writes also refuse hardlinks. Regular file reads check the descriptor and enforce
 the byte ceiling even if a file grows while it is being read.
+
+Configuration collection fields are validated before use: aliases/roles are
+objects of strings and model/deny lists are arrays of strings. Malformed values
+are refused with the file and field named. Invalid, negative, boolean or non-finite
+numeric settings use the documented default; numeric zero retains its explicit
+meaning. Provider metadata is validated separately so invalid optional accounting
+cannot discard a paid answer. Missing or malformed choices now return an
+incomplete result with any reported usage instead of raising with a raw response
+dump. Filtered/error finishes also do not count as successful answers. Error
+bodies are bounded and closed; success bodies are limited to 64 MiB.
+
+`categories --verify` and `doctor` require a fresh catalogue for their reachability
+checks. A cached copy no longer counts as proof that OpenRouter is reachable.
+Category verification exits nonzero for missing or excluded pins.
+
+CLI input that exceeds its byte limit or fails to reach EOF by the deadline now
+refuses the consultation before billing, instead of silently sending a partial
+prompt. Idle sockets still finish normally after their bounded idle wait.

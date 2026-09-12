@@ -54,7 +54,7 @@ trees and fake external commands. Offline tests must never reach OpenRouter.
   cleanup and symlink handling. Keep paid answers even if persistence fails;
   never continue read-modify-write without its lock. Do not silently migrate or
   delete existing transcripts.
-- [ ] HTTP/provider boundaries (`core.py`, offline tests): exercise real urllib
+- [x] HTTP/provider boundaries (`core.py`, offline tests): exercise real urllib
   handling with fake responses, including HTTPError cleanup, connection resets,
   malformed error/choice/usage structures and explicit zero cost. Preserve
   useful answers when optional metadata is malformed. Keep POST retry policy.
@@ -174,3 +174,12 @@ resume the same stored conversation, confirmed by the regression.
 Live protocol validation after budget changes passed every check: real max-effort
 single calls, complete and partial panels, discovery, malformed-argument recovery,
 and a PDF codeword returned from the attachment. No low-effort calls were used.
+
+Boundary verification: 23 failed assertions and 10 errors reproduced with malformed
+config/catalogue/response fixtures. All now pass, including bounded and closed
+HTTP bodies, single-attempt reset failure, retained valid answers and billed
+errors, and truthful live catalogue verification. New tests/test_boundaries.py
+is in the full gate, alongside the CLI subprocess suite. No dependency or model
+version changed. Public correction: malformed/absent choices return incomplete
+with usage rather than a raw-payload exception. Collection config type errors
+are refused early; negative/boolean numeric limits no longer disable guards.

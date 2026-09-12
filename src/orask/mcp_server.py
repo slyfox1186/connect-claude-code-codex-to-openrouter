@@ -293,7 +293,11 @@ def _note(text: str, *notes: str | None) -> str:
 
 # The policy itself lives in core.override_allowed, so the offline suite can test it without
 # needing the mcp SDK. This layer only decides which keys the tool arguments map onto.
-_gate = core.override_allowed
+def _gate(key: str, requested: bool) -> tuple[bool, str | None]:
+    try:
+        return core.override_allowed(key, requested)
+    except core.OpenRouterError as exc:
+        raise ToolError(str(exc)) from exc
 
 
 async def _run(func, /, **kwargs):

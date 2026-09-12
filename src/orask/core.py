@@ -13,6 +13,7 @@ import contextlib
 import fcntl
 import fnmatch
 import hashlib
+import http.client
 import json
 import math
 import os
@@ -110,6 +111,7 @@ BINARY_HINT = re.compile(rb"[\x00-\x08\x0e-\x1f]")
 # Read ceiling applied before the file is opened, so a huge file is never
 # pulled into memory just to be truncated afterwards.
 MAX_FILE_BYTES = 32 * 1024 * 1024
+MAX_RESPONSE_BYTES = 64 * 1024 * 1024
 
 # Attachments ride along as base64, which inflates them by a third and is not
 # subject to the text character cap, so they carry their own byte ceilings.
@@ -243,6 +245,41 @@ _DEFAULTS: Config = {
 _config_cache: Config | None = None
 
 
+def _validate_config(cfg: Config, path: Path) -> None:
+    def reject(field: str, expected: str) -> None:
+        raise OpenRouterError(f"config file {path}: {field} must be {expected}")
+
+    for key in ("aliases", "roles"):
+        if key in cfg and (not isinstance(cfg[key], dict) or any(
+            not isinstance(v, str) or not v.strip() for v in cfg[key].values()
+        )):
+            reject(key, "an object of non-empty strings")
+    for key in ("allowed_models", "default_panel", "deny_file_patterns",
+                "category_exclude_vendors"):
+        if key in cfg and (not isinstance(cfg[key], list) or any(
+            not isinstance(v, str) or not v.strip() for v in cfg[key]
+        )):
+            reject(key, "a list of non-empty strings")
+    for key in ("default_model", "default_role", "default_effort", "pdf_engine"):
+        if key in cfg and cfg[key] is not None and not isinstance(cfg[key], str):
+            reject(key, "a string or null")
+    if cfg.get("cost_guard_on_unknown_pricing", "warn") not in ("warn", "block"):
+        reject("cost_guard_on_unknown_pricing", "'warn' or 'block'")
+    if "categories" in cfg:
+        if not isinstance(cfg["categories"], dict):
+            reject("categories", "an object")
+        for name, spec in cfg["categories"].items():
+            if not isinstance(spec, dict):
+                reject(f"categories.{name}", "an object")
+            for field in ("models", "aka"):
+                value = spec.get(field, [])
+                if not isinstance(value, list) or any(not isinstance(v, str) for v in value):
+                    reject(f"categories.{name}.{field}", "a list of strings")
+            for field in ("why", "measured"):
+                if field in spec and not isinstance(spec[field], str):
+                    reject(f"categories.{name}.{field}", "a string")
+
+
 def load_config(refresh: bool = False) -> Config:
     """Packaged defaults, overlaid by ~/.config/openrouter/config.json."""
     global _config_cache
@@ -255,12 +292,13 @@ def load_config(refresh: bool = False) -> Config:
             continue
         try:
             loaded = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
+        except (OSError, ValueError, UnicodeError) as exc:
             raise OpenRouterError(f"config file {path} is not valid JSON: {exc}") from exc
         if not isinstance(loaded, dict):
             raise OpenRouterError(
                 f"config file {path} must contain a JSON object, got {type(loaded).__name__}"
             )
+        _validate_config(loaded, path)
         for key, value in loaded.items():
             if key.startswith("_"):
                 continue
@@ -342,13 +380,16 @@ def _request(
         req = urllib.request.Request(url, data=body, headers=headers, method=method)
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
-                raw = resp.read().decode("utf-8", "replace")
+                received = resp.read(MAX_RESPONSE_BYTES + 1)
+            if len(received) > MAX_RESPONSE_BYTES:
+                raise OpenRouterError("OpenRouter response exceeded the 64 MiB read limit")
+            raw = received.decode("utf-8", "replace")
             try:
                 parsed = json.loads(raw)
             except json.JSONDecodeError as exc:
                 raise OpenRouterError(
-                    f"OpenRouter returned a non-JSON response to {method} {path}: "
-                    f"{raw.strip()[:400] or '(empty body)'}"
+                    f"OpenRouter returned a non-JSON response to {method} {path}; "
+                    "the response body was omitted because it may contain private request data"
                 ) from exc
             if not isinstance(parsed, dict):
                 raise OpenRouterError(
@@ -359,8 +400,11 @@ def _request(
             detail = ""
             # Any failure to read the body is fine: the status line alone is enough to
             # build a useful message, and the body is often already gone.
-            with contextlib.suppress(Exception):
-                detail = exc.read().decode("utf-8", "replace")[:2000]
+            try:
+                with contextlib.suppress(Exception):
+                    detail = exc.read(2000).decode("utf-8", "replace")
+            finally:
+                exc.close()
             message = _http_message(exc.code, detail)
             if exc.code in retryable and attempt < retries:
                 last_error = OpenRouterError(message)
@@ -385,10 +429,17 @@ def _request(
             # and a repeat would be billed a second time.
             last_error = OpenRouterError(
                 f"OpenRouter request timed out after {timeout:.0f}s. "
-                "Reasoning models on a large context can be slow; retry with a "
-                "lower effort, or raise request_timeout_s in the config."
+                "Reasoning models on a large context can be slow; inspect the task size "
+                "and raise request_timeout_s if appropriate. No automatic retry was made."
             )
             raise last_error from exc
+        except (OSError, http.client.HTTPException) as exc:
+            # A reset or incomplete read can happen after generation starts. It is not
+            # evidence that repeating this POST is free, so return an actionable failure.
+            raise OpenRouterError(
+                f"OpenRouter connection failed during {method} {path} ({type(exc).__name__}); "
+                "no automatic retry was made because the request may already be billed"
+            ) from exc
 
     raise last_error or OpenRouterError("OpenRouter request failed")
 
@@ -416,13 +467,18 @@ def _http_message(code: int, detail: str) -> str:
         404: "no such model slug - run 'orask models --search <name>' for exact slugs",
         429: "rate limited by OpenRouter or the upstream provider",
     }.get(code)
-    parsed = detail
+    parsed = ""
     try:
         obj = json.loads(detail)
-        error = obj.get("error") or {}
-        parsed = error.get("message") or detail
-        typed = (error.get("metadata") or {}).get("error_type")
-        if typed:
+        error = obj.get("error") if isinstance(obj, dict) else None
+        if isinstance(error, dict):
+            message = error.get("message")
+            parsed = message if isinstance(message, str) else ""
+            metadata = error.get("metadata")
+            typed = metadata.get("error_type") if isinstance(metadata, dict) else None
+        else:
+            typed = None
+        if isinstance(typed, str) and typed:
             hint = ERROR_TYPE_HINTS.get(typed, f"error_type: {typed}")
     except (json.JSONDecodeError, AttributeError):
         pass
@@ -451,11 +507,42 @@ CATALOG_FAILURE_COOLDOWN_S = 60.0
 
 
 def _valid_catalog(data: Any) -> bool:
-    return (
-        isinstance(data, list)
-        and bool(data)
-        and all(isinstance(entry, dict) and entry.get("id") for entry in data)
-    )
+    """Validate the fields this client consumes, leaving unrelated provider fields alone."""
+    if not isinstance(data, list) or not data:
+        return False
+    for entry in data:
+        if not isinstance(entry, dict) or not isinstance(entry.get("id"), str) or not entry["id"]:
+            return False
+        for key in ("name", "description"):
+            if entry.get(key) is not None and not isinstance(entry[key], str):
+                return False
+        for key in ("pricing", "top_provider", "reasoning", "architecture", "benchmarks"):
+            if entry.get(key) is not None and not isinstance(entry[key], dict):
+                return False
+        top = entry.get("top_provider") or {}
+        for value in (entry.get("created"), entry.get("context_length"),
+                      top.get("context_length"), top.get("max_completion_tokens")):
+            if value is not None and (not isinstance(value, (int, float))
+                                      or _nonnegative_number(value) is None):
+                return False
+        reasoning = entry.get("reasoning") or {}
+        architecture = entry.get("architecture") or {}
+        for value in (reasoning.get("supported_efforts"), entry.get("supported_parameters"),
+                      architecture.get("input_modalities")):
+            if value is not None and (not isinstance(value, list)
+                                      or any(not isinstance(v, str) for v in value)):
+                return False
+        bench = (entry.get("benchmarks") or {}).get("artificial_analysis")
+        if bench is not None:
+            if not isinstance(bench, dict):
+                return False
+            for key in ("intelligence_index", "coding_index", "agentic_index"):
+                if bench.get(key) is not None and (
+                    not isinstance(bench[key], (int, float))
+                    or _nonnegative_number(bench[key]) is None
+                ):
+                    return False
+    return True
 
 
 def get_catalog(refresh: bool = False, allow_stale: bool = True) -> list[dict[str, Any]]:
@@ -838,7 +925,7 @@ def verify_categories() -> list[dict[str, Any]]:
     which pins are still real, which have been retired, and what each one
     currently scores.
     """
-    catalog = _catalog_or_empty()
+    catalog = get_catalog(refresh=True, allow_stale=False)
     by_id = {m.get("id"): m for m in catalog}
     banned = excluded_vendors()
     rows = []
@@ -853,7 +940,7 @@ def verify_categories() -> list[dict[str, Any]]:
             rows.append({
                 "category": row["category"],
                 "slug": slug,
-                "available": bool(model) or not by_id,
+                "available": bool(model),
                 "excluded_vendor": bool(banned and _vendor(slug) in banned),
                 "intelligence_index": index,
                 "context": (model or {}).get("context_length"),
@@ -1443,10 +1530,11 @@ def _setting(key: str, default: int) -> int:
     exactly how someone turns one of these ceilings off.
     """
     value = load_config().get(key)
-    if value is None:
+    if value is None or isinstance(value, bool):
         return default
     try:
-        return max(0, int(value))
+        number = int(value)
+        return number if number >= 0 else default
     except (TypeError, ValueError, OverflowError):
         return default
 
@@ -1493,11 +1581,11 @@ def _float_setting(key: str, default: float) -> float:
     is the cost guard itself, so a typo in a config file must not become a traceback.
     """
     value = load_config().get(key)
-    if value is None:
+    if value is None or isinstance(value, bool):
         return default
     try:
         number = float(value)
-        return max(0.0, number) if math.isfinite(number) else default
+        return number if math.isfinite(number) and number >= 0 else default
     except (TypeError, ValueError, OverflowError):
         return default
 
@@ -1838,11 +1926,7 @@ def _price(model: dict[str, Any], field: str) -> float:
     return _known_price(model, field) or 0.0
 
 
-def _known_price(model: dict[str, Any], field: str) -> float | None:
-    pricing = model.get("pricing")
-    if not isinstance(pricing, dict) or field not in pricing:
-        return None
-    value = pricing[field]
+def _nonnegative_number(value: Any) -> float | None:
     if isinstance(value, bool):
         return None
     try:
@@ -1850,6 +1934,11 @@ def _known_price(model: dict[str, Any], field: str) -> float | None:
     except (TypeError, ValueError, OverflowError):
         return None
     return number if math.isfinite(number) and number >= 0 else None
+
+
+def _known_price(model: dict[str, Any], field: str) -> float | None:
+    pricing = model.get("pricing")
+    return _nonnegative_number(pricing.get(field)) if isinstance(pricing, dict) else None
 
 
 def context_window(slug: str) -> int:
@@ -1958,6 +2047,35 @@ def estimate_input_cost(slug: str, chars: int) -> float:
     return estimate_call_cost(slug, chars, 0)[0]
 
 
+def _clean_usage(raw: Any, notes: list[str]) -> dict[str, Any]:
+    """Optional provider accounting cannot invalidate a useful paid answer."""
+    out: dict[str, Any] = {}
+    invalid = not isinstance(raw, dict) or not raw
+    for key, value in (raw.items() if isinstance(raw, dict) else []):
+        if key in ("prompt_tokens", "completion_tokens", "cost", "total_cost"):
+            number = _nonnegative_number(value)
+            if number is None:
+                invalid = True
+            else:
+                out[key] = int(number) if key.endswith("_tokens") else number
+        elif key in ("prompt_tokens_details", "completion_tokens_details"):
+            if not isinstance(value, dict):
+                invalid = True
+                continue
+            out[key] = {}
+            for field in ("reasoning_tokens", "audio_tokens", "video_tokens", "cached_tokens"):
+                if field in value:
+                    number = _nonnegative_number(value[field])
+                    if number is None:
+                        invalid = True
+                    else:
+                        out[key][field] = int(number)
+    if invalid:
+        notes.append("provider usage was missing or malformed; valid fields were kept, "
+                     "but a zero fallback cost does not confirm a free call")
+    return out
+
+
 def actual_cost(slug: str, usage: dict[str, Any]) -> float:
     """Prefer OpenRouter's own cost; fall back to catalogue pricing."""
     for key in ("cost", "total_cost"):
@@ -1968,9 +2086,10 @@ def actual_cost(slug: str, usage: dict[str, Any]) -> float:
     model = _find(slug)
     if not model:
         return 0.0
-    prompt = float(usage.get("prompt_tokens") or 0)
-    completion = float(usage.get("completion_tokens") or 0)
-    return prompt * _price(model, "prompt") + completion * _price(model, "completion")
+    prompt = _nonnegative_number(usage.get("prompt_tokens")) or 0
+    completion = _nonnegative_number(usage.get("completion_tokens")) or 0
+    return (prompt * _price(model, "prompt") + completion * _price(model, "completion")
+            + _price(model, "request"))
 
 
 # --------------------------------------------------------------------------
@@ -2454,42 +2573,46 @@ def ask(
         payload["plugins"] = plugins
 
     timeout = _float_setting("request_timeout_s", 300.0) or 300.0
+    response: dict[str, Any] = {}
     try:
         response = _request("POST", "/chat/completions", payload, timeout=timeout)
         # OpenRouter can answer 200 and put the failure in the body. Route it through the same
         # translator as an HTTP error: otherwise the caller gets "returned no choices" plus a
         # raw dump, and none of the typed-error guidance that exists for exactly this.
         embedded = response.get("error")
-        if isinstance(embedded, dict):
-            raise OpenRouterError(
-                _http_message(int(embedded.get("code") or 200), json.dumps(response))
-            )
+        if embedded is not None:
+            code = _nonnegative_number(embedded.get("code")) if isinstance(embedded, dict) else None
+            raise OpenRouterError(_http_message(int(code or 200), json.dumps({"error": embedded})))
     except OpenRouterError as exc:
         log_call(
             {
                 "model": slug, "requested": model, "ok": False,
                 "error": str(exc)[:500], "chars_in": chars,
+                "cost_usd": actual_cost(slug, _clean_usage(response.get("usage"), []))
+                if response.get("usage") else 0.0,
                 "latency_s": round(time.monotonic() - started, 2), "thread": thread,
             }
         )
         raise
 
-    choices = response.get("choices") or []
-    if not choices:
-        raise OpenRouterError(
-            f"{slug} returned no choices. Raw response: {json.dumps(response)[:600]}"
-        )
-    message = choices[0].get("message") or {}
-    answer = (message.get("content") or "").strip()
-    # Present when OpenRouter parsed an attached file for this call. Sent back
-    # on the next turn, it stands in for re-parsing the same document.
-    annotations = message.get("annotations") or None
-    reasoning = (message.get("reasoning") or "").strip()
-    finish = choices[0].get("finish_reason") or choices[0].get("native_finish_reason")
+    choices = response.get("choices")
+    choice = choices[0] if isinstance(choices, list) and choices else None
+    choice = choice if isinstance(choice, dict) else {}
+    message = choice.get("message")
+    message = message if isinstance(message, dict) else {}
+    content = message.get("content")
+    answer = content.strip() if isinstance(content, str) else ""
+    annotations = message.get("annotations")
+    if not isinstance(annotations, list) or any(not isinstance(a, dict) for a in annotations):
+        annotations = None
+    raw_reasoning = message.get("reasoning")
+    reasoning = raw_reasoning.strip() if isinstance(raw_reasoning, str) else ""
+    finish = choice.get("finish_reason") or choice.get("native_finish_reason")
+    finish = finish if isinstance(finish, str) else None
 
     empty = not answer
-    incomplete = empty or finish == "length"
-    if incomplete:
+    incomplete = empty or (finish is not None and finish != "stop")
+    if incomplete and finish == "length":
         notes.append(
             f"incomplete response (finish_reason={finish}, max_tokens={limit}): "
             "max_tokens covers reasoning plus the final answer; a larger context window "
@@ -2498,10 +2621,16 @@ def ask(
             "limits, or narrow the task. MCP calls require max/xhigh, or justified medium. "
             "Do not retry unchanged or treat partial analysis as a completed review."
         )
-        if empty:
-            notes.append("the model returned no final answer; the call may still be billed")
+    elif incomplete:
+        notes.append(
+            f"incomplete response (finish_reason={finish}, max_tokens={limit}); "
+            "inspect the response status before deciding how to recover. A missing, "
+            "malformed or filtered answer is not evidence that more output tokens will help."
+        )
+    if empty:
+        notes.append("the model returned no final answer; the call may still be billed")
 
-    usage = response.get("usage") or {}
+    usage = _clean_usage(response.get("usage"), notes)
     prompt_detail = usage.get("prompt_tokens_details") or {}
     cost = actual_cost(slug, usage)
     elapsed = round(time.monotonic() - started, 2)
