@@ -12,7 +12,7 @@ Two front-ends over one engine:
   MCP layer ever breaks.
 
 The engine (`src/orask/core.py`) is **standard library only**. The MCP layer is
-the only thing that needs a third-party package (`mcp>=2.0`), so a broken or
+the only thing that needs a third-party package (`mcp>=2,<3`), so a broken or
 upgraded SDK can never take the CLI down with it.
 
 ## Layout
@@ -22,14 +22,18 @@ config/models.json        aliases, roles, limits          (user-editable)
 src/orask/core.py         engine: HTTP, resolution, cost, threads, logging
 src/orask/cli.py          CLI front-end
 src/orask/mcp_server.py   MCP front-end (mcp SDK)
+src/orask/install_config.py safe configuration and interpreter-pin updates
 bin/orask                 CLI launcher
 bin/openrouter-mcp        MCP stdio launcher
 install.sh                idempotent registration for both agents
-check.sh                  the gate: lint, types, shell syntax, offline tests
+check.sh                  the gate: lint, format, types, shell syntax, offline tests
 pyproject.toml            ruff and mypy config (no [project] table, on purpose)
 guides/                   local best-practice cheat sheets, served by read_guide
 tests/test_core.py        offline engine checks, no network or key needed
 tests/test_mcp_offline.py offline MCP protocol and safety checks
+tests/test_cli.py         CLI subprocess and doctor checks
+tests/test_boundaries.py provider/configuration boundary checks
+tests/test_install.py    isolated installer and launcher checks
 tests/test_mcp_stdio.py   live MCP protocol test (five billed completions)
 tests/eval_budget.py      opt-in paid baseline/candidate caller-prompt evaluation
 ```
@@ -62,18 +66,32 @@ printf 'OPENROUTER_API_KEY=sk-or-...\n' > ~/.config/openrouter/env
 chmod 600 ~/.config/openrouter/env
 ```
 
-Re-running the installer is safe. Every step checks for itself first, and any
-file it edits is backed up with a timestamp beside it.
+Re-running the installer checks existing registrations before updating them.
+Changed client configurations and the interpreter pin receive private timestamped
+backups. Codex edits preserve unrelated sections and use a lock plus atomic
+replacement. Malformed, unreadable, symbolic-link or unsupported configuration files
+are refused; they are never treated as empty. Common quoted TOML headers and
+multiline values are supported, including on Python 3.10. Ambiguous inline/dotted
+managed-server definitions require a manual edit. Installer reads are capped at
+32 MiB. Existing real launcher files or directories are refused; symlinks can be
+updated.
 
-Nothing in the repo is tied to one machine: every path comes from `$HOME` or
-from where the clone happens to sit, so it installs the same way on any Linux or
-macOS box. Three environment variables steer it if needed:
+A Claude registration update stops if backup, removal or addition fails. If
+addition fails after removal, the backup remains for recovery; rerun the
+installer after resolving the error. Restart both clients after server code,
+instruction or registration changes. These checks do not replace the clients' own trust settings.
 
 | variable | effect |
 |---|---|
-| `ORASK_PYTHON` | use this interpreter instead of searching for one |
+| `ORASK_PYTHON` | explicit absolute executable Python 3.10+; invalid values fail without fallback; the installer also requires its MCP SDK import |
 | `ORASK_BOOTSTRAP=1` | build the env without asking, for an unattended install |
-| `ORASK_CONFIG_DIR` | keep the key and user config somewhere other than `~/.config/openrouter` |
+| `ORASK_CONFIG_DIR` | relocate the key and user config from `~/.config/openrouter` |
+| `CLAUDE_CONFIG_DIR` | register in this directory's `.claude.json`, otherwise `~/.claude.json` |
+| `CODEX_HOME` | register in this directory's `config.toml`, otherwise `~/.codex/config.toml` |
+
+The selected interpreter is stored in `.orask-python`. Pin changes use a private
+atomic replacement and backup; a symlink pin is refused. Launchers otherwise
+search the saved pin, known environments and available Python installations.
 
 ## MCP tools
 
@@ -87,8 +105,9 @@ macOS box. Three environment variables steer it if needed:
 | `openrouter_usage` | Account spend plus what this bridge has cost. |
 | `read_guide` | Local best-practice guides. Free, no model call. |
 
-Only `question` is required; everything else has a working default. Arguments are
-flat JSON, one plain string per argument:
+For `ask_llm` and `ask_panel`, provide `question` as its own argument.
+Arguments use their declared JSON types: text strings, file/model arrays, numeric
+budgets and boolean switches. For example:
 
 ```json
 {"question": "what you want answered",
@@ -108,10 +127,10 @@ OpenRouter request parameter raises it. What a caller sets is a budget inside it
 `max_context_tokens` (tool argument, `--max-context-tokens` on the CLI, or
 `max_context_tokens` in the config for a standing default) budgets prompt plus
 answer into that many tokens. A number above what the model takes is clamped back
-down to the model's own window and the answer says so. Left unset, the whole
-published window is used.
+down to the model's own window and the answer says so. Left unset, the published window is the fitting limit when available;
+file limits and the output cap still apply.
 
-Whatever the budget, the prompt is measured against it before the call goes out:
+Whatever the budget, the prompt is estimated against it before the call goes out:
 
 - room left over, and `max_tokens` is lowered to fit it, with a note saying so
 - no room left, and the call is refused before it is billed, naming the estimate
@@ -123,7 +142,7 @@ it fits and caps the answer at half the window to leave room for what survives.
 `false` refuses even on the endpoints of 8k or less that OpenRouter compresses by
 default. Unset leaves that default alone.
 
-The window in force, and how much of it the prompt used, comes back on every
+The window in force, and the estimated prompt size, comes back on every
 answer: `context: 41231/200000` in the header line, and `context_window` in the
 JSON.
 
@@ -147,7 +166,7 @@ a read before making it:
 
 ```bash
 orask guide                      # the index: topic and when to read it
-orask guide python               # heading tree only
+orask guide python               # whole guide if short; heading tree if long
 orask guide python Subprocess    # one section
 orask guide python --all         # the whole file
 orask guide --search flock       # every guide at once, with the section named
@@ -208,8 +227,7 @@ orask "does this spec contradict the code?" -f ~/docs/spec.pdf -f src/api.py
 orask "review this package" -f src/orask/ --role reviewer
 ```
 
-A PDF works on every model, because OpenRouter parses it before the model sees
-it. `pdf_engine` picks how: `cloudflare-ai` (the default, free, right for a text
+OpenRouter can parse PDFs for models without native file input. `pdf_engine` picks how: `cloudflare-ai` (the default, free, right for a text
 PDF), `mistral-ocr` (reads scanned pages, billed per 1,000 pages) or `native`
 (models that take a file directly). Images and audio need a model that accepts
 that modality; ask one that does not and the file is held back with a note
@@ -224,48 +242,49 @@ private key does not become sendable by having binary contents.
 
 ### Following up on a document
 
-Name a `thread` and the attachment stays with it, so the next question about the
-same PDF does not mean sending it again:
+Name a `thread` and the attachment stays with it, so the next question can reuse its saved document context:
 
 ```bash
 orask "what does clause 4 say?" -f contract.pdf -t contract
 orask "does clause 9 contradict it?"            -t contract
 ```
 
-The turn is stored with its attachment parts, and OpenRouter's file annotations
-from the answer are stored alongside and replayed on the assistant turn. The
-annotations are what let OpenRouter recognise a document it has already parsed
-and skip the parse, which is where the `mistral-ocr` per-page charge would land.
+The bridge replays the original file parts and any saved assistant annotations.
+PDF annotations contain parsed text and sometimes images; they are document data.
+Reusing them can avoid another parsing charge, but the follow-up still sends
+content and incurs model input/output charges. See [OpenRouter's PDF annotation
+format](https://openrouter.ai/docs/guides/overview/multimodal/pdfs).
 
-They are only a parse receipt, not the document: annotations replayed without the
-file leave the model with nothing to read. That is why the file part is carried
-too, which is also how OpenRouter's own example does it. A live probe caught the
-difference, and `test_core.py` now pins it.
-
-Carrying base64 in a transcript has a budget of its own, `thread_attachment_bytes`
-(4 MB). Over that the attachment is not kept and the answer says to pass the file
-again on the next turn, rather than leaving a follow-up that quietly cannot see
-the document.
+New and replayed attachments share the current byte/count limits, and stored
+image/audio inputs must be compatible with the follow-up model. Parsed annotation
+text contributes to context estimates; embedded images contribute to attachment
+limits and cost estimates. The cumulative serialized attachment and annotation
+budget is `thread_attachment_bytes` (4 MiB). If saving the turn would exceed it,
+the existing transcript is preserved and the answer reports that the turn was
+not saved. Pass the needed files again or choose a new thread.
 
 ## Categories
 
 "Ask an LLM that is good at coding" has to land on a real slug, so `category`
-maps a capability onto the two current benchmark leaders for it. Pass it instead
+maps a capability onto two configured model pins. Pass it instead
 of `model`, and the agent picks:
 
-| category | models | picked on |
-|---|---|---|
-| `coding` | Kimi K3, GLM 5.3 | SciCode 58.7; coding index (SciCode + Terminal-Bench Hard + LiveCodeBench) |
-| `debugging` | GLM 5.3, Grok 4.6 | strongest on code and reasoning at once |
-| `reasoning` | Grok 4.6, Kimi K3 | GPQA Diamond 93.3 and 91.5 |
-| `math` | Kimi K3, Qwen3.8 Max | weighted competition-math tables; AIME is saturated |
-| `chat` | Muse Spark 1.2, Kimi K3 | LMArena text Elo 1499 and 1489 |
-| `agentic` | GLM 5.3, DeepSeek V4 Pro | tau2-bench airline 80.0 and 78.0 |
-| `research` | DeepSeek V4 Flash, Grok 4.6 | BrowseComp 77.0, DeepSearchQA 69.0 |
-| `long_context` | GLM 5.3, Kimi K3 | 1.31M and 1.05M token windows, MRCR v2 at 1M |
-| `creative` | GLM 5.3, Kimi K3 | Arena open creative-writing board |
-| `budget` | GLM 5.3 Flash, DeepSeek V4.1 Flash | $0.24 and $0.52 per million blended |
-| `general` | GLM 5.3, Grok 4.6 | highest published intelligence index |
+| category | configured models |
+|---|---|
+| `coding` | Kimi K3, GLM 5.3 |
+| `debugging` | GLM 5.3, Grok 4.6 |
+| `reasoning` | Grok 4.6, Kimi K3 |
+| `math` | Kimi K3, Qwen3.8 Max |
+| `chat` | Muse Spark 1.2, Kimi K3 |
+| `agentic` | GLM 5.3, DeepSeek V4 Pro |
+| `research` | DeepSeek V4 Flash, Grok 4.6 |
+| `long_context` | GLM 5.3, Kimi K3 |
+| `creative` | GLM 5.3, Kimi K3 |
+| `budget` | GLM 5.3 Flash, DeepSeek V4.1 Flash |
+| `general` | GLM 5.3, Grok 4.6 |
+
+These are the packaged selections recorded on 2026-09-10, not a live benchmark
+ranking. Exact slugs, selection rationale and dates live in `config/models.json`.
 
 `ask_llm` takes the first; `ask_panel` puts both against each other, which is
 what a plural request means. "Use the coding LLMs to review this" is passed
@@ -284,9 +303,9 @@ purpose. The rule lives in `category_exclude_vendors`.
 Every category pairs **two different vendors**, so a panel is two independent
 houses rather than one lab asked twice.
 
-Leadership moves. Each entry records the benchmark evidence and the date it was
-checked, and `orask categories --verify` re-checks every pinned slug against the
-live catalogue, reporting anything retired or downgraded:
+Each entry records its selection rationale and date. `orask categories --verify`
+requires a fresh catalogue and exits nonzero for missing or excluded pins. It
+checks availability and policy, not benchmark leadership:
 
 ```
 orask categories                    # what each category is and why
@@ -325,12 +344,10 @@ actually arrived, and every recovery is reported back in the response so the nex
 call is made correctly.
 
 
-**Per-model reasoning efforts.** They genuinely differ: Kimi K3 and GLM 5.3
-accept `max`/`high`/`low` and reject `medium`, Grok 4.6 accepts
-`xhigh`/`high`/`medium`/`low` and has no `max`, and Gemini 3.8 Flash accepts only
-`high`/`medium`/`low`. `clamp_effort()` snaps any
-requested effort onto what the target model actually advertises, rounding up on a
-tie, and says so in the response notes. Verified against the live catalogue.
+**Per-model reasoning efforts.** `clamp_effort()` maps the requested level to
+published model levels, rounding upward on a tie and reporting substitutions.
+Use `llm_model_info` for the current advertised levels rather than relying on a
+fixed per-model effort table.
 
 MCP calls default to `max` independently of the CLI's configurable default.
 Claude Code and Codex must request `max` or `xhigh`; `medium` requires a concrete
@@ -338,7 +355,11 @@ task-specific `effort_reason`. Low, minimal and disabled reasoning are rejected
 before billing. A preferred effort maps to the model's published levels; a model
 whose strongest level is `high` can use that level, and mapping never drops below
 medium. Models without published compatible reasoning levels are refused by MCP.
-The CLI retains its existing effort choices.
+MCP also sends `provider.require_parameters=true` to restrict routing to providers
+that support the request parameters, as described in [OpenRouter provider
+routing](https://openrouter.ai/docs/guides/routing/provider-selection). This may
+refuse a request when no compatible provider is available. The CLI retains its
+existing effort choices and packaged `high` default.
 
 **Choosing a reply budget.** `max_tokens` covers reasoning and the final answer
 together. A large context window does not prevent a small output cap from being
@@ -359,18 +380,20 @@ against the live catalogue and ranked by published intelligence index, so `grok`
 lands on the current flagship, not an elderly variant. `:batch` endpoints (which
 answer in minutes) and `:free` tiers are never selected implicitly.
 
-**Cost control.** Worst-case cost, meaning the whole prompt in and `max_tokens`
-out, is computed before sending and refused above `max_cost_usd_per_call` ($1.00).
-Fixed per-request fees are included. Missing, invalid, or non-finite token prices
-are unknown prices, while explicit zero prices remain free. When a model has no
-catalogue pricing the guard says it could not be evaluated
-instead of treating unknown as free. Every call is logged with OpenRouter's own
-reported cost.
+**Cost control.** The preflight estimate includes the estimated prompt, the full
+chosen output cap and known request fees. It refuses an estimate above
+`max_cost_usd_per_call` ($1.00 by default, per model). This is a heuristic guard,
+not a spending ceiling: token estimates, attachment processing, routing prices
+and OCR page estimates can differ from the eventual bill. Unknown pricing warns
+by default; `cost_guard_on_unknown_pricing: "block"` refuses it instead. Explicit
+zero prices and provider-reported zero cost are preserved. Results prefer
+provider-reported cost and otherwise fall back to available usage/catalogue data;
+missing accounting does not prove a free call. Call logging is best effort.
 
-**POSTs are not retried into a double bill.** A 5xx on `/chat/completions` can
-arrive after the provider already generated and billed the tokens, so POSTs retry
-only on 408/429, the statuses that mean the request never reached a model. GETs keep
-the full retry set. Read timeouts are never retried, for the same reason.
+**Retry policy.** Completion POSTs retry only HTTP 408/429. They do not retry 5xx
+or read timeouts, to reduce duplicate-billing risk after an ambiguous failure.
+GETs use a broader retry set. This policy cannot guarantee that every failed
+request was unbilled.
 
 **Typed failures are translated.** OpenRouter returns a stable `error_type` at
 `error.metadata.error_type` on `/chat/completions`. The image ones each have a
@@ -381,14 +404,14 @@ HTTP 400. An unrecognised type is still printed rather than swallowed.
 **The OCR page charge is inside the guard, not outside it.** `mistral-ocr` bills per
 1,000 pages on top of tokens, which a token-only estimate cannot see: a long scan
 could pass the $1.00 guard and then bill separately. There is no way to count pages
-before the parse, so they are inferred from the file size at a deliberately small
-bytes-per-page figure, priced from `mistral_ocr_usd_per_1k_pages`, and folded into
+before the parse, so they are inferred from the file size using a
+bytes-per-page heuristic, priced from `mistral_ocr_usd_per_1k_pages`, and folded into
 the estimate. The answer says the count is inferred rather than parsed.
 
 **The cost guard estimates attachments, and says that it is estimating.**
 OpenRouter has no preflight token-counting endpoint and does not publish how a
 provider tiles an image, so an attachment's share of the pre-flight estimate is a
-deliberately high heuristic, and the answer says so. The real numbers come back
+heuristic, and the answer says so. The real numbers come back
 afterwards in `usage.prompt_tokens_details` (`audio_tokens`, `video_tokens`,
 `cached_tokens`), which the result now reports.
 
@@ -398,17 +421,20 @@ application-default file, `.azure`, the `gh` token store), database and tooling
 secrets (`.pgpass`, `.my.cnf`, `.s3cfg`, terraform vars, gem and cargo credentials),
 both git configs since a remote URL routinely carries a token, `RAILWAY_VARS.md`,
 `admin_login_credentials*`, this bridge's own key file, and `/proc/<pid>/environ`,
-which holds this process's own environment and therefore the API key itself. This is
-the injection guard: an agent talked into "include your config files" cannot post
-credentials to a third party. Override per call with `allow_secret_files` from the
-CLI, or from a tool call only when the config permits it (see above).
+which holds this process's own environment and therefore the API key itself. This reduces accidental disclosure through known file paths. Filename rules
+cannot detect arbitrary copied secrets or credentials pasted into context;
+callers must inspect what they send. Override per call with `allow_secret_files` from the
+CLI, or from a tool call only when the config permits it (see below).
 
 Every path is resolved before the check, so a symlink (`/tmp/notes.txt` pointing
 at `~/.ssh/id_rsa`) cannot walk past it, and matching is case-insensitive so
 `ID_RSA` and `CERT.PEM` are caught too. User patterns are unioned with the
 built-ins rather than replacing them, because adding one project pattern must
 not silently disable credential protection; `deny_file_patterns_replace: true` makes
-replacement a deliberate act.
+replacement a deliberate act. Replacement and MCP override permissions require
+JSON `true`; strings such as `"false"` never grant permission. Policy checks both
+the requested path and resolved target, and detects hardlinks to the known API
+key file, including when `ORASK_CONFIG_DIR` relocates it.
 
 **Only regular files are read.** A FIFO, device or socket would block forever and
 hang the bridge. The descriptor is opened first and then checked with `fstat`, which
@@ -454,23 +480,24 @@ failure in the body, which used to surface as "returned no choices" plus a raw d
 It goes through the same typed-error translation as any other failure.
 
 **Incomplete completions are failures.** Empty answers, reasoning-only responses,
-and `finish_reason: length` return `ok: false` and `incomplete: true`, preserving
+`finish_reason: length`, and filtered/error finishes return `ok: false` and `incomplete: true`, preserving
 usage and any partial answer. They do not count as answered panel members or enter
 completed thread history. Reasoning is visible only with `include_reasoning`.
 This intentionally corrects the earlier behavior that counted unfinished reasoning
 or truncated text as a successful consultation.
 
-**Piped stdin never hangs.** `git diff | orask ask ...` works, but fd 0 is not
+**Piped stdin is bounded.** `git diff | orask ask ...` works, but fd 0 is not
 always a pipe: launched from a background job, daemon or agent shell tool it is
 often a socket whose write end is never closed, and a plain `sys.stdin.read()`
 blocks there forever. Every shape goes through `select`. A regular file or real pipe
 is waited on until the deadline, because a slow producer is normal; a socket or
 character device is read only while data keeps arriving (`ORASK_STDIN_WAIT`, default
 0.5s). Both are bounded by a 32 MB ceiling and a 30s deadline (`ORASK_STDIN_DEADLINE`),
-so `yes | orask ask ...` returns too. This was a live hang, caught in testing and
+Reaching either hard limit refuses the call instead of sending a partial prompt.
+Both timing settings must be finite positive seconds. This was a live hang, caught in testing and
 regression-tested for all four stdin shapes.
 
-**Errors reach the model verbatim.** The MCP SDK replaces an unexpected
+**Expected failures reach the caller.** The MCP SDK replaces an unexpected
 exception's text with a generic "Error executing tool", so expected failures are
 re-raised as `ToolError`, the one type it forwards intact. That is how the
 calling agent learns to run `orask models --search` instead of retrying blindly.
@@ -479,65 +506,60 @@ calling agent learns to run `orask models --search` instead of retrying blindly.
 without an in-memory TTL it would serve the catalogue it booted with forever and
 silently use stale prices and effort lists.
 
-**Persistence never breaks a paid call.** The catalogue cache and thread
-transcripts are written best-effort: a read-only or full `~/.cache` returns False
-rather than raising, so a successful fetch is not thrown away and an answer the
-user already paid for is never lost to a failed write. Thread turns take an
-exclusive `flock` for the read-modify-write, so two concurrent turns on one
-thread cannot silently drop an exchange.
+**Persistence is best effort.** A failed cache or thread write does not discard
+the provider answer. Thread save failures are reported with the result. Private
+state files reject unsafe links and nonregular files; transcript updates are
+atomic and preserve malformed existing files for recovery. A stable exclusive
+lock merges concurrent saves, waiting at most 10 seconds before refusing the
+write. This protects saved exchanges; simultaneous questions can still have read
+the same earlier history. Call-log readers skip malformed records and read a
+bounded tail, so local totals are not an authoritative billing ledger.
 
-## How this code was reviewed
+`usage` scans at most the newest 4 MiB of the log and reports its coverage.
+`bridge_costs_unknown`, `bridge_timestamps_unknown`, `bridge_log_records_skipped`
+and `notes` disclose incomplete accounting. Totals include known costs only;
+invalid/future timestamps are excluded from the last-24h total. Unavailable totals
+are `null`. The existing `bridge_calls_logged` field still counts successful answers.
+Transcript writes also enforce the reader's 32 MiB serialized-file limit.
 
-Kimi and GLM reviewed this module through the bridge itself, twice. The first
-round found the cost guard ignoring output tokens, POST retries that could
-double-bill, an unbounded in-memory catalogue cache, and unvalidated file reads.
-The second round verified those fixes, and both models independently and
-separately found a symlink bypass of the secrets denylist, plus `text[-0:]` returning the
-whole string instead of nothing when `max_file_chars` was 0. All findings are
-fixed and regression-tested. One claim was rejected on evidence: GLM reported
-`X-OpenRouter-Title` as not a real header, but the current OpenRouter docs
-confirm it is (with `X-Title` as the legacy alias), so both are sent.
+**Configuration and provider boundaries.** Collection fields are validated before
+use: aliases/roles are objects of strings and model/deny lists are arrays of
+strings. Invalid numeric configuration falls back to safe defaults; invalid
+per-call budgets are refused. Optional malformed usage metadata does not discard
+a usable paid answer. Error bodies are bounded and closed, and successful HTTP
+response bodies are limited to 64 MiB.
 
-A third defect came out of using the tool rather than reviewing it: `orask` hung
-forever when launched from a background job, because fd 0 was an open socket and
-`sys.stdin.read()` never returned.
+**Strict CLI and doctor checks.** Unknown commands/options and invalid arguments
+exit nonzero. A single incomplete answer exits nonzero; a panel exits zero if
+at least one model succeeded, so inspect each result for partial panel failures.
+`doctor` requires fresh catalogue/account access and checks user-scope command,
+interpreter and tool settings for this checkout. It cannot prove a running
+client's handshake, project overrides or trust policy. Python 3.10 lacks stdlib
+TOML parsing, so doctor reports Codex validation unavailable; run that check with
+Python 3.11+. Installer editing and ordinary consultations still support 3.10.
 
 ## Tests
 
+```bash
+./check.sh                         # lint, format, types, shell syntax, offline tests
+PY=$(cat .orask-python)            # absolute interpreter selected by install.sh
+"$PY" tests/test_core.py           # offline engine checks
+"$PY" tests/test_mcp_stdio.py       # live: five billed completions, needs SDK and key
+"$PY" tests/eval_budget.py --live   # paid prompt comparison, 16 calls by default
+orask doctor                      # installed-state check; network, no completion
 ```
-./check.sh                      # the gate: ruff, mypy, bash -n, offline tests
-python tests/test_core.py       # offline, free, no mcp package needed
-python tests/test_mcp_stdio.py  # live, five billed completions, needs mcp and a key
-python tests/eval_budget.py --live  # paid prompt comparison, 16 calls by default
-orask doctor                    # installed-state check
-```
 
-`check.sh` is what has to pass. It runs the offline suite against a scratch
-config, state and cache directory, so a run cannot read the real API key, append to
-the real call log, or reach the network. `ruff format` is deliberately not part of it:
-the source is hand-aligned and a wholesale reformat is 2000 lines of churn.
+`check.sh` is the required gate. It runs Ruff lint and format checks, mypy, Bash
+syntax checks, and the core, MCP protocol, CLI, provider/configuration boundary,
+and installer suites. Offline fixtures use scratch configuration/state/cache and
+fake client commands; they do not require the real key or paid model calls.
+Coverage includes malformed provider data, effort/budget policy, incomplete
+answers, attachment replay, private persistence, stdin limits, client registration
+and installer failure recovery. Live tests are separate opt-in checks.
 
-`test_core.py` stubs the catalogue and replaces the HTTP layer with one that raises,
-so a check that reaches the network fails loudly rather than billing a model. It
-covers category resolution (synonyms, phrases, retired pins, excluded vendors,
-and a check that the shipped config still pairs two live non-excluded vendors per
-category), alias resolution and self-healing, `allowed_models` locking, effort
-clamping per model, file truncation, binary and FIFO rejection, the secrets
-denylist, prompt caps, thread persistence and path-traversal flattening, cost
-estimation, retry policy, catalogue validation, and argument-shape recovery
-(question folded into `context`, leaked tool-call tags, list arguments sent as a
-bare string).
-
-For attachments it covers type classification by magic bytes and by extension,
-the content parts each kind produces, the modality gate, the byte and count
-ceilings, the denylist applying to binaries, directory expansion and pruning,
-and the fact that base64 is judged by bytes rather than against the text cap.
-
-`test_mcp_stdio.py` replays the real malformed call over the protocol. That check
-costs nothing: it points at an unresolvable model, so reaching model resolution
-is itself the proof that the question was accepted. It also sends a real one-page
-PDF whose only content is a codeword, so the round trip is proved by the model
-returning something it could only have read out of the file.
+The supported minimum is Python 3.10 with MCP 2.x. Linux offline checks cover the
+minimum and current project environments; macOS execution remains unverified.
+Formatting changes are kept in a separate mechanical commit from behavior fixes.
 
 ## Adding a model
 
@@ -548,8 +570,12 @@ Edit `aliases` in `config/models.json`:
              "grok": "x-ai/grok-4.6" }
 ```
 
-`default_panel` decides who answers a bare `orask panel`, and every alias there
-is one more billed call per panel.
+The packaged aliases are `kimi` → `moonshotai/kimi-k3`, `glm` → `z-ai/glm-5.3`,
+`grok` → `x-ai/grok-4.6` and `gemini` → `google/gemini-3.8-flash`.
+`default_model` is `kimi`; `default_panel` includes all four aliases. Each distinct
+resolved model is a separate billed consultation. The category vendor exclusion
+applies to category selection; it does not remove Gemini from this explicit
+panel or prevent a deliberately named model.
 
 Find exact slugs with `orask models --search grok`. A user copy at
 `~/.config/openrouter/config.json` overrides the packaged file, and `aliases` and
@@ -562,59 +588,7 @@ anything else is then refused. Empty means an ad-hoc full slug is allowed.
 
 ```
 claude mcp remove openrouter -s user
-# then delete the [mcp_servers.openrouter] block from ~/.codex/config.toml
+# then delete the [mcp_servers.openrouter] block (and its subtables)
+# from ${CODEX_HOME:-$HOME/.codex}/config.toml
 rm ~/.local/bin/orask ~/.local/bin/openrouter-mcp
 ```
-
-## Audit safety corrections (2026-09-12)
-
-MCP safety overrides and denylist replacement require JSON `true`; strings such
-as `"false"` cannot grant permission. Non-finite numeric settings fall back to
-safe defaults. File policy checks both the requested name and resolved target,
-including the API key file when `ORASK_CONFIG_DIR` relocates it. Provider-reported
-zero cost is authoritative and is not replaced with an estimated charge.
-
-Thread and call-log files are created with owner-only permissions. Transcript
-writes require a lock; if locking or persistence fails, the paid answer is
-returned with a save-failure note and existing history is preserved. Lock waits
-are bounded to ten seconds. Malformed transcripts are readable as empty history
-but are not overwritten until repaired. State reads refuse symlinks, and log
-writes also refuse hardlinks. Regular file reads check the descriptor and enforce
-the byte ceiling even if a file grows while it is being read.
-
-Configuration collection fields are validated before use: aliases/roles are
-objects of strings and model/deny lists are arrays of strings. Malformed values
-are refused with the file and field named. Invalid, negative, boolean or non-finite
-numeric settings use the documented default; numeric zero retains its explicit
-meaning. Provider metadata is validated separately so invalid optional accounting
-cannot discard a paid answer. Missing or malformed choices now return an
-incomplete result with any reported usage instead of raising with a raw response
-dump. Filtered/error finishes also do not count as successful answers. Error
-bodies are bounded and closed; success bodies are limited to 64 MiB.
-
-`categories --verify` and `doctor` require a fresh catalogue for their reachability
-checks. A cached copy no longer counts as proof that OpenRouter is reachable.
-Category verification exits nonzero for missing or excluded pins.
-
-CLI input that exceeds its byte limit or fails to reach EOF by the deadline now
-refuses the consultation before billing, instead of silently sending a partial
-prompt. Idle sockets still finish normally after their bounded idle wait.
-
-Attachment byte/count limits cover new files and replayed thread files together.
-A follow-up that no longer fits the current limits, or switches to a model unable
-to read a stored image/audio file, is refused before billing. The transcript's
-attachment budget is cumulative across retained turns. The known API-key file
-is refused even when reached through an innocently named hardlink; filename
-policies cannot detect arbitrary copied secrets, so callers must still inspect
-the files they choose to send. Iterable file lists are consumed once per panel.
-
-Guide reads use the same descriptor safety checks as attachments. Section lookup
-respects longer code fences and valid closing fences, and impossible or future
-verification dates are marked as needing verification.
-
-The offline gate has been exercised with Python 3.10.21/MCP 2.0.0 and Python
-3.13.15/MCP 2.2.0 on Linux. The test client uses an explicit stdio transport
-compatible with both SDK versions. Python 3.10 has no stdlib TOML parser:
-`doctor` therefore reports Codex registration validation unavailable on that
-interpreter; use Python 3.11+ for that check. CLI consultations and MCP serving
-retain Python 3.10 support. macOS execution remains unverified.

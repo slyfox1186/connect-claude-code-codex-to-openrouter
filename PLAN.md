@@ -73,12 +73,12 @@ trees and fake external commands. Offline tests must never reach OpenRouter.
   scratch state; add offline real MCP stdio coverage separately from the stdlib
   unit suite. Add the format gate in its own commit. Remove obsolete suppressions
   only after checking the relevant types; explain any retained suppression.
-- [ ] Docs: update README and local JEFF_START_HERE.md for affected behavior and
+- [x] Docs: update README and local JEFF_START_HERE.md for affected behavior and
   verification commands. Correct overclaims (cost estimates are heuristics, not
   absolute spending guarantees; test count; default panel; actual thread replay).
   Read all remaining guides and validate material technical claims against
   primary sources. Record any uncertain benchmark claims rather than change pins.
-- [ ] Final audit: inspect complete affected success/error paths; run full gate,
+- [x] Final audit: inspect complete affected success/error paths; run full gate,
   real offline stdio, CLI subprocess and installer fixture tests, supported Python
   syntax/version checks where available. Report macOS/runtime versions not run.
 - [ ] Release: fetch and safely rebase, run gate again if upstream changed, push
