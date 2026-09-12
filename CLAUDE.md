@@ -14,6 +14,7 @@ Always invoke Python by absolute path. The interpreter this machine resolved is 
 ```bash
 PY=$(cat .orask-python)
 
+./check.sh                      # THE GATE: ruff, mypy, bash -n, offline tests. Must pass.
 $PY tests/test_core.py          # offline checks, no network or key, safe to run any time
 $PY tests/test_mcp_stdio.py     # live MCP protocol test over stdio; spends a few cents
 orask doctor                    # key, permissions, catalogue, aliases, both registrations
@@ -24,10 +25,20 @@ Running a module directly needs the src path: `PYTHONPATH=src $PY -m orask.cli .
 The launchers in `bin/` do that plus interpreter resolution, so prefer `bin/orask`.
 
 `test_mcp_stdio.py` makes a real billed model call and needs the `mcp` package plus a key.
-Ask Jeff before running it.
+Ask Jeff before running it. `test_core.py` must never need either: it redirects every runtime
+path to a scratch directory before importing core, and replaces `core._request` with one that
+raises, so a check that reaches the network fails loudly instead of spending money. Anything
+that has to be tested from `mcp_server.py` belongs in `core` first (see `override_allowed`).
 
-There is no lint or type config in the repo. `# noqa` codes in the source follow ruff/flake8
-naming but nothing enforces them.
+`check.sh` is the pass/fail gate and runs everything: ruff, mypy, `bash -n` over the shell
+files, and the offline suite against a scratch config/state/cache so it cannot read the real
+key, append to the real call log, or reach the network. Config is in `pyproject.toml`, which
+has **no `[project]` table** on purpose: `core.PROJECT_ROOT` assumes the repository layout, so
+`pip install -e .` would lose `config/models.json` with no error to say so.
+
+`ruff format` is deliberately not in the gate. The source is hand-aligned (the magic-byte
+table, the media maps, the printed column widths) and reformatting is 2000 lines of churn.
+`PLW0603` is off for the same class of reason: the module-level caches are the design.
 
 ### Running one check
 
@@ -114,11 +125,25 @@ tool-call tags only when they wrap or terminate a value. A `context` with no que
 refused, because a wrong guess bills a real model for a prompt nobody wrote.
 
 An empty completion returns `ok: False` with usage preserved. A caller keying on `ok` must not
-mistake "no answer" for a second opinion.
+mistake "no answer" for a second opinion. It was still billed, though, so anything that totals
+money counts every entry that carries a cost, never only the ones where `ok` is true.
+
+The safety overrides are not the calling agent's to set. `allow_secret_files` and
+`allow_expensive` are tool arguments, so an agent that can be talked into asking for a
+credential can be talked into passing the override with it. `core.override_allowed()` refuses
+both for tool calls unless `mcp_allow_secret_files` / `mcp_allow_expensive` is set in the
+config; the CLI flags are a person typing them and are untouched.
+
+An output cap is always chosen and always sent. "No cap sent, zero output priced" is how the
+cost guard used to be walked past, and there is no state that reaches it now.
 
 Persistence is best effort and never breaks a paid call: a failed cache or thread write returns
-False rather than raising, so an answer already paid for is not lost. Thread writes take an
-exclusive `flock` for the read-modify-write.
+False rather than raising, so an answer already paid for is not lost. That includes a bad
+config value, because `thread_max_messages` is read *after* the response has been billed.
+Every numeric setting goes through `_setting()` or `_float_setting()` for the same reason: a
+bare `ValueError` reaches the calling agent as a useless "Error executing tool". Thread writes
+take an exclusive `flock` for the read-modify-write, and `load_thread()` drops null content on
+the way in, so transcripts damaged by the old recovered-question bug repair themselves.
 
 Attachments are bounded by bytes, not characters, since base64 inflates by a third. They sit
 outside `max_input_chars` on purpose and are folded into the cost estimate through

@@ -7,7 +7,7 @@ Lets an AI coding agent consult other frontier models mid-task:
 Two front-ends over one engine:
 
 - **MCP server** (`bin/openrouter-mcp`), registered with Claude Code and Codex,
-  exposing five tools so the agent can consult another model on its own.
+  exposing six tools so the agent can consult another model on its own.
 - **CLI** (`bin/orask`), the same engine from any shell, and the fallback if the
   MCP layer ever breaks.
 
@@ -25,7 +25,9 @@ src/orask/mcp_server.py   MCP front-end (mcp SDK)
 bin/orask                 CLI launcher
 bin/openrouter-mcp        MCP stdio launcher
 install.sh                idempotent registration for both agents
-tests/test_core.py        68 offline checks, no network or key needed
+check.sh                  the gate: lint, types, shell syntax, offline tests
+pyproject.toml            ruff and mypy config (no [project] table, on purpose)
+tests/test_core.py        227 offline checks, no network or key needed
 tests/test_mcp_stdio.py   end-to-end MCP protocol test (spends a few cents)
 ```
 
@@ -41,7 +43,8 @@ cd connect-claude-code-codex-to-openrouter
 ./install.sh
 ```
 
-`install.sh` looks for a Python 3.10+ that can import the `mcp` SDK (>=2.0). If
+`install.sh` looks for a Python 3.10+ that can import the `mcp` SDK, which it
+installs pinned to `mcp>=2,<3` because `mcp.server.mcpserver` is a 2.0 API. If
 there is none it offers to build one: its own conda env named `openrouter-mcp`
 on Python 3.13, under whichever conda root the machine already has
 (`~/miniconda3` first), or a project-local `.venv` on a machine with no conda at
@@ -267,11 +270,16 @@ deliberately high heuristic, and the answer says so. The real numbers come back
 afterwards in `usage.prompt_tokens_details` (`audio_tokens`, `video_tokens`,
 `cached_tokens`), which the result now reports.
 
-**Secrets denylist.** `files` paths matching `deny_file_patterns` (ssh keys,
-`.env`, `*.pem`, `RAILWAY_VARS.md`, `admin_login_credentials*`, this bridge's own
-key file, and more) are refused with a loud note. This is the injection guard: an
-agent talked into "include your config files" cannot post credentials to a third
-party. Override per call with `allow_secret_files`.
+**Secrets denylist.** `files` paths matching `deny_file_patterns` are refused with a
+loud note: ssh keys, `.env`, `*.pem`, cloud credential stores (gcloud's
+application-default file, `.azure`, the `gh` token store), database and tooling
+secrets (`.pgpass`, `.my.cnf`, `.s3cfg`, terraform vars, gem and cargo credentials),
+both git configs since a remote URL routinely carries a token, `RAILWAY_VARS.md`,
+`admin_login_credentials*`, this bridge's own key file, and `/proc/<pid>/environ`,
+which holds this process's own environment and therefore the API key itself. This is
+the injection guard: an agent talked into "include your config files" cannot post
+credentials to a third party. Override per call with `allow_secret_files` from the
+CLI, or from a tool call only when the config permits it (see above).
 
 Every path is resolved before the check, so a symlink (`/tmp/notes.txt` pointing
 at `~/.ssh/id_rsa`) cannot walk past it, and matching is case-insensitive so
@@ -281,8 +289,39 @@ not silently disable credential protection; `deny_file_patterns_replace: true` m
 replacement a deliberate act.
 
 **Only regular files are read.** A FIFO, device or socket would block forever and
-hang the bridge; size is checked by `stat` before opening, so a huge file is never
+hang the bridge. The descriptor is opened first and then checked with `fstat`, which
+also closes the race where a regular file is swapped for a FIFO between the check
+and the open, and the size is read from that same descriptor so a huge file is never
 pulled into memory just to be truncated.
+
+**The type is decided by the content, not only by the name.** Magic bytes win, but
+`ID3` is three bytes, so a CSV whose first column is called `ID3` used to attach as
+an MP3; a real ID3v2 tag names its major version next. The extension still carries
+the formats that have no signature (an untagged MP3 starts with a frame sync), but a
+file whose first 64 bytes read as plain text is taken at its word over its name, so
+`notes.mp3` full of text is not sent as corrupt audio and billed.
+
+**The safety overrides are not the calling agent's to set.** `allow_secret_files`
+and `allow_expensive` are tool arguments, which means an agent that can be talked
+into asking for a credential can be talked into passing the override alongside it in
+the same call. For tool calls both are refused unless the config opts in with
+`mcp_allow_secret_files` or `mcp_allow_expensive`, and the refusal names the key that
+would permit it. The CLI flags are a person typing them and are unchanged.
+
+**An output cap is always chosen and always sent.** With no `max_tokens`, no
+`default_max_tokens` and no published provider ceiling, the old code sent no cap and
+priced zero output tokens, so any prompt passed the guard while the provider
+generated to its own limit. There is no state now in which the guard prices the
+answer at nothing.
+
+**A failed catalogue fetch is remembered.** A single `ask()` looks the catalogue up
+five or six times; with the network down each of those was a full retry cycle. One
+failure suppresses the next attempt for a minute. The fetch also takes a lock, so a
+cold panel makes one `/models` request rather than one per worker.
+
+**An error in a 200 body is still an error.** OpenRouter can answer 200 and put the
+failure in the body, which used to surface as "returned no choices" plus a raw dump.
+It goes through the same typed-error translation as any other failure.
 
 **Empty completions are failures.** A billed call that returns no content comes
 back `ok: False` with the usage preserved, so a caller keying on `ok` cannot
@@ -292,10 +331,12 @@ and no answer, the reasoning is surfaced with an explanation.
 **Piped stdin never hangs.** `git diff | orask ask ...` works, but fd 0 is not
 always a pipe: launched from a background job, daemon or agent shell tool it is
 often a socket whose write end is never closed, and a plain `sys.stdin.read()`
-blocks there forever. A regular file or real pipe is drained in full; a socket or
-character device is read only while data keeps arriving (`ORASK_STDIN_WAIT`,
-default 0.5s). This was a live hang, caught in testing and regression-tested for
-all four stdin shapes.
+blocks there forever. Every shape goes through `select`. A regular file or real pipe
+is waited on until the deadline, because a slow producer is normal; a socket or
+character device is read only while data keeps arriving (`ORASK_STDIN_WAIT`, default
+0.5s). Both are bounded by a 32 MB ceiling and a 30s deadline (`ORASK_STDIN_DEADLINE`),
+so `yes | orask ask ...` returns too. This was a live hang, caught in testing and
+regression-tested for all four stdin shapes.
 
 **Errors reach the model verbatim.** The MCP SDK replaces an unexpected
 exception's text with a generic "Error executing tool", so expected failures are
@@ -332,12 +373,19 @@ forever when launched from a background job, because fd 0 was an open socket and
 ## Tests
 
 ```
+./check.sh                      # the gate: ruff, mypy, bash -n, offline tests
 python tests/test_core.py       # offline, free, no mcp package needed
 python tests/test_mcp_stdio.py  # live, a few cents, needs mcp and a key
-orask doctor                                                                  # installed-state check
+orask doctor                    # installed-state check
 ```
 
-`test_core.py` stubs the catalogue, so it needs neither network nor key. It
+`check.sh` is what has to pass. It runs the offline suite against a scratch
+config, state and cache directory, so a run cannot read the real API key, append to
+the real call log, or reach the network. `ruff format` is deliberately not part of it:
+the source is hand-aligned and a wholesale reformat is 2000 lines of churn.
+
+`test_core.py` stubs the catalogue and replaces the HTTP layer with one that raises,
+so a check that reaches the network fails loudly rather than billing a model. It
 covers category resolution (synonyms, phrases, retired pins, excluded vendors,
 and a check that the shipped config still pairs two live non-excluded vendors per
 category), alias resolution and self-healing, `allowed_models` locking, effort
