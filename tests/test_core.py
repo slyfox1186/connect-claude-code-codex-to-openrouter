@@ -9,6 +9,7 @@ A test that reaches the network is a bug in the test, and it fails loudly instea
 real model call.
 """
 
+import contextlib
 import json
 import os
 import sys
@@ -1261,16 +1262,19 @@ with tempfile.TemporaryDirectory() as tmp:
 
 # ---- guides are local files, and the topic name is not to be trusted ------
 _guides = core.list_guides()
-check("the packaged guides are found", len(_guides) >= 4,
+check("the packaged guides are found", len(_guides) >= 5,
       ", ".join(g["topic"] for g in _guides))
-check("every guide declares when to read it and when it was verified",
-      all(g["triggers"] and g["verified"] for g in _guides),
-      ", ".join(g["topic"] for g in _guides if not (g["triggers"] and g["verified"])))
+check("every guide declares when to read it and a parseable verified date",
+      all(g["triggers"] and not g["stale"] for g in _guides),
+      ", ".join(g["topic"] for g in _guides if not (g["triggers"] and not g["stale"])))
 
 _outline = core.guide_outline("bash")
 check("an outline lists headings without returning the body",
-      len(_outline["sections"]) > 3 and "sections" in _outline,
-      f"{len(_outline['sections'])} sections")
+      len(_outline["sections"]) > 3, f"{len(_outline['sections'])} sections")
+check("every outline entry carries its own length, for budgeting a read",
+      all(s["lines"] > 0 for s in _outline["sections"]))
+check("the line count is the body, not the front matter",
+      _outline["lines"] < len(Path(_outline["path"]).read_text().splitlines()))
 
 _whole = core.read_guide("bash")["text"]
 _part = core.read_guide("bash", section="Quoting")
@@ -1279,11 +1283,39 @@ check("a section read returns that heading only",
       f"{len(_part['text'])} of {len(_whole)} chars")
 check("a section match is case-insensitive and partial",
       core.read_guide("bash", section="quot")["section"] == "Quoting")
+check("an empty section is the whole guide, not an outline",
+      core.read_guide("bash", section="")["text"] == _whole)
 
 # The topic comes from a tool argument, so it is hostile input.
-for _bad in ("../../../etc/passwd", "/etc/passwd", "../README", "..", "a/b"):
+for _bad in ("../../../etc/passwd", "/etc/passwd", "../README", "..", "a/b", "%2e%2e/x"):
     check(f"a guide path cannot escape the guides directory ({_bad})",
           core._guide_path(_bad) is None)
+
+# _guide_path is not the only reader: list and search open files too, and a
+# symlink planted in a guide directory must not be readable through any of them.
+_gdir = SCRATCH / "guides-extra"
+_gdir.mkdir(exist_ok=True)
+(_gdir / "real.md").write_text("---\ntriggers: t\nverified: 2026-09-11\n---\n\n## A\nsecretword\n")
+_secret = SCRATCH / "outside.md"
+_secret.write_text("## Leaked\nsecretword-outside\n")
+with contextlib.suppress(OSError, NotImplementedError):
+    (_gdir / "escape.md").symlink_to(_secret)
+_cfg_guides = dict(core.load_config(), guide_dirs=[str(_gdir)])
+core._config_cache = _cfg_guides
+_names = {r["topic"] for r in core.list_guides()}
+check("a guide directory from config is indexed", "real" in _names, str(sorted(_names))[:80])
+check("a symlink out of a guide directory is not listed", "escape" not in _names)
+check("and it is not readable", core._guide_path("escape") is None)
+check("and its contents cannot be reached through search",
+      core.search_guides("secretword-outside")["total"] == 0)
+(_gdir / "python.md").write_text(
+    "---\ntriggers: local override\nverified: 2026-09-11\n---\n\n## Local\nmine\n")
+check("a configured directory wins over the packaged copy of the same topic",
+      core.read_guide("python")["path"].startswith(str(_gdir)),
+      core.read_guide("python")["path"])
+(_gdir / "python.md").unlink()
+core._config_cache = cfg
+
 try:
     core.read_guide("no-such-guide")
     check("an unknown guide is refused with the list of real ones", False)
@@ -1297,18 +1329,60 @@ except core.OpenRouterError as _exc:
     check("an unknown section names the real sections", "Sections:" in str(_exc),
           str(_exc)[:80])
 
+# A heading inside a fenced code block is a sample, not a section. Getting this
+# wrong puts phantom entries in the outline and ends a slice inside an example.
+_fenced = SCRATCH / "fenced.md"
+_fenced.write_text(
+    "---\ntriggers: t\nverified: 2026-09-11\n---\n\n"
+    "## Real one\nbody\n\n```md\n## Not a heading\n```\n\nmore body\n\n## Real two\ntail\n"
+)
+_body = core._guide_split(_fenced.read_text())[1]
+_heads = [m.group(2) for _, m in core._guide_headings(_body)]
+check("a heading inside a code fence is not a section",
+      _heads == ["Real one", "Real two"], str(_heads))
+_starts = core._guide_headings(_body)
+check("and a fenced heading does not cut a section short",
+      "more body" in "\n".join(_body.splitlines()[_starts[0][0]:_starts[1][0]]))
+
+# A document that opens with a horizontal rule has no front matter, and its
+# content must not be eaten as metadata.
+_meta, _rule_body = core._guide_split("---\n\nIntro para\n\n---\n\nRest\n")
+check("a horizontal rule is not mistaken for front matter",
+      _meta == {} and "Intro para" in _rule_body, str(_meta))
+_meta2, _ = core._guide_split("\ufeff---\ntriggers: t\nverified: 2026-01-01\n---\n\nbody\n")
+check("a byte order mark does not hide the front matter",
+      _meta2.get("verified") == "2026-01-01", str(_meta2))
+
+_found = core.search_guides("pipefail")
 check("search finds a rule and names the section holding it",
-      any(h["topic"] == "bash" and h["section"] for h in core.search_guides("pipefail")),
-      str(core.search_guides("pipefail")[:1])[:100])
+      any(h["topic"] == "bash" and h["section"] for h in _found["hits"]),
+      str(_found["hits"][:1])[:100])
+check("search matches heading text, not only body lines",
+      core.search_guides("Heredocs")["total"] > 0)
+_small = core.search_guides("the", limit=3)
+check("a truncated search says so and still counts every match",
+      _small["truncated"] and _small["total"] > len(_small["hits"]),
+      f"{len(_small['hits'])} of {_small['total']}")
+check("a truncated search is not filled from one guide alone",
+      len({h["topic"] for h in core.search_guides("the", limit=6)["hits"]}) > 1)
 
 # Front matter must never be handed to the model as if it were content.
 check("front matter is stripped from the returned text",
       not _whole.lstrip().startswith("---"), _whole[:40])
+check("the packaged guides directory is always searched",
+      core.GUIDES_DIR.resolve() in core.guide_dirs())
+check("a guide_dirs path is not comma-split the way files are",
+      core.guide_dirs()[0] != Path("/nope"))
 
-# The guides are the one place a doc claim is machine-checkable, so pin it.
-check("a config-supplied guide directory is ignored when it does not exist",
-      core.GUIDES_DIR in core.guide_dirs())
-
+# A directory added through guide_dirs holds documents written for people, with
+# no front matter. A bare filename gives an agent nothing to route on.
+(_gdir / "plain.md").write_text("# Redis How-To and Best Practices\n\n## A\nbody\n")
+core._config_cache = _cfg_guides
+_plain = next(r for r in core.list_guides() if r["topic"] == "plain")
+check("a file with no front matter is indexed by its title",
+      _plain["triggers"] == "Redis How-To and Best Practices", _plain["triggers"])
+check("and it is flagged as undated rather than silently trusted", _plain["stale"])
+core._config_cache = cfg
 
 print()
 if FAILS:

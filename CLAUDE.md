@@ -173,13 +173,39 @@ to `guides/` is the entire change - there is no list to update. `verified` is a
 date because a stale guide overrides the model's own judgement with wrong
 advice; `orask guide --stale` audits it.
 
-The `topic` argument comes from a tool call, so `_guide_path()` pattern-checks
-the name before joining it and confirms the resolved file is inside the
-directory it came from. Both halves are needed: the pattern stops `../`, the
-resolve-and-contain check stops a symlink planted in a guide directory.
+`_guide_map()` is the only place a path enters this subsystem. It resolves every
+candidate and confirms it sits inside the directory it was found in, and list,
+search and read all go through it - a check on the read path alone would leave
+search quoting a symlinked file it refuses to open. `topic` is pattern-checked
+before it is joined as well: the pattern stops `../`, the resolve-and-contain
+check stops the symlink, and both are needed.
 
-Guides are served as index, outline, or one section. Returning a 2,000-line file
-whole costs more context than it saves, which is why `guide_outline()` exists.
+The addressable name is the slugified filename stem, never the front matter
+`topic`. A name that is displayed but cannot be looked up sends the agent to an
+error listing the string it just refused.
+
+`_guide_headings()` skips fenced code blocks and is shared by the outline, the
+section slice and search. A manual full of `##` lines inside shell samples
+otherwise gets phantom sections, and a slice that ends inside an example.
+
+Front matter is parsed once, by `_guide_split()`, and every line of the block
+must be `key: value`. A document opening with a horizontal rule also starts with
+`---`, and without that check its prose is swallowed as metadata and disappears
+from the body, the outline and search with no error.
+
+Widths: index, whole guide, outline, one section. Under `FULL_GUIDE_MAX_LINES`
+the adapter returns the whole file, because two round trips cost more than a
+250-line guide; above it, the outline, with each section's length so the agent
+can budget the read. Sections are capped at `MAX_GUIDE_SECTION_CHARS` or section
+mode would put the unbounded dump back.
+
+`search_guides()` returns `total` alongside the shown hits and takes them
+round-robin. A count that stops at the limit reads as "this is everywhere it
+appears", and one large manual would otherwise use the whole budget.
+
+The instructions index is built once at startup: MCP sends instructions during
+initialize and cannot change them afterwards. The text says so rather than
+leaving it to be discovered.
 
 ## Documentation
 

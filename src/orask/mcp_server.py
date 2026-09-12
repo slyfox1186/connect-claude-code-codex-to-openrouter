@@ -65,14 +65,27 @@ the user has to make that decision, not you.\
 """
 
 
+def _clean(value: str, limit: int) -> str:
+    """Collapse to one bounded line.
+
+    Front matter reaches the agent's system prompt verbatim, and a directory
+    named in `guide_dirs` is content this project did not write. One line,
+    bounded length, so a guide file cannot author the instructions.
+    """
+    return " ".join(str(value).split())[:limit]
+
+
 def _guide_index() -> str:
     """One line per local guide, appended to the instructions the agent reads.
 
     Generated rather than written out, so adding a file to guides/ is the whole
-    change: nothing here can drift from what is actually on disk.
+    change. It is read once at startup: MCP instructions are sent during
+    initialize and cannot change afterwards, so a guide added mid-session shows
+    up in read_guide but not here until the server restarts. That is said out
+    loud below rather than left for someone to discover.
     """
     try:
-        rows = core.list_guides()
+        rows = core.list_guides()[:core.MAX_INDEXED_GUIDES]
     except Exception:
         # A guides directory problem must never stop the server starting.
         return ""
@@ -83,10 +96,13 @@ def _guide_index() -> str:
         "",
         "This machine also carries local best-practice guides. Read the matching",
         "one with read_guide BEFORE writing or reviewing code in that area. They",
-        "are local files: free, instant, no model call.",
+        "are local files: free, instant, no model call. This list is fixed when",
+        "the server starts; read_guide with no arguments is always current.",
         "",
     ]
-    lines += [f"  {r['topic']:<14} {r['triggers']}" for r in rows]
+    lines += [
+        f"  {_clean(r['topic'], 24):<24} {_clean(r['triggers'], 110)}" for r in rows
+    ]
     return "\n".join(lines)
 
 
@@ -537,35 +553,61 @@ async def openrouter_usage() -> str:
     return json.dumps(data, indent=2)
 
 
+FULL_GUIDE_MAX_LINES = 400
+
+
+def _guide_topics() -> str:
+    """The topic list, carried on the tool description as well as the instructions.
+
+    The description travels with the tool schema, which every harness delivers;
+    whether a harness surfaces server instructions is its own choice.
+    """
+    try:
+        topics = ", ".join(r["topic"] for r in core.list_guides()[:core.MAX_INDEXED_GUIDES])
+    except Exception:
+        return ""
+    return f" Guides on this machine: {topics}." if topics else ""
+
+
 @mcp.tool(
     name="read_guide",
     title="Local best-practice guide for a topic",
     description=(
         "Read the project's local best-practice guides. These are plain files on this "
         "machine: free, instant, and no model is called. Call with no arguments for the "
-        "index, with `topic` for that guide's heading tree, with `topic` and `section` for "
-        "one section's text, or with `search` to grep every guide at once. Read the guide "
-        "for a topic BEFORE writing or reviewing code in it, whenever one exists."
+        "index, with `topic` for that guide (short guides come back whole, long ones as a "
+        "heading tree), with `topic` and `section` for one section, `full=true` to force "
+        "the whole file, or `search` to grep every guide at once. Read the guide for a "
+        "topic BEFORE writing or reviewing code in it, whenever one exists." + _guide_topics()
     ),
 )
 async def read_guide(
     topic: str | None = None,
     section: str | None = None,
     search: str | None = None,
+    full: bool = False,
 ) -> str:
     """Read a local best-practice guide.
 
     Args:
         topic: Guide name, e.g. 'python', 'bash', 'css'. Omit for the index.
-        section: A heading within that guide. Omit for the heading tree, which
-            is the cheap way to find the section worth reading.
+        section: A heading within that guide. Omit for the whole guide if it is
+            short, or its heading tree if it is long.
         search: Substring to look for across every guide. Overrides `topic`.
+        full: Return the whole file even when it is long.
     """
     if search:
-        hits = await _run(core.search_guides, query=search)
+        found = await _run(core.search_guides, query=search)
+        hits, total = found["hits"], found["total"]
         if not hits:
             return f"Nothing in the guides matches {search!r}."
-        lines = [f"{len(hits)} match(es) for {search!r}:", ""]
+        shown = (
+            f"{len(hits)} of {total} matches for {search!r} "
+            "(narrow the query, or search one topic):"
+            if found["truncated"]
+            else f"{total} match(es) for {search!r}:"
+        )
+        lines = [shown, ""]
         lines += [
             f"- **{h['topic']}** / {h['section'] or '(top)'} (line {h['line']}): {h['snippet']}"
             for h in hits
@@ -579,28 +621,36 @@ async def read_guide(
             return "No guides are installed."
         lines = ["| guide | read it when | verified |", "| --- | --- | --- |"]
         lines += [
-            f"| `{r['topic']}` | {r['triggers']} | {r['verified']} |" for r in rows
+            f"| `{r['topic']}` | {r['triggers']} | "
+            f"{r['verified'] or 'undated'}{' (stale)' if r['stale'] else ''} |"
+            for r in rows
         ]
-        lines += ["", "read_guide(topic) for its headings, then read_guide(topic, section)."]
+        lines += ["", "read_guide(topic) for a guide, read_guide(topic, section) for one part."]
         return "\n".join(lines)
 
-    if not section:
-        data = await _run(core.guide_outline, topic=topic)
-        lines = [
-            f"# {data['topic']} ({data['lines']} lines, verified {data['verified'] or 'undated'})",
-            "",
-            f"Read when: {data['triggers']}" if data["triggers"] else "",
-            "",
-            "Sections:",
-        ]
-        lines += [
-            f"{'  ' * (s['level'] - 2)}- {s['title']}" for s in data["sections"]
-        ]
-        lines += ["", "read_guide(topic, section) for one of these, or section='' for all of it."]
-        return "\n".join(lines)
+    if section:
+        data = await _run(core.read_guide, topic=topic, section=section)
+        stamp = data["verified"] or "undated"
+        return f"[{data['topic']} / {data['section']}, verified {stamp}]\n\n{data['text']}"
 
-    data = await _run(core.read_guide, topic=topic, section=section)
-    return data["text"]
+    outline = await _run(core.guide_outline, topic=topic)
+    stamp = outline["verified"] or "undated"
+    # A short guide is cheaper read whole than navigated in two round trips, and
+    # the agent should not have to know which width applies before it has looked.
+    if full or outline["lines"] <= FULL_GUIDE_MAX_LINES:
+        data = await _run(core.read_guide, topic=topic)
+        return f"[{data['topic']}, verified {stamp}]\n\n{data['text']}"
+
+    lines = [f"# {outline['topic']} ({outline['lines']} lines, verified {stamp})", ""]
+    if outline["triggers"]:
+        lines += [f"Read when: {outline['triggers']}", ""]
+    lines.append("Sections:")
+    lines += [
+        f"{'  ' * (s['level'] - 2)}- {s['title']}  ({s['lines']} lines)"
+        for s in outline["sections"]
+    ]
+    lines += ["", "read_guide(topic, section) for one of these, or full=true for all of it."]
+    return "\n".join(lines)
 
 
 def main() -> None:

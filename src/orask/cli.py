@@ -499,17 +499,21 @@ def _cmd_doctor(_args: argparse.Namespace) -> int:
 
 def _cmd_guide(args: argparse.Namespace) -> int:
     if args.search:
-        hits = core.search_guides(args.search)
-        if not hits:
+        found = core.search_guides(args.search)
+        if not found["hits"]:
             print(f"nothing matches {args.search!r}")
             return 1
-        for hit in hits:
-            print(f"{hit['topic']:<14} {hit['section'] or '(top)':<28} {hit['snippet']}")
+        for hit in found["hits"]:
+            print(f"{hit['topic']:<14} {hit['section'] or '(top)':<30} {hit['snippet']}")
+        if found["truncated"]:
+            print(f"\n{len(found['hits'])} of {found['total']} shown - narrow the query")
         return 0
 
     if args.stale:
         cutoff = (dt.date.today() - dt.timedelta(days=182)).isoformat()
-        rows = [r for r in core.list_guides() if not r["verified"] or r["verified"] < cutoff]
+        # An unparseable date counts as stale: that is the safe direction, and it
+        # also surfaces a guide whose front matter was written by hand and wrong.
+        rows = [r for r in core.list_guides() if r["stale"] or r["verified"] < cutoff]
         if not rows:
             print("every guide has been verified in the last six months")
             return 0
@@ -533,11 +537,13 @@ def _cmd_guide(args: argparse.Namespace) -> int:
 
     data = core.guide_outline(args.topic)
     print(f"{data['topic']}  ({data['lines']} lines, verified {data['verified'] or 'undated'})")
+    print(data["path"])
     if data["triggers"]:
         print(f"read when: {data['triggers']}")
     print()
     for entry in data["sections"]:
-        print(f"{'  ' * (entry['level'] - 2)}- {entry['title']}")
+        print(f"{'  ' * (entry['level'] - 2)}- {entry['title']}  ({entry['lines']} lines)")
+    print(f"\norask guide {data['topic']} <section>, or --all for the whole file")
     return 0
 
 

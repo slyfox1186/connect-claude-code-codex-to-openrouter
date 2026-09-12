@@ -28,7 +28,7 @@ install.sh                idempotent registration for both agents
 check.sh                  the gate: lint, types, shell syntax, offline tests
 pyproject.toml            ruff and mypy config (no [project] table, on purpose)
 guides/                   local best-practice cheat sheets, served by read_guide
-tests/test_core.py        247 offline checks, no network or key needed
+tests/test_core.py        266 offline checks, no network or key needed
 tests/test_mcp_stdio.py   end-to-end MCP protocol test (spends a few cents)
 ```
 
@@ -110,8 +110,11 @@ the directory at startup and appended to the server instructions, so the calling
 agent knows what exists without a tool call, and adding a file to `guides/` is
 the whole change.
 
-A long guide is served in three widths, because dropping 2,000 lines into a
-context window to answer one question costs more than it saves:
+A long guide is served in widths, because dropping 2,000 lines into a context
+window to answer one question costs more than it saves. A guide under 400 lines
+comes back whole, since two round trips cost more than the file; a longer one
+comes back as a heading tree with each section's length, so the agent can budget
+a read before making it:
 
 ```bash
 orask guide                      # the index: topic and when to read it
@@ -128,12 +131,31 @@ judgement, so the date is part of the format and `--stale` is how it gets
 audited.
 
 `guide_dirs` in the user config adds machine-local collections without putting a
-personal path in this repository.
+personal path in this repository. A directory listed there wins over the
+packaged copy of the same topic, because it is opt-in configuration; `orask
+guide <topic>` prints the winning path. A file with no front matter is indexed
+by its h1, so a directory of ordinary documents is still routable.
 
-The `topic` argument arrives from a tool call and is treated as hostile: it is
-pattern-checked before being joined to a path, and the result is resolved and
-confirmed to be inside the directory it came from, so neither `../` nor a symlink
-reaches an unrelated file.
+Front matter reaches the calling agent's system prompt, so it is collapsed to
+one bounded line per guide and the list is capped. A directory named in
+`guide_dirs` is trusted content by that route. The guide *body* is only ever a
+tool result, which is data.
+
+The index in the server instructions is built once at startup, because MCP sends
+instructions during initialize and cannot change them afterwards. A guide added
+mid-session appears in `read_guide` immediately and in the instructions after a
+restart; the instructions say so.
+
+Every path enters through one function, `_guide_map()`, which resolves each
+candidate and confirms it sits inside the directory it was found in. Listing,
+searching and reading all go through it, so a symlink planted in a guide
+directory cannot be read by any of the three. The `topic` argument is
+pattern-checked before it is joined to a path as well: the pattern stops `../`,
+the resolve-and-contain check stops the symlink, and both are needed.
+
+Headings are found with fenced code blocks excluded. A reference manual is full
+of samples whose `##` lines look like headings to a line scan, and treating one
+as real ends a section slice in the middle of an example.
 
 ## Sending files
 
