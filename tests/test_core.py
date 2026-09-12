@@ -1184,6 +1184,42 @@ _cli.STDIN_DEADLINE_S = _saved_deadline
 _cli.STDIN_MAX_BYTES = _saved_max
 
 
+# --------------------------------------------------------------------------
+# the safety overrides are not the calling agent's to set
+# --------------------------------------------------------------------------
+
+core._config_cache = cfg
+for _key in ("mcp_allow_secret_files", "mcp_allow_expensive"):
+    _allowed, _why = core.override_allowed(_key, True)
+    check(f"{_key} is refused by default", _allowed is False)
+    check(f"and {_key} says how to permit it",
+          bool(_why) and _key in (_why or ""), (_why or "")[:70])
+    core._config_cache = dict(cfg, **{_key: True})
+    _allowed, _why = core.override_allowed(_key, True)
+    check(f"{_key} is honoured once the config opts in", _allowed is True and _why is None)
+    core._config_cache = cfg
+    check(f"{_key} is silent when nothing was requested",
+          core.override_allowed(_key, False) == (False, None))
+
+# the paths a poisoned instruction would name
+for _path, _label in (
+    ("/proc/1234/environ", "a process environment"),
+    ("/proc/1234/cmdline", "a process command line"),
+    ("/home/u/.config/gcloud/application_default_credentials.json", "gcloud credentials"),
+    ("/home/u/.gitconfig", "a git config"),
+    ("/home/u/project/.git/config", "a repository git config"),
+    ("/home/u/.pgpass", "a postgres password file"),
+    ("/home/u/.config/gh/hosts.yml", "a github cli token store"),
+    ("/home/u/infra/terraform.tfvars", "terraform variables"),
+):
+    check(f"{_label} is on the denylist",
+          bool(core.denied_by_policy(Path(_path), core.DEFAULT_DENY_PATTERNS)), _path)
+
+for _path in ("/proc/cpuinfo", "/proc/meminfo", "/home/u/project/config.py"):
+    check(f"{_path} is still sendable",
+          core.denied_by_policy(Path(_path), core.DEFAULT_DENY_PATTERNS) is None)
+
+
 print()
 if FAILS:
     print(f"{len(FAILS)} of {CHECKS} checks failed: {', '.join(FAILS)}")

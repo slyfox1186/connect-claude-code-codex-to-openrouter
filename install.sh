@@ -75,7 +75,10 @@ bootstrap_conda() {
             || return 1
     fi
     say "installing the mcp SDK into it"
-    "$prefix/bin/python" -m pip install --upgrade --quiet mcp || return 1
+    # Pinned to the 2.x line: mcp.server.mcpserver is a 2.0 API, and python_ok below checks
+    # for exactly that. Unpinned, a future 3.0 would install cleanly and then fail the check
+    # that just ran.
+    "$prefix/bin/python" -m pip install --upgrade --quiet "mcp>=2,<3" || return 1
     PYTHON="$prefix/bin/python"
 }
 
@@ -84,7 +87,7 @@ bootstrap_venv() {
     local base="$1"
     say "no conda found; creating $PROJECT/.venv instead"
     "$base" -m venv "$PROJECT/.venv" || return 1
-    "$PROJECT/.venv/bin/python" -m pip install --upgrade --quiet pip mcp || return 1
+    "$PROJECT/.venv/bin/python" -m pip install --upgrade --quiet pip "mcp>=2,<3" || return 1
     PYTHON="$PROJECT/.venv/bin/python"
 }
 

@@ -45,6 +45,7 @@ __all__ = [
     "list_models",
     "load_config",
     "model_info",
+    "override_allowed",
     "read_log",
     "resolve_category",
     "resolve_model",
@@ -148,6 +149,23 @@ DEFAULT_DENY_PATTERNS = [
     "*/.credentials.json", "*/auth.json", "*/.config/openrouter/env",
     "*RAILWAY_VARS.md", "*this_pc_ssh_transer_details*",
     "*admin_login_credentials*", "*/shadow", "*/.password-store/*",
+    # Cloud and tooling credential stores. None of these is ever source code someone wants a
+    # second opinion on, and every one of them is a plausible thing to talk an agent into
+    # attaching: gcloud's application-default file is the commonest cloud credential on a
+    # development machine.
+    "*/.config/gcloud/*credentials*", "*/.azure/*", "*/.config/gh/hosts.yml",
+    "*/.pgpass", "*/.my.cnf", "*/.s3cfg", "*/.boto", "*/.htpasswd",
+    "*/.terraformrc", "*/terraform.tfvars", "*/*.auto.tfvars",
+    "*/.gem/credentials", "*/.cargo/credentials*", "*/.gradle/gradle.properties",
+    # A git remote URL routinely carries an access token inside it.
+    "*/.gitconfig", "*/.git/config",
+    # Process state, not files. /proc/<pid>/environ holds this process's own environment,
+    # which is where OPENROUTER_API_KEY lives when it is exported. Until now the only thing
+    # stopping that being attached was the binary-content heuristic noticing the NUL
+    # separators. The informational parts of /proc (cpuinfo, meminfo) are deliberately left
+    # readable, because asking a model about your own hardware is a real use.
+    "/proc/*/environ", "/proc/*/cmdline", "/proc/*/mem", "/proc/*/maps",
+    "/proc/*/fd/*", "/proc/*/task/*", "/proc/kcore", "/proc/keys", "/proc/key-users",
 ]
 
 
@@ -1335,6 +1353,30 @@ def _setting(key: str, default: int) -> int:
         return max(0, int(value))
     except (TypeError, ValueError):
         return default
+
+
+def override_allowed(key: str, requested: bool) -> tuple[bool, str | None]:
+    """Whether a caller-supplied safety override may be honoured, and why not.
+
+    The denylist and the cost guard exist because the calling agent can be talked into things.
+    An agent that can set the override in the same call it was talked into is no guard at all,
+    so for tool calls both are refused unless the config turns them on. The CLI flags are a
+    person typing them deliberately and never come through here.
+
+    Lives in core rather than in the MCP layer so it can be tested without the mcp SDK, which
+    the offline suite does not have and must not need.
+    """
+    if not requested:
+        return False, None
+    if load_config().get(key):
+        return True, None
+    return False, (
+        f"`{key.removeprefix('mcp_')}` was requested but is not honoured for tool calls. Set "
+        f'"{key}": true in {USER_CONFIG} to permit it, or run the orask CLI with the matching '
+        "flag. This is deliberate: an agent that can be talked into asking for a secret, or "
+        "for an expensive call, can be talked into passing the override alongside it in the "
+        "same call."
+    )
 
 
 def _float_setting(key: str, default: float) -> float:

@@ -55,7 +55,13 @@ always its own argument:
      "role": "architect"}
 
 Never wrap a value in XML tags, and never fold the question into `context`.
-A long `context` is fine and expected; length is not what breaks a call.\
+A long `context` is fine and expected; length is not what breaks a call.
+
+Two safety overrides exist but are off for tool calls: `allow_secret_files`
+(send a file matching the credential denylist) and `allow_expensive` (bypass
+the per-call cost guard). Passing either is refused with a note unless the
+user has turned it on in their config. Relay that note rather than retrying:
+the user has to make that decision, not you.\
 """
 
 mcp = MCPServer(
@@ -151,9 +157,15 @@ def _question(tool: str, question: str | None, context: str | None, files: Any):
     return question, context, core.as_list(files) or None, note
 
 
-def _note(text: str, note: str | None) -> str:
-    """Put a recovered-shape warning above the answer, where it will be read."""
-    return f"> note: {note}\n\n{text}" if note else text
+def _note(text: str, *notes: str | None) -> str:
+    """Put warnings above the answer, where they will be read."""
+    lines = [f"> note: {note}" for note in notes if note]
+    return "\n".join(lines) + "\n\n" + text if lines else text
+
+
+# The policy itself lives in core.override_allowed, so the offline suite can test it without
+# needing the mcp SDK. This layer only decides which keys the tool arguments map onto.
+_gate = core.override_allowed
 
 
 async def _run(func, /, **kwargs):
@@ -249,12 +261,17 @@ async def ask_llm(
             right for a text PDF), 'mistral-ocr' (reads scans, billed per
             1,000 pages) or 'native' (only for models that take files directly).
         show_reasoning: Also return the model's reasoning trace.
-        allow_expensive: Bypass the per-call cost guard for a large prompt.
-        allow_secret_files: Permit a file that matches the secrets denylist
-            (ssh keys, .env, credentials). Leave false unless the user has
-            explicitly asked for that specific file to be sent.
+        allow_expensive: Ask to bypass the per-call cost guard for a large
+            prompt. Refused unless mcp_allow_expensive is true in the config,
+            and the answer says so.
+        allow_secret_files: Ask to send a file that matches the secrets denylist
+            (ssh keys, .env, credentials). Refused unless mcp_allow_secret_files
+            is true in the config, and the answer says so. Leave false unless
+            the user has explicitly asked for that specific file to be sent.
     """
     question, context, files, shape_note = _question("ask_llm", question, context, files)
+    allow_expensive, expensive_note = _gate("mcp_allow_expensive", allow_expensive)
+    allow_secret_files, secret_note = _gate("mcp_allow_secret_files", allow_secret_files)
     result = await _run(
         core.ask,
         question=question, model=model, category=category, context=context, files=files,
@@ -262,7 +279,7 @@ async def ask_llm(
         thread=thread, cwd=cwd, pdf_engine=pdf_engine, allow_expensive=allow_expensive,
         allow_secret_files=allow_secret_files, include_reasoning=show_reasoning,
     )
-    return _note(_render(result, show_reasoning), shape_note)
+    return _note(_render(result, show_reasoning), shape_note, expensive_note, secret_note)
 
 
 @mcp.tool(
@@ -323,12 +340,15 @@ async def ask_panel(
         pdf_engine: How an attached PDF is read: 'cloudflare-ai' (default, free),
             'mistral-ocr' (reads scans, billed per 1,000 pages) or 'native'.
         show_reasoning: Also return each model's reasoning trace.
-        allow_expensive: Bypass the per-call cost guard.
-        allow_secret_files: Permit a file that matches the secrets denylist
-            (ssh keys, .env, credentials). Leave false unless the user has
-            explicitly asked for that specific file to be sent.
+        allow_expensive: Ask to bypass the per-call cost guard. Refused unless
+            mcp_allow_expensive is true in the config.
+        allow_secret_files: Ask to send a file that matches the secrets denylist.
+            Refused unless mcp_allow_secret_files is true in the config. Leave
+            false unless the user has explicitly asked for that file.
     """
     question, context, files, shape_note = _question("ask_panel", question, context, files)
+    allow_expensive, expensive_note = _gate("mcp_allow_expensive", allow_expensive)
+    allow_secret_files, secret_note = _gate("mcp_allow_secret_files", allow_secret_files)
     results = await _run(
         core.ask_panel,
         question=question, models=models, category=category, context=context, files=files,
@@ -351,7 +371,7 @@ async def ask_panel(
             "\n\nCompare the answers above before acting: where they agree you have "
             "corroboration, where they disagree say so rather than silently picking one."
         )
-    return _note(body + footer, shape_note)
+    return _note(body + footer, shape_note, expensive_note, secret_note)
 
 
 @mcp.tool(
