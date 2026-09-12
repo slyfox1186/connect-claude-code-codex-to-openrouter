@@ -2,21 +2,39 @@
 
 No network, no API key needed:
     python tests/test_core.py        (any interpreter; no mcp package needed)
+
+"Offline" is enforced here rather than merely intended: every runtime path is redirected to a
+scratch directory before core is imported, and the HTTP layer is replaced with one that raises.
+A test that reaches the network is a bug in the test, and it fails loudly instead of billing a
+real model call.
 """
 
 import json
+import os
 import sys
 import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+# core reads these into module-level constants at import time, so they have to be set first.
+# Without this a run reads the real API key and appends fabricated entries to the real call
+# log, which then feeds `orask log` and `orask usage`.
+SCRATCH = Path(tempfile.mkdtemp(prefix="orask-tests-"))
+os.environ["ORASK_CONFIG_DIR"] = str(SCRATCH / "config")
+os.environ["ORASK_STATE_DIR"] = str(SCRATCH / "state")
+os.environ["ORASK_CACHE_DIR"] = str(SCRATCH / "cache")
+os.environ.pop("OPENROUTER_API_KEY", None)
+
 from orask import core  # noqa: E402
 
 FAILS = []
+CHECKS = 0
 
 
 def check(label, ok, detail=""):
+    global CHECKS
+    CHECKS += 1
     print(f"[{'PASS' if ok else 'FAIL'}] {label}" + (f" - {detail}" if detail else ""))
     if not ok:
         FAILS.append(label)
@@ -71,6 +89,16 @@ FAKE = [
 core._catalog_cache = FAKE
 core.get_catalog = lambda refresh=False, allow_stale=True: FAKE  # type: ignore[assignment]
 core._config_cache = None
+
+
+def _no_network(method, path, payload=None, timeout=60.0, retries=3):
+    raise AssertionError(
+        f"a test reached the HTTP layer: {method} {path}. That is a billable call, so it is an "
+        "error in the test rather than something to tolerate."
+    )
+
+
+core._request = _no_network  # type: ignore[assignment]
 cfg = core.load_config()
 
 # ---- alias + slug resolution ----------------------------------------------
@@ -239,8 +267,6 @@ with tempfile.TemporaryDirectory() as tmp:
     core._config_cache = cfg
 
 # ---- file safety and the secrets denylist ---------------------------------
-import os as _os  # noqa: E402
-
 with tempfile.TemporaryDirectory() as tmp:
     root = Path(tmp)
     (root / ".ssh").mkdir()
@@ -283,7 +309,7 @@ with tempfile.TemporaryDirectory() as tmp:
     core._config_cache = cfg
 
     fifo = root / "pipe"
-    _os.mkfifo(fifo)
+    os.mkfifo(fifo)
     _, notes = core.build_messages("q", files=[str(fifo)])
     check(
         "a FIFO is skipped instead of hanging the bridge",
@@ -323,7 +349,7 @@ with tempfile.TemporaryDirectory() as tmp:
     empty_key = Path(tmp) / "env"
     empty_key.write_text("OPENROUTER_API_KEY=\n")
     saved_env_file, core.ENV_FILE = core.ENV_FILE, empty_key
-    saved_env = _os.environ.pop("OPENROUTER_API_KEY", None)
+    saved_env = os.environ.pop("OPENROUTER_API_KEY", None)
     try:
         core.get_api_key()
         check("an empty key value reads as no key", False)
@@ -332,7 +358,7 @@ with tempfile.TemporaryDirectory() as tmp:
     finally:
         core.ENV_FILE = saved_env_file
         if saved_env is not None:
-            _os.environ["OPENROUTER_API_KEY"] = saved_env
+            os.environ["OPENROUTER_API_KEY"] = saved_env
 
 # ---- retry policy: a POST must not be retried into a double bill ----------
 check("POST retries exclude 5xx", core.RETRY_STATUS_POST == {408, 429})
@@ -480,14 +506,20 @@ check(
 )
 
 # ---- cost guard policy on unknown pricing --------------------------------
+# The model has to be genuinely unpriced for this branch to exist, which means absent from the
+# catalogue. mistral-large IS priced in FAKE, so the earlier version of this check sailed past
+# the guard, sent a real billed POST, and then asserted on a refusal that could never happen.
+_saved_catalog = core.get_catalog
+core.get_catalog = lambda refresh=False, allow_stale=True: []  # type: ignore[assignment]
 core._config_cache = dict(cfg, cost_guard_on_unknown_pricing="block")
 try:
-    core.ask("q", model="mistralai/mistral-large-2512")
-    check("block policy is wired (unpriced model)", True, "model was priced, skipped")
+    core.ask("q", model="unpriced/model-x")
+    check("block policy refuses a model with no catalogue pricing", False, "no error raised")
 except core.OpenRouterError as exc:
-    check("block policy produces a clear refusal",
-          "cannot be checked" in str(exc) or "network" in str(exc).lower(), str(exc)[:70])
+    check("block policy refuses a model with no catalogue pricing",
+          "cannot be checked" in str(exc), str(exc)[:80])
 core._config_cache = cfg
+core.get_catalog = _saved_catalog
 
 # ---- stdin must never hang the CLI (regression: fd 0 as an open socket) ----
 import socket as _socket  # noqa: E402
@@ -501,7 +533,7 @@ _parent, _child = _socket.socketpair()
 try:
     proc = _sp.run(
         [_LAUNCHER, "--version"], stdin=_child,
-        capture_output=True, text=True, timeout=25,
+        capture_output=True, text=True, timeout=25, check=False,
     )
     check("an open socket on stdin does not hang the CLI", proc.returncode == 0,
           proc.stdout.strip() or proc.stderr.strip()[:80])
@@ -515,8 +547,9 @@ _parent, _child = _socket.socketpair()
 try:
     _parent.sendall(b"context from a socket that stays open")
     proc = _sp.run(
-        [_LAUNCHER, "models", "--search", "kimi-k3", "--limit", "1"],
-        stdin=_child, capture_output=True, text=True, timeout=30,
+        # `categories` reads the packaged config and nothing else: no key, no network.
+        [_LAUNCHER, "categories"],
+        stdin=_child, capture_output=True, text=True, timeout=30, check=False,
     )
     check("a socket that never closes still returns", proc.returncode == 0,
           proc.stderr.strip()[:80] or "ok")
@@ -527,15 +560,16 @@ finally:
 
 # the ergonomic path must keep working: a real pipe is drained in full
 proc = _sp.run(
-    [_LAUNCHER, "--version"], input="piped text", capture_output=True, text=True, timeout=25,
+    [_LAUNCHER, "--version"], input="piped text", capture_output=True, text=True,
+    timeout=25, check=False,
 )
 check("a normal pipe on stdin still works", proc.returncode == 0, proc.stdout.strip())
 
 # and /dev/null (a character device) is simply empty
-with open(_os.devnull) as _devnull:
+with open(os.devnull) as _devnull:
     proc = _sp.run(
         [_LAUNCHER, "--version"], stdin=_devnull,
-        capture_output=True, text=True, timeout=25,
+        capture_output=True, text=True, timeout=25, check=False,
     )
     check("/dev/null on stdin is treated as empty", proc.returncode == 0)
 
@@ -902,11 +936,7 @@ check("a plain error still reports its status and message",
 
 
 print()
-print("summary:", len(FAILS), "failures")
 if FAILS:
+    print(f"{len(FAILS)} of {CHECKS} checks failed: {', '.join(FAILS)}")
     sys.exit(1)
-
-if FAILS:
-    print(f"{len(FAILS)} failed: {', '.join(FAILS)}")
-    sys.exit(1)
-print("all offline checks passed")
+print(f"all {CHECKS} offline checks passed")
