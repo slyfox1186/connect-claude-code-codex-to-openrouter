@@ -362,11 +362,14 @@ cat <<'DONE'
 
 Then just ask, in either agent:
   "ask Kimi what it thinks about this"
-  "get GLM's take on this approach"
-  "ask both Kimi and GLM whether this plan is sound"
+  "get Grok's take on this approach"
+  "ask them all whether this plan is sound"
+  "use the coding LLMs to review this file"
 
 Or from any shell:
   orask "why would this hang on shutdown?" -m glm -f server.py
   orask panel "is this migration plan safe?" -c "$(cat PLAN.md)"
+  orask panel "is this design sound?" -C coding
+  orask guide python            # local best-practice cheat sheets
   orask models --search grok
 DONE
