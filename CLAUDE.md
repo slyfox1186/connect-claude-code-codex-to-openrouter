@@ -161,6 +161,26 @@ the `@mcp.tool` in `mcp_server.py`, the `TOOLS` list inside the Codex block of `
 table in `README.md`. The `INSTRUCTIONS` string in `mcp_server.py` is what the calling agent
 reads before choosing a tool, so behaviour changes belong there too.
 
+## Guides
+
+`guides/*.md` are local best-practice cheat sheets served by the `read_guide`
+tool and `orask guide`. They are plain files: no model call, nothing billed.
+
+Front matter (`topic`, `triggers`, `verified`) is the contract. `triggers` is
+what the agent matches against to decide whether to open one, and it is what
+`_guide_index()` puts into the server instructions at startup, so adding a file
+to `guides/` is the entire change - there is no list to update. `verified` is a
+date because a stale guide overrides the model's own judgement with wrong
+advice; `orask guide --stale` audits it.
+
+The `topic` argument comes from a tool call, so `_guide_path()` pattern-checks
+the name before joining it and confirms the resolved file is inside the
+directory it came from. Both halves are needed: the pattern stops `../`, the
+resolve-and-contain check stops a symlink planted in a guide directory.
+
+Guides are served as index, outline, or one section. Returning a 2,000-line file
+whole costs more context than it saves, which is why `guide_outline()` exists.
+
 ## Documentation
 
 `README.md` is the public technical doc and is committed. `JEFF_START_HERE.md` is Jeff's plain

@@ -31,7 +31,7 @@ PROOF_PDF_B64 = (
 
 EXPECTED_TOOLS = {
     "ask_llm", "ask_panel", "list_llm_models", "llm_model_info", "openrouter_usage",
-    "list_llm_categories",
+    "list_llm_categories", "read_guide",
 }
 
 

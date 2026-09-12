@@ -41,14 +41,19 @@ __all__ = [
     "expand_paths",
     "get_api_key",
     "get_catalog",
+    "guide_dirs",
+    "guide_outline",
     "list_categories",
+    "list_guides",
     "list_models",
     "load_config",
     "model_info",
     "override_allowed",
+    "read_guide",
     "read_log",
     "resolve_category",
     "resolve_model",
+    "search_guides",
     "sent_attachments",
     "split_embedded_question",
     "strip_call_syntax",
@@ -2526,3 +2531,210 @@ def account_usage() -> dict[str, Any]:
         ),
         "log_file": str(CALL_LOG),
     }
+
+
+# --------------------------------------------------------------------------
+# Guides: local best-practice cheat sheets the calling agent can pull in
+# --------------------------------------------------------------------------
+# These are plain markdown files, read from disk and returned verbatim. No model
+# is called and nothing is billed. They are served in three widths - index,
+# outline, section - because a useful guide is often far too long to hand an
+# agent whole, and dropping 2,000 lines into a context window to answer one
+# question costs more than it saves.
+
+GUIDES_DIR = PROJECT_ROOT / "guides"
+MAX_GUIDE_BYTES = 512 * 1024
+_GUIDE_TOPIC = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+_GUIDE_HEADING = re.compile(r"^(#{2,4})\s+(.+?)\s*$")
+
+
+def guide_dirs() -> list[Path]:
+    """The packaged guides, then any extra directories from config.
+
+    `guide_dirs` in the user config adds machine-local collections without
+    baking a personal path into a public repository.
+    """
+    dirs = [GUIDES_DIR]
+    for extra in as_list(load_config().get("guide_dirs")):
+        path = Path(str(extra)).expanduser()
+        if path.is_dir() and path not in dirs:
+            dirs.append(path)
+    return dirs
+
+
+def _guide_front_matter(text: str) -> dict[str, str]:
+    """Parse the leading `---` block. Not YAML: one `key: value` per line."""
+    if not text.startswith("---"):
+        return {}
+    end = text.find("\n---", 3)
+    if end < 0:
+        return {}
+    meta: dict[str, str] = {}
+    for line in text[3:end].splitlines():
+        key, sep, value = line.partition(":")
+        if sep and key.strip():
+            meta[key.strip()] = value.strip()
+    return meta
+
+
+def _guide_body(text: str) -> str:
+    """The markdown after the front matter block."""
+    if text.startswith("---"):
+        end = text.find("\n---", 3)
+        if end >= 0:
+            rest = text[end + 4 :]
+            return rest.lstrip("-").lstrip("\n")
+    return text
+
+
+def _guide_path(topic: str) -> Path | None:
+    """Resolve a topic name to a file, refusing anything that escapes the dirs.
+
+    `topic` arrives from a tool call, so it is treated as hostile: the name is
+    pattern-checked before it is joined, and the result is resolved and checked
+    against the directory it came from, so neither `../` nor a symlink inside a
+    guide directory can read an unrelated file.
+    """
+    name = (topic or "").strip().lower().removesuffix(".md")
+    if not _GUIDE_TOPIC.match(name):
+        return None
+    for directory in guide_dirs():
+        root = directory.resolve()
+        candidate = (root / f"{name}.md").resolve()
+        if candidate.is_file() and candidate.is_relative_to(root):
+            return candidate
+    return None
+
+
+def _guide_text(path: Path) -> str:
+    with path.open("rb") as handle:
+        raw = handle.read(MAX_GUIDE_BYTES + 1)
+    text = raw[:MAX_GUIDE_BYTES].decode("utf-8", "replace")
+    if len(raw) > MAX_GUIDE_BYTES:
+        text += f"\n\n[truncated at {MAX_GUIDE_BYTES // 1024} KB]\n"
+    return text
+
+
+def list_guides() -> list[dict]:
+    """Every readable guide, with the front matter that says when to open it."""
+    rows: dict[str, dict] = {}
+    for directory in guide_dirs():
+        for path in sorted(directory.glob("*.md")):
+            topic = path.stem.lower()
+            if topic in rows or not _GUIDE_TOPIC.match(topic):
+                continue
+            try:
+                meta = _guide_front_matter(_guide_text(path))
+            except OSError:
+                continue
+            rows[topic] = {
+                "topic": meta.get("topic", topic),
+                "triggers": meta.get("triggers", ""),
+                "verified": meta.get("verified", ""),
+                "path": str(path),
+            }
+    return [rows[key] for key in sorted(rows)]
+
+
+def guide_outline(topic: str) -> dict:
+    """Front matter plus the heading tree, so a long guide can be navigated cheaply."""
+    path = _guide_path(topic)
+    if path is None:
+        known = ", ".join(row["topic"] for row in list_guides()) or "none"
+        raise OpenRouterError(f"No guide named {topic!r}. Available guides: {known}")
+    text = _guide_text(path)
+    meta = _guide_front_matter(text)
+    sections = []
+    for line in _guide_body(text).splitlines():
+        match = _GUIDE_HEADING.match(line)
+        if match:
+            sections.append({"level": len(match.group(1)), "title": match.group(2)})
+    return {
+        "topic": meta.get("topic", path.stem),
+        "triggers": meta.get("triggers", ""),
+        "verified": meta.get("verified", ""),
+        "path": str(path),
+        "lines": text.count("\n") + 1,
+        "sections": sections,
+    }
+
+
+def read_guide(topic: str, section: str | None = None) -> dict:
+    """A whole guide, or one section of it.
+
+    `section` matches a heading case-insensitively, exactly first and then by
+    substring, and returns that heading down to the next one at the same or a
+    higher level.
+    """
+    path = _guide_path(topic)
+    if path is None:
+        known = ", ".join(row["topic"] for row in list_guides()) or "none"
+        raise OpenRouterError(f"No guide named {topic!r}. Available guides: {known}")
+    text = _guide_text(path)
+    meta = _guide_front_matter(text)
+    body = _guide_body(text)
+    result = {
+        "topic": meta.get("topic", path.stem),
+        "verified": meta.get("verified", ""),
+        "path": str(path),
+        "section": None,
+        "text": body,
+    }
+    if not section:
+        return result
+
+    lines = body.splitlines()
+    wanted = section.strip().lower()
+    starts = [(i, m) for i, line in enumerate(lines) if (m := _GUIDE_HEADING.match(line))]
+    hit = next((p for p in starts if p[1].group(2).strip().lower() == wanted), None)
+    if hit is None:
+        hit = next((p for p in starts if wanted in p[1].group(2).lower()), None)
+    if hit is None:
+        titles = ", ".join(m.group(2) for _, m in starts) or "none"
+        raise OpenRouterError(
+            f"No section matching {section!r} in guide {result['topic']!r}. Sections: {titles}"
+        )
+    start, match = hit
+    level = len(match.group(1))
+    end = len(lines)
+    for index, other in starts:
+        if index > start and len(other.group(1)) <= level:
+            end = index
+            break
+    result["section"] = match.group(2)
+    result["text"] = "\n".join(lines[start:end]).rstrip()
+    return result
+
+
+def search_guides(query: str, limit: int = 20) -> list[dict]:
+    """Case-insensitive substring search across every guide.
+
+    Each hit names the section it sits in, so the caller can follow up with
+    `read_guide(topic, section)` instead of pulling the whole file.
+    """
+    needle = (query or "").strip().lower()
+    if not needle:
+        raise OpenRouterError("Search needs something to look for.")
+    hits: list[dict] = []
+    for row in list_guides():
+        path = Path(row["path"])
+        try:
+            body = _guide_body(_guide_text(path))
+        except OSError:
+            continue
+        heading = ""
+        for number, line in enumerate(body.splitlines(), 1):
+            match = _GUIDE_HEADING.match(line)
+            if match:
+                heading = match.group(2)
+                continue
+            if needle in line.lower():
+                hits.append({
+                    "topic": row["topic"],
+                    "section": heading,
+                    "line": number,
+                    "snippet": line.strip()[:200],
+                })
+                if len(hits) >= limit:
+                    return hits
+    return hits

@@ -64,6 +64,34 @@ user has turned it on in their config. Relay that note rather than retrying:
 the user has to make that decision, not you.\
 """
 
+
+def _guide_index() -> str:
+    """One line per local guide, appended to the instructions the agent reads.
+
+    Generated rather than written out, so adding a file to guides/ is the whole
+    change: nothing here can drift from what is actually on disk.
+    """
+    try:
+        rows = core.list_guides()
+    except Exception:
+        # A guides directory problem must never stop the server starting.
+        return ""
+    if not rows:
+        return ""
+    lines = [
+        "",
+        "",
+        "This machine also carries local best-practice guides. Read the matching",
+        "one with read_guide BEFORE writing or reviewing code in that area. They",
+        "are local files: free, instant, no model call.",
+        "",
+    ]
+    lines += [f"  {r['topic']:<14} {r['triggers']}" for r in rows]
+    return "\n".join(lines)
+
+
+INSTRUCTIONS += _guide_index()
+
 mcp = MCPServer(
     name="openrouter",
     title="OpenRouter second opinion",
@@ -507,6 +535,72 @@ async def openrouter_usage() -> str:
     """Account usage and bridge spend."""
     data = await _run(core.account_usage)
     return json.dumps(data, indent=2)
+
+
+@mcp.tool(
+    name="read_guide",
+    title="Local best-practice guide for a topic",
+    description=(
+        "Read the project's local best-practice guides. These are plain files on this "
+        "machine: free, instant, and no model is called. Call with no arguments for the "
+        "index, with `topic` for that guide's heading tree, with `topic` and `section` for "
+        "one section's text, or with `search` to grep every guide at once. Read the guide "
+        "for a topic BEFORE writing or reviewing code in it, whenever one exists."
+    ),
+)
+async def read_guide(
+    topic: str | None = None,
+    section: str | None = None,
+    search: str | None = None,
+) -> str:
+    """Read a local best-practice guide.
+
+    Args:
+        topic: Guide name, e.g. 'python', 'bash', 'css'. Omit for the index.
+        section: A heading within that guide. Omit for the heading tree, which
+            is the cheap way to find the section worth reading.
+        search: Substring to look for across every guide. Overrides `topic`.
+    """
+    if search:
+        hits = await _run(core.search_guides, query=search)
+        if not hits:
+            return f"Nothing in the guides matches {search!r}."
+        lines = [f"{len(hits)} match(es) for {search!r}:", ""]
+        lines += [
+            f"- **{h['topic']}** / {h['section'] or '(top)'} (line {h['line']}): {h['snippet']}"
+            for h in hits
+        ]
+        lines += ["", "Read one with read_guide(topic, section)."]
+        return "\n".join(lines)
+
+    if not topic:
+        rows = await _run(core.list_guides)
+        if not rows:
+            return "No guides are installed."
+        lines = ["| guide | read it when | verified |", "| --- | --- | --- |"]
+        lines += [
+            f"| `{r['topic']}` | {r['triggers']} | {r['verified']} |" for r in rows
+        ]
+        lines += ["", "read_guide(topic) for its headings, then read_guide(topic, section)."]
+        return "\n".join(lines)
+
+    if not section:
+        data = await _run(core.guide_outline, topic=topic)
+        lines = [
+            f"# {data['topic']} ({data['lines']} lines, verified {data['verified'] or 'undated'})",
+            "",
+            f"Read when: {data['triggers']}" if data["triggers"] else "",
+            "",
+            "Sections:",
+        ]
+        lines += [
+            f"{'  ' * (s['level'] - 2)}- {s['title']}" for s in data["sections"]
+        ]
+        lines += ["", "read_guide(topic, section) for one of these, or section='' for all of it."]
+        return "\n".join(lines)
+
+    data = await _run(core.read_guide, topic=topic, section=section)
+    return data["text"]
 
 
 def main() -> None:

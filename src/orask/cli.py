@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import json
 import os
 import select
@@ -23,7 +24,7 @@ from typing import Any
 from . import __version__, core
 
 SUBCOMMANDS = {"ask", "panel", "models", "info", "usage", "threads", "log", "doctor",
-               "categories"}
+               "categories", "guide"}
 
 
 def _fmt_money(value: Any) -> str:
@@ -216,6 +217,14 @@ def build_parser() -> argparse.ArgumentParser:
     cats.add_argument("--verify", action="store_true",
                       help="check each pinned model against the live catalogue")
     cats.add_argument("--json", action="store_true")
+
+    guide = subs.add_parser("guide", help="local best-practice guides (free, no model call)")
+    guide.add_argument("topic", nargs="?", help="guide name; omit for the index")
+    guide.add_argument("section", nargs="?", help="one heading within that guide")
+    guide.add_argument("--search", metavar="TEXT", help="search across every guide")
+    guide.add_argument("--all", action="store_true", help="print the whole guide")
+    guide.add_argument("--stale", action="store_true",
+                       help="list guides whose verified date is over six months old")
 
     subs.add_parser("doctor", help="check key, catalogue, aliases and registrations")
     return parser
@@ -488,10 +497,54 @@ def _cmd_doctor(_args: argparse.Namespace) -> int:
     return 0 if ok else 1
 
 
+def _cmd_guide(args: argparse.Namespace) -> int:
+    if args.search:
+        hits = core.search_guides(args.search)
+        if not hits:
+            print(f"nothing matches {args.search!r}")
+            return 1
+        for hit in hits:
+            print(f"{hit['topic']:<14} {hit['section'] or '(top)':<28} {hit['snippet']}")
+        return 0
+
+    if args.stale:
+        cutoff = (dt.date.today() - dt.timedelta(days=182)).isoformat()
+        rows = [r for r in core.list_guides() if not r["verified"] or r["verified"] < cutoff]
+        if not rows:
+            print("every guide has been verified in the last six months")
+            return 0
+        for row in rows:
+            print(f"{row['topic']:<14} verified {row['verified'] or 'never'}")
+        return 1
+
+    if not args.topic:
+        rows = core.list_guides()
+        if not rows:
+            print("no guides installed")
+            return 1
+        width = max(len(r["topic"]) for r in rows)
+        for row in rows:
+            print(f"{row['topic']:<{width}}  {row['triggers']}")
+        return 0
+
+    if args.section or args.all:
+        print(core.read_guide(args.topic, section=args.section)["text"])
+        return 0
+
+    data = core.guide_outline(args.topic)
+    print(f"{data['topic']}  ({data['lines']} lines, verified {data['verified'] or 'undated'})")
+    if data["triggers"]:
+        print(f"read when: {data['triggers']}")
+    print()
+    for entry in data["sections"]:
+        print(f"{'  ' * (entry['level'] - 2)}- {entry['title']}")
+    return 0
+
+
 HANDLERS = {
     "ask": _cmd_ask, "panel": _cmd_panel, "models": _cmd_models, "info": _cmd_info,
     "usage": _cmd_usage, "threads": _cmd_threads, "log": _cmd_log, "doctor": _cmd_doctor,
-    "categories": _cmd_categories,
+    "categories": _cmd_categories, "guide": _cmd_guide,
 }
 
 

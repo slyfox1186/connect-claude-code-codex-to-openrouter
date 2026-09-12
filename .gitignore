@@ -129,3 +129,7 @@ scratchpad/
 
 # Local only: personal setup notes, never published.
 JEFF_START_HERE.md
+
+# Raw source material for the cheat sheets in guides/. Local only: large,
+# machine-specific, and not this project's to publish.
+docs/

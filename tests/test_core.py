@@ -1259,6 +1259,57 @@ with tempfile.TemporaryDirectory() as tmp:
     core._config_cache = cfg
 
 
+# ---- guides are local files, and the topic name is not to be trusted ------
+_guides = core.list_guides()
+check("the packaged guides are found", len(_guides) >= 4,
+      ", ".join(g["topic"] for g in _guides))
+check("every guide declares when to read it and when it was verified",
+      all(g["triggers"] and g["verified"] for g in _guides),
+      ", ".join(g["topic"] for g in _guides if not (g["triggers"] and g["verified"])))
+
+_outline = core.guide_outline("bash")
+check("an outline lists headings without returning the body",
+      len(_outline["sections"]) > 3 and "sections" in _outline,
+      f"{len(_outline['sections'])} sections")
+
+_whole = core.read_guide("bash")["text"]
+_part = core.read_guide("bash", section="Quoting")
+check("a section read returns that heading only",
+      _part["text"].startswith("## Quoting") and len(_part["text"]) < len(_whole),
+      f"{len(_part['text'])} of {len(_whole)} chars")
+check("a section match is case-insensitive and partial",
+      core.read_guide("bash", section="quot")["section"] == "Quoting")
+
+# The topic comes from a tool argument, so it is hostile input.
+for _bad in ("../../../etc/passwd", "/etc/passwd", "../README", "..", "a/b"):
+    check(f"a guide path cannot escape the guides directory ({_bad})",
+          core._guide_path(_bad) is None)
+try:
+    core.read_guide("no-such-guide")
+    check("an unknown guide is refused with the list of real ones", False)
+except core.OpenRouterError as _exc:
+    check("an unknown guide is refused with the list of real ones",
+          "Available guides" in str(_exc), str(_exc)[:80])
+try:
+    core.read_guide("bash", section="no-such-section")
+    check("an unknown section names the real sections", False)
+except core.OpenRouterError as _exc:
+    check("an unknown section names the real sections", "Sections:" in str(_exc),
+          str(_exc)[:80])
+
+check("search finds a rule and names the section holding it",
+      any(h["topic"] == "bash" and h["section"] for h in core.search_guides("pipefail")),
+      str(core.search_guides("pipefail")[:1])[:100])
+
+# Front matter must never be handed to the model as if it were content.
+check("front matter is stripped from the returned text",
+      not _whole.lstrip().startswith("---"), _whole[:40])
+
+# The guides are the one place a doc claim is machine-checkable, so pin it.
+check("a config-supplied guide directory is ignored when it does not exist",
+      core.GUIDES_DIR in core.guide_dirs())
+
+
 print()
 if FAILS:
     print(f"{len(FAILS)} of {CHECKS} checks failed: {', '.join(FAILS)}")

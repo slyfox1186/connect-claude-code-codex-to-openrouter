@@ -261,7 +261,7 @@ import json, os, sys, tempfile
 path, command, interpreter = sys.argv[1], sys.argv[2], sys.argv[3]
 HEADER = "[mcp_servers.openrouter]"
 TOOLS = ["ask_llm", "ask_panel", "list_llm_models", "list_llm_categories",
-         "llm_model_info", "openrouter_usage"]
+         "llm_model_info", "openrouter_usage", "read_guide"]
 block = f"""{HEADER}
 command = {json.dumps(command)}
 args = []

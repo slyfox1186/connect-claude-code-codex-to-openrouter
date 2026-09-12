@@ -7,7 +7,7 @@ Lets an AI coding agent consult other frontier models mid-task:
 Two front-ends over one engine:
 
 - **MCP server** (`bin/openrouter-mcp`), registered with Claude Code and Codex,
-  exposing six tools so the agent can consult another model on its own.
+  exposing seven tools so the agent can consult another model on its own.
 - **CLI** (`bin/orask`), the same engine from any shell, and the fallback if the
   MCP layer ever breaks.
 
@@ -27,7 +27,8 @@ bin/openrouter-mcp        MCP stdio launcher
 install.sh                idempotent registration for both agents
 check.sh                  the gate: lint, types, shell syntax, offline tests
 pyproject.toml            ruff and mypy config (no [project] table, on purpose)
-tests/test_core.py        232 offline checks, no network or key needed
+guides/                   local best-practice cheat sheets, served by read_guide
+tests/test_core.py        247 offline checks, no network or key needed
 tests/test_mcp_stdio.py   end-to-end MCP protocol test (spends a few cents)
 ```
 
@@ -82,6 +83,7 @@ macOS box. Three environment variables steer it if needed:
 | `list_llm_models` | Search the live catalogue for slugs, prices, context, reasoning efforts. |
 | `llm_model_info` | Full detail for one model. |
 | `openrouter_usage` | Account spend plus what this bridge has cost. |
+| `read_guide` | Local best-practice guides. Free, no model call. |
 
 Only `question` is required; everything else has a working default. Arguments are
 flat JSON, one plain string per argument:
@@ -95,6 +97,43 @@ flat JSON, one plain string per argument:
 
 The question is always its own argument. It does not go inside `context`, and no
 value is ever wrapped in XML tags.
+
+## Guides
+
+`guides/` holds best-practice cheat sheets as plain markdown, one per topic.
+They are local files: `read_guide` opens one, no model is called and nothing is
+billed.
+
+The point is that an agent should read the house rules for a language *before*
+writing it, rather than being corrected afterwards. The index is generated from
+the directory at startup and appended to the server instructions, so the calling
+agent knows what exists without a tool call, and adding a file to `guides/` is
+the whole change.
+
+A long guide is served in three widths, because dropping 2,000 lines into a
+context window to answer one question costs more than it saves:
+
+```bash
+orask guide                      # the index: topic and when to read it
+orask guide python               # heading tree only
+orask guide python Subprocess    # one section
+orask guide python --all         # the whole file
+orask guide --search flock       # every guide at once, with the section named
+orask guide --stale              # anything not verified in six months
+```
+
+Each file carries front matter with `topic`, `triggers` and `verified`. A guide
+with wrong advice is worse than no guide, because it overrides the model's own
+judgement, so the date is part of the format and `--stale` is how it gets
+audited.
+
+`guide_dirs` in the user config adds machine-local collections without putting a
+personal path in this repository.
+
+The `topic` argument arrives from a tool call and is treated as hostile: it is
+pattern-checked before being joined to a path, and the result is resolved and
+confirmed to be inside the directory it came from, so neither `../` nor a symlink
+reaches an unrelated file.
 
 ## Sending files
 
