@@ -45,7 +45,10 @@
     "gemini": "google/gemini-3.8-flash"
   },
   "allowed_models": [],
-  "default_max_tokens": 32000,
+  "_default_max_tokens": "null sends no output cap, so each model and provider applies its own output limit. OpenRouter bills the tokens generated, not the cap, so a cap saves nothing on an answer that finishes and cuts off one that needs more room, which is still billed. A number here sends that cap on every call, including tool calls from Claude Code and Codex.",
+  "default_max_tokens": null,
+  "_cost_guard_output_tokens": "With no cap sent, the per-call cost guard assumes this many output tokens when it estimates a call. It is never sent to the provider. The largest answer in the call log on 2026-09-13 was 27,113 tokens.",
+  "cost_guard_output_tokens": 32000,
   "_max_context_tokens": "0 uses whatever window each model publishes. A number budgets prompt plus answer into that many tokens instead; it is clamped down to the model's own window, since a context window is a property of the model and no OpenRouter request parameter raises it.",
   "max_context_tokens": 0,
   "_context_compression": "null leaves it to OpenRouter, which compresses endpoints of 8k or less and refuses an overflow on larger ones. true drops text from the middle of an oversized prompt instead of refusing it; false refuses everywhere.",

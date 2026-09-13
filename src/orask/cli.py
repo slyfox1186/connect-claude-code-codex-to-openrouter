@@ -65,7 +65,7 @@ def _print_result(result: dict[str, Any], show_reasoning: bool) -> None:
             print(f"   billed {_fmt_money(result['usage'].get('cost_usd'))}")
             usage = result["usage"]
             print(
-                f"   max_tokens={result.get('max_tokens')} "
+                f"   max_tokens={result.get('max_tokens') or 'none sent'} "
                 f"context_window={result.get('context_window')} "
                 f"effort={result.get('effort')} finish_reason={result.get('finish_reason')} "
                 f"in={usage.get('prompt_tokens')} out={usage.get('completion_tokens')} "
@@ -234,7 +234,10 @@ def _shared_ask_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--max-tokens",
         type=int,
-        help="cap reasoning plus final-answer tokens; size for task complexity",
+        help=(
+            "send an output cap covering reasoning and answer; unset sends none and the "
+            "provider's own limit applies"
+        ),
     )
     parser.add_argument(
         "--max-context-tokens",

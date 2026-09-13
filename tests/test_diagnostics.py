@@ -86,7 +86,7 @@ class DiagnosticsTests(unittest.TestCase):
             <= {e["event"] for e in events}
         )
         prepared = next(e for e in events if e["event"] == "call.prepared")
-        self.assertEqual(prepared["max_tokens"], 32000)
+        self.assertIsNone(prepared.get("max_tokens"))
         self.assertGreater(prepared["estimated_prompt_tokens"], 0)
         self.assertGreater(prepared["estimated_cost_usd"], 0)
         call_id = result["diagnostics"]["call_id"]
@@ -138,6 +138,17 @@ class DiagnosticsTests(unittest.TestCase):
         for rendered in [output.getvalue(), mcp_server._render(result)]:
             for needle in ["16000", "1500", "800", "600", "length", "diagnostics.jsonl"]:
                 self.assertIn(needle, rendered)
+
+    def test_uncapped_incomplete_renderers_say_no_cap_was_sent(self):
+        from orask import cli, mcp_server
+
+        self.response["choices"][0]["finish_reason"] = "length"
+        result = self.ask()
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            cli._print_result(result, False)
+        for rendered in [output.getvalue(), mcp_server._render(result)]:
+            self.assertIn("none sent", rendered)
 
     def test_transport_success_and_retry_are_logged_without_headers_or_bodies(self):
         error = urllib.error.HTTPError(

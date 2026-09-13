@@ -173,30 +173,39 @@ enabled-tool list must include `get_consultation` for recovery to work.
 ## Context window
 
 Prompt and answer share one window, and how big it is belongs to the model: no
-OpenRouter request parameter raises it. What a caller sets is a budget inside it.
+OpenRouter request parameter raises it.
 
-`max_context_tokens` (tool argument, `--max-context-tokens` on the CLI, or
-`max_context_tokens` in the config for a standing default) budgets prompt plus
-answer into that many tokens. A number above what the model takes is clamped back
-down to the model's own window and the answer says so. Left unset, the published window is the fitting limit when available;
-file limits and the output cap still apply.
+By default the bridge sends no output cap (`max_tokens`). The model and the
+provider serving it apply their own output limit. OpenRouter bills the tokens
+actually generated, so a cap does not reduce the bill for an answer that
+finishes. It can only truncate one, and the truncated call is still billed. The
+MCP tools therefore take no `max_tokens` or `max_context_tokens` argument, and
+Claude Code and Codex cannot set either. A person can still send a cap with
+`--max-tokens` or `default_max_tokens` in the config.
 
-Whatever the budget, the prompt is estimated against it before the call goes out:
+`max_context_tokens` (`--max-context-tokens` on the CLI, or `max_context_tokens`
+in the config for a standing default) budgets prompt plus answer into that many
+tokens, and then does send a cap: the room the prompt leaves. A number above
+what the model takes is clamped back down to the model's own window and the
+answer says so.
 
-- enough room for the chosen output allowance, and the call proceeds
-- some room, but less than the chosen output allowance: MCP refuses before
-  submitting so the caller can narrow the task or revise its budget; the CLI
-  retains its documented automatic reduction and reports the effective cap
+Whatever the budget, the prompt is estimated against the window before the call
+goes out:
+
+- enough room, and the call proceeds
+- a configured cap larger than the room left: MCP refuses before submitting;
+  the CLI lowers the cap and reports the effective one
 - no room left, and the call is refused before it is billed, naming the estimate
   and the window
 
-`context_compression` decides that second case instead. `true` sends OpenRouter's
+`context_compression` decides that last case instead. `true` sends OpenRouter's
 context-compression plugin, which drops text from the middle of the prompt until
-it fits and caps the answer at half the window to leave room for what survives.
-`false` refuses even on the endpoints of 8k or less that OpenRouter compresses by
-default. Unset leaves that default alone.
+it fits. When a cap is in force, the answer is capped at half the window to leave
+room for what survives; with no cap, none is sent. `false` refuses even on the
+endpoints of 8k or less that OpenRouter compresses by default. Unset leaves that
+default alone.
 
-MCP also refuses when compression would reduce the chosen output allowance.
+MCP also refuses when compression would reduce a configured cap.
 It does not silently enlarge budgets, weaken reasoning, or make a paid retry.
 
 The window in force, and the estimated prompt size, comes back on every
@@ -487,14 +496,14 @@ routing](https://openrouter.ai/docs/guides/routing/provider-selection). This may
 refuse a request when no compatible provider is available. The CLI retains its
 existing effort choices and packaged `high` default.
 
-**Choosing a reply budget.** `max_tokens` covers reasoning and the final answer
-together. A large context window does not prevent a small output cap from being
-used entirely for reasoning. Before a substantial consultation, the caller uses
-`llm_model_info` (including `bridge_limits`) to choose output and context budgets
-for the actual task. The configured default is a starting point. If a call ends
-with `length`, inspect its usage, increase the output allowance within the model
-and cost limits, or split the work. Retry only the incomplete model in a panel.
-There is no automatic paid retry, and exhaustive reviews must not use compression.
+**Output limits.** Reasoning and the final answer share one output limit. The
+bridge sends no `max_tokens`, so that limit belongs to the model and the provider
+serving it, and it varies: on 2026-09-13 OpenRouter's endpoint list showed Kimi K3
+output ceilings from 16,384 to 943,718 tokens depending on the provider, and
+Moonshot documents a default of 131,072 when no cap is sent. If a call still ends
+with `length`, the model reached that limit, so split the work or use a model with
+a larger output ceiling. Retry only the incomplete model in a panel. There is no
+automatic paid retry, and exhaustive reviews must not use compression.
 
 **Diagnosing successful and failed consultations.** Verbose lifecycle metadata
 is enabled by default in `/tmp/orask-<uid>/diagnostics.jsonl`. It covers MCP/CLI
@@ -538,8 +547,9 @@ against the live catalogue and ranked by published intelligence index, so `grok`
 lands on the current flagship, not an elderly variant. `:batch` endpoints (which
 answer in minutes) and `:free` tiers are never selected implicitly.
 
-**Cost control.** The preflight estimate includes the estimated prompt, the full
-chosen output cap and known request fees. It refuses an estimate above
+**Cost control.** The preflight estimate includes the estimated prompt, the output
+cap when one is sent or `cost_guard_output_tokens` (32,000) when none is, and
+known request fees. It refuses an estimate above
 `max_cost_usd_per_call` ($1.00 by default, per model). This is a heuristic guard,
 not a spending ceiling: token estimates, attachment processing, routing prices
 and OCR page estimates can differ from the eventual bill. Unknown pricing warns
@@ -622,11 +632,17 @@ without being billed rather than answered in half a sentence. `context_compressi
 tri-state on purpose: unset sends no plugin at all, because `enabled: false` is itself a
 decision and it turns off the compression an endpoint of 8k or less applies for you.
 
-**An output cap is always chosen and always sent.** With no `max_tokens`, no
-`default_max_tokens` and no published provider ceiling, the old code sent no cap and
-priced zero output tokens, so any prompt passed the guard while the provider
-generated to its own limit. There is no state now in which the guard prices the
-answer at nothing.
+**No output cap is sent by default.** OpenRouter bills generated tokens, not the
+allowance, so a cap saved nothing on an answer that finished and turned one that
+needed more room into a truncated call that was still billed. The calling agents
+kept choosing caps sized for the visible answer, and at `max` effort the hidden
+reasoning used them up first. The MCP tools no longer accept `max_tokens` or
+`max_context_tokens`, and the MCP SDK drops either argument when a client with a
+stale tool list sends one. The cap's one real job was bounding the cost guard's
+estimate. With no cap the guard prices `cost_guard_output_tokens` (32,000) instead
+of zero, above the largest answer in the call log (27,113 tokens). That estimate
+is not a bound: the provider's own limit is the only hard limit on one call's
+output.
 
 **A failed catalogue fetch is remembered.** A single `ask()` looks the catalogue up
 five or six times; with the network down each of those was a full retry cycle. One

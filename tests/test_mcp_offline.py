@@ -51,6 +51,8 @@ def provider_fixture():
             and payload["model"] == "google/gemini-3.8-flash"
         ):
             raise core.OpenRouterError("Google Flash fixture unavailable")
+        if "force-cap-check" in json.dumps(payload["messages"]) and "max_tokens" in payload:
+            raise AssertionError("a max_tokens tool argument reached the provider")
         partial = "force-incomplete" in json.dumps(payload["messages"])
         answer = "partial" if partial else "FINISHED"
         if "force-wide" in json.dumps(payload["messages"]):
@@ -123,7 +125,8 @@ async def check_protocol():
             tools = await client.list_tools()
             ask = next(t for t in tools.tools if t.name == "ask_llm")
             assert "effort_reason" in ask.input_schema["properties"]
-            assert "max_tokens includes BOTH" in client.instructions
+            assert "the bridge sends no output cap" in client.instructions
+            assert not {"max_tokens", "max_context_tokens"} & set(ask.input_schema["properties"])
             panel = next(t for t in tools.tools if t.name == "ask_panel")
             categories = next(t for t in tools.tools if t.name == "list_llm_categories")
             for instructions in (
@@ -174,7 +177,11 @@ async def check_protocol():
             text = "".join(getattr(c, "text", "") for c in result.content)
             assert "0/2 answered" in text and "INCOMPLETE" in text and "partial" in text, text
             assert "private reasoning" not in text and "$0.0400" in text, text
-            for needle in ("max_tokens: 32000", "completion_tokens: 100", "reasoning_tokens: 50"):
+            for needle in (
+                "max_tokens: none sent",
+                "completion_tokens: 100",
+                "reasoning_tokens: 50",
+            ):
                 assert needle in text, text
             result = await client.call_tool("read_guide", {"topic": "bash", "section": "Quoting"})
             text = "".join(getattr(c, "text", "") for c in result.content)
@@ -244,13 +251,12 @@ async def check_protocol():
             assert len({e["call_id"] for e in correlated if e.get("call_id")}) == 2
             assert "private reasoning" not in json.dumps(events)
             assert "force-slow" not in json.dumps(events)
-            before = log_path.read_bytes()
             result = await client.call_tool(
-                "ask_llm", {"question": "q", "max_tokens": 32000, "max_context_tokens": 1000}
+                "ask_llm",
+                {"question": "force-cap-check", "max_tokens": 2500, "max_context_tokens": 1000},
             )
             text = "".join(getattr(c, "text", "") for c in result.content)
-            assert result.is_error and "output budget" in text and "diagnostics.jsonl" in text, text
-            assert log_path.read_bytes() == before, "refused budget must never bill"
+            assert not result.is_error and "FINISHED" in text, text
     print("all offline MCP protocol checks passed")
 
 

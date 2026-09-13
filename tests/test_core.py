@@ -29,6 +29,7 @@ SCRATCH = Path(SCRATCH_OWNER.name)
 os.environ["ORASK_CONFIG_DIR"] = str(SCRATCH / "config")
 os.environ["ORASK_STATE_DIR"] = str(SCRATCH / "state")
 os.environ["ORASK_CACHE_DIR"] = str(SCRATCH / "cache")
+os.environ["ORASK_DIAGNOSTIC_DIR"] = str(SCRATCH / "diagnostics")
 os.environ.pop("OPENROUTER_API_KEY", None)
 
 from orask import core
@@ -584,6 +585,26 @@ check(
     and any("compression" in n for n in _notes),
     f"{_fit} {_notes}",
 )
+
+_fit, _win, _notes = core.fit_context("moonshotai/kimi-k3", 1000, None)
+check("no cap in means no cap out", (_fit, _win, _notes) == (None, 1048576, []), str(_fit))
+_fit, _win, _notes = core.fit_context("moonshotai/kimi-k3", 1000, None, requested_window=4000)
+check(
+    "a person's context budget still bounds an uncapped answer",
+    _win == 4000 and _fit is not None and _fit < 4000,
+    f"{_fit} of {_win}",
+)
+_fit, _win, _notes = core.fit_context("mistralai/mistral-large-2512", 4000000, None, compress=True)
+check(
+    "compression with no cap sends no cap",
+    _fit is None and any("compression" in n for n in _notes),
+    f"{_fit} {_notes}",
+)
+try:
+    core.fit_context("mistralai/mistral-large-2512", 4000000, None)
+    check("an uncapped prompt that fills the window is still refused", False, "no error raised")
+except core.OpenRouterError as exc:
+    check("an uncapped prompt that fills the window is still refused", "no room left" in str(exc))
 
 try:
     core.ask("q", model="kimi", max_context_tokens=10)
@@ -1242,9 +1263,8 @@ check(
 # the cost guard, and config values that must never take a paid call down
 # --------------------------------------------------------------------------
 
-# With no cap from the config and none published by the model, the old code sent no
-# max_tokens and priced zero output, so any prompt passed the guard and the provider billed
-# to its own ceiling.
+# No cap is sent by default, and an uncapped answer must still not be priced at zero: the
+# guard assumes cost_guard_output_tokens of output instead.
 core._config_cache = dict(cfg, default_max_tokens=None, max_cost_usd_per_call=0.10)
 try:
     core.ask("q", model="moonshotai/kimi-k3:batch")
@@ -1261,12 +1281,21 @@ except AssertionError:
         False,
         "reached the network, so the guard was skipped",
     )
+core._config_cache = dict(cfg, cost_guard_output_tokens=0, max_cost_usd_per_call=0.10)
+try:
+    core.ask("q", model="moonshotai/kimi-k3:batch")
+    check("the guard's output assumption is cost_guard_output_tokens", False, "no transport")
+except AssertionError:
+    check("the guard's output assumption is cost_guard_output_tokens", True)
+except core.OpenRouterError as exc:
+    check("the guard's output assumption is cost_guard_output_tokens", False, str(exc)[:80])
 core._config_cache = cfg
 
 for _bad_key in (
     "max_file_chars",
     "max_input_chars",
     "default_max_tokens",
+    "cost_guard_output_tokens",
     "catalog_ttl_s",
     "request_timeout_s",
     "max_cost_usd_per_call",
@@ -1744,6 +1773,12 @@ check(
 # mcp_server cannot be imported here (that would need the mcp SDK, and the point
 # of this suite is that it does not). The decorators are read as text instead.
 _server_src = (ROOT / "src" / "orask" / "mcp_server.py").read_text()
+for _tool in ("ask_llm", "ask_panel"):
+    _signature = _server_src.split(f"def {_tool}(", 1)[1].split(") -> str:", 1)[0]
+    check(
+        f"{_tool} gives the calling agent no output cap or context budget to set",
+        "max_tokens" not in _signature and "max_context_tokens" not in _signature,
+    )
 _declared = re.findall(r'@mcp\.tool\(\s*\n\s*name="([a-z_]+)"', _server_src)
 check(
     "every @mcp.tool is in core.MCP_TOOLS",
@@ -2051,6 +2086,41 @@ with patch.object(core, "_request", return_value=_answered):
 check(
     "a complete final answer remains successful",
     _result["ok"] and _result.get("incomplete") is False,
+)
+with patch.object(core, "_request", return_value=_answered) as _transport:
+    _result = core.ask("review", model="kimi")
+check(
+    "no output cap is sent unless someone chose one",
+    "max_tokens" not in _transport.call_args.args[2] and _result["max_tokens"] is None,
+    str(_transport.call_args.args[2].get("max_tokens")),
+)
+with patch.object(core, "_request", return_value=_answered) as _transport:
+    core.ask("review", model="kimi", _mcp_call=True)
+check("a tool call sends no output cap either", "max_tokens" not in _transport.call_args.args[2])
+core._config_cache = dict(cfg, default_max_tokens=20000)
+with patch.object(core, "_request", return_value=_answered) as _transport:
+    core.ask("review", model="kimi")
+check(
+    "default_max_tokens in the config still sends that cap",
+    _transport.call_args.args[2].get("max_tokens") == 20000,
+)
+core._config_cache = cfg
+with patch.object(core, "_request", return_value=_answered) as _transport:
+    core.ask("review", model="kimi", max_tokens=5000)
+check(
+    "an explicit --max-tokens is still sent",
+    _transport.call_args.args[2].get("max_tokens") == 5000,
+)
+_cut = {
+    "choices": [{"message": {"content": "partial"}, "finish_reason": "length"}],
+    "usage": {"prompt_tokens": 10, "completion_tokens": 900, "cost": 0.01},
+}
+with patch.object(core, "_request", return_value=_cut):
+    _result = core.ask("review", model="kimi")
+check(
+    "an uncapped cut-off names the provider limit, not a cap",
+    _result["ok"] is False and any("sent no max_tokens" in n for n in _result["notes"]),
+    str(_result["notes"]),
 )
 _info = core.model_info("kimi")
 check(

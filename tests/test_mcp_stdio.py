@@ -205,7 +205,6 @@ async def main() -> int:
                 "question": "Reply with exactly the word: ACKNOWLEDGED",
                 "model": "kimi",
                 "effort": "max",
-                "max_tokens": 16000,
             },
         )
         text = "".join(getattr(c, "text", "") for c in res.content)
@@ -219,7 +218,6 @@ async def main() -> int:
                 "question": "Reply with exactly one word: PANEL",
                 "models": ["kimi", "glm"],
                 "effort": "max",
-                "max_tokens": 16000,
             },
         )
         text = "".join(getattr(c, "text", "") for c in res.content)
@@ -240,7 +238,6 @@ async def main() -> int:
                 "question": "Reply with exactly one word: PARTIAL",
                 "models": ["kimi", "no-such-model-xyz"],
                 "effort": "max",
-                "max_tokens": 16000,
             },
         )
         text = "".join(getattr(c, "text", "") for c in res.content)
@@ -268,7 +265,6 @@ async def main() -> int:
                     "model": "kimi",
                     "files": [str(pdf)],
                     "effort": "max",
-                    "max_tokens": 16000,
                 },
             )
             text = "".join(getattr(c, "text", "") for c in res.content)

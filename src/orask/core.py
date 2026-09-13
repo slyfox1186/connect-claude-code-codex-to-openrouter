@@ -300,7 +300,8 @@ _DEFAULTS: Config = {
     "default_role": "advisor",
     "aliases": {"kimi": "moonshotai/kimi-k3", "glm": "z-ai/glm-5.3"},
     "allowed_models": [],
-    "default_max_tokens": 32000,
+    "default_max_tokens": None,
+    "cost_guard_output_tokens": 32000,
     "max_context_tokens": 0,
     "context_compression": None,
     "request_timeout_s": 300,
@@ -1743,6 +1744,22 @@ def _setting(key: str, default: int) -> int:
         return default
 
 
+def _optional_cap(key: str) -> int | None:
+    """A positive integer config value, or None for unset, 0 or not a number.
+
+    None sends no cap at all. A typo reads as unset rather than raising, for the same reason
+    as _setting: these are read on the paid path.
+    """
+    value = load_config().get(key)
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if number > 0 else None
+
+
 def _tristate(value: Any) -> bool | None:
     """A real true/false, or None for "leave the decision to OpenRouter".
 
@@ -2275,20 +2292,23 @@ def context_window(slug: str) -> int:
 def fit_context(
     slug: str,
     prompt_chars: int,
-    max_tokens: int,
+    max_tokens: int | None,
     requested_window: int | None = None,
     compress: bool = False,
-) -> tuple[int, int, list[str]]:
+) -> tuple[int | None, int, list[str]]:
     """Fit prompt and answer inside the context window, and refuse when they do not.
 
-    Returns the output cap to send, the window it was fitted to (0 when the catalogue
-    publishes none) and the notes worth reporting. OpenRouter has no request parameter that
-    sets a context window - a model's is fixed - so `requested_window` can only budget below
-    it, and anything above is clamped back down to what the model actually accepts.
+    Returns the output cap to send (None sends none, so the provider's own limit applies),
+    the window it was fitted to (0 when the catalogue publishes none) and the notes worth
+    reporting. OpenRouter has no request parameter that sets a context window - a model's is
+    fixed - so `requested_window` can only budget below it, and anything above is clamped
+    back down to what the model actually accepts. A budget below the published window is the
+    one thing that turns "no cap" into a cap, because a person set it to bound the answer.
     """
     notes: list[str] = []
     published = context_window(slug)
     window = published
+    budgeted = False
     if requested_window:
         window = int(requested_window)
         if published and window > published:
@@ -2300,16 +2320,26 @@ def fit_context(
             window = published
         elif published:
             notes.append(f"context budgeted to {window} tokens of the {published} {slug} allows")
+            budgeted = window < published
+        else:
+            budgeted = True
     if window <= 0:
         return max_tokens, 0, notes
 
     prompt_tokens = int(prompt_chars / CHARS_PER_TOKEN) + 1
     room = window - prompt_tokens
     if room < MIN_ANSWER_TOKENS:
+        if compress and max_tokens is None and not budgeted:
+            notes.append(
+                f"the prompt is about {prompt_tokens} tokens against a {window} token "
+                "window, so OpenRouter's context-compression plugin will drop text from "
+                "the middle before the model reads it; no output cap is sent"
+            )
+            return None, window, notes
         if compress:
             # OpenRouter drops from the middle until the prompt fits, which it can only do
-            # if the answer is not itself claiming the whole window.
-            budget = min(max_tokens, max(MIN_ANSWER_TOKENS, window // 2))
+            # if a cap in force is not itself claiming the whole window.
+            budget = min(max_tokens or window, max(MIN_ANSWER_TOKENS, window // 2))
             notes.append(
                 f"the prompt is about {prompt_tokens} tokens against a {window} token "
                 f"window, so OpenRouter's context-compression plugin will drop text from "
@@ -2325,7 +2355,13 @@ def fit_context(
             "pass context_compression=true to let OpenRouter drop text from the middle of "
             "the prompt until it fits."
         )
-    if max_tokens > room:
+    if max_tokens is None and budgeted:
+        notes.append(
+            f"capped the answer at {room} tokens: max_context_tokens budgets prompt and "
+            f"answer into {window} and the prompt is about {prompt_tokens}"
+        )
+        return room, window, notes
+    if max_tokens is not None and max_tokens > room:
         notes.append(
             f"lowered max_tokens from {max_tokens} to {room}: the prompt is about "
             f"{prompt_tokens} tokens of the {window} token context window and the answer "
@@ -2336,7 +2372,7 @@ def fit_context(
 
 
 def estimate_call_cost(slug: str, chars: int, max_tokens: int | None) -> tuple[float, bool]:
-    """Estimated cost: approximate prompt tokens plus the full output allowance.
+    """Estimated cost: approximate prompt tokens plus the output tokens being priced.
 
     Returns (usd, priced). `priced` is False when the model is not in the
     catalogue, so the caller can say the guard could not be evaluated instead
@@ -2793,24 +2829,15 @@ def ask(
     billable = chars + int(attached["tokens"] * CHARS_PER_TOKEN)
 
     if max_tokens is not None and int(max_tokens) < 1:
-        # 0 would read as "no cap": no max_tokens sent and zero output priced,
-        # so the provider's own ceiling applies against a $0.00 estimate.
-        raise OpenRouterError("max_tokens must be 1 or more; omit it to use the configured default")
-    limit = int(max_tokens) if max_tokens is not None else _setting("default_max_tokens", 32000)
+        raise OpenRouterError("max_tokens must be 1 or more; omit it to send no output cap")
+    # No cap is sent unless a person chose one. OpenRouter bills the tokens generated, not the
+    # allowance, so a cap saves nothing on an answer that finishes and truncates one that needs
+    # more room, which is then billed for nothing usable.
+    limit = int(max_tokens) if max_tokens is not None else _optional_cap("default_max_tokens")
     ceiling = int(((_find(slug).get("top_provider") or {}).get("max_completion_tokens")) or 0)
     if limit and ceiling and limit > ceiling:
         notes.append(f"max_tokens={limit} exceeds {slug}'s output ceiling; using {ceiling}.")
         limit = ceiling
-    if not limit:
-        # Neither the config nor the catalogue gave a cap. Sending no max_tokens would price
-        # zero output against the guard while the provider generates to its own ceiling, so
-        # the packaged default stands in and is actually sent.
-        limit = ceiling or int(_DEFAULTS["default_max_tokens"])
-        notes.append(
-            f"no output cap was configured and {slug} publishes none, so {limit} was used: "
-            "without it the cost guard would price the answer at zero. Set default_max_tokens "
-            "or pass max_tokens to choose your own."
-        )
 
     wanted_window = (
         int(max_context_tokens)
@@ -2839,14 +2866,19 @@ def ask(
         context_window=window,
         estimated_prompt_tokens=int(billable / CHARS_PER_TOKEN) + 1,
     )
-    if _mcp_call and limit < output_before_fit:
+    if (
+        _mcp_call
+        and limit is not None
+        and output_before_fit is not None
+        and limit < output_before_fit
+    ):
         diagnostics.emit("call.refused", phase="context", reason="output_budget_reduced")
         raise OpenRouterError(
             f"refusing to send: the requested output budget is {output_before_fit} tokens, "
             f"but the prompt leaves only {limit} in the {window}-token context window. "
-            "No model request was sent. Narrow the source/task or raise max_context_tokens "
-            "if it is below the model's window. Choose a smaller max_tokens only when the "
-            "revised task can finish within it; the bridge will not silently shrink MCP output."
+            "No model request was sent. Narrow the source/task, raise max_context_tokens "
+            "if it is below the model's window, or remove default_max_tokens from the "
+            "config so no cap is sent; the bridge will not silently shrink MCP output."
         )
 
     # Resolved before the guard runs, because which engine reads the PDF changes what the
@@ -2859,7 +2891,10 @@ def ask(
         engine = "cloudflare-ai"
 
     guard = _float_setting("max_cost_usd_per_call", 1.0)
-    estimate, priced = estimate_call_cost(slug, billable, limit)
+    # With no cap there is no output bound to price, so the guard assumes
+    # cost_guard_output_tokens rather than zero. Nothing about it is sent to the provider.
+    priced_output = limit if limit is not None else _setting("cost_guard_output_tokens", 32000)
+    estimate, priced = estimate_call_cost(slug, billable, priced_output)
     diagnostics.emit(
         "call.cost_guard",
         model=slug,
@@ -2906,12 +2941,17 @@ def ask(
                 f"'{policy}')"
             )
         elif estimate > guard:
+            output = (
+                f"up to {limit} tokens out"
+                if limit is not None
+                else f"about {priced_output} tokens out assumed by cost_guard_output_tokens"
+            )
             raise OpenRouterError(
                 f"refusing to send: estimated cost for {slug} is about "
-                f"{fmt_usd(estimate)} ({billable} chars in, up to {limit} tokens out"
+                f"{fmt_usd(estimate)} ({billable} chars in, {output}"
                 + (f", plus about {fmt_usd(ocr)} of mistral-ocr page charges" if ocr else "")
-                + f"), over the {fmt_usd(guard)} per-call guard. Trim the context, lower "
-                "max_tokens, "
+                + f"), over the {fmt_usd(guard)} per-call guard. Trim the context, pick a "
+                "cheaper model, "
                 + ("use pdf_engine='cloudflare-ai' if the PDF has real text in it, " if ocr else "")
                 + "or pass allow_expensive to override."
             )
@@ -2944,7 +2984,7 @@ def ask(
     if final_effort:
         payload["reasoning"] = {"effort": final_effort}
 
-    if limit:
+    if limit is not None:
         payload["max_tokens"] = int(limit)
     if temperature is not None:
         payload["temperature"] = float(temperature)
@@ -3043,14 +3083,21 @@ def ask(
 
     empty = not answer
     incomplete = empty or (finish is not None and finish != "stop")
-    if incomplete and finish == "length":
+    if incomplete and finish == "length" and limit is None:
         notes.append(
-            f"incomplete response (finish_reason={finish}, max_tokens={limit}): "
-            "max_tokens covers reasoning plus the final answer; a larger context window "
-            "alone does not increase that output allowance. Inspect usage.reasoning_tokens "
-            "and llm_model_info, then choose a larger max_tokens within the model and cost "
-            "limits, or narrow the task. MCP calls require max/xhigh, or justified medium. "
-            "Do not retry unchanged or treat partial analysis as a completed review."
+            "incomplete response (finish_reason=length): the bridge sent no max_tokens, so "
+            "the model or its provider stopped at its own output limit, which reasoning "
+            "counts toward. The same request will most likely stop in the same place: split "
+            "or narrow the task, or ask a model with a larger max_output_tokens "
+            "(llm_model_info). Do not treat partial analysis as a completed review."
+        )
+    elif incomplete and finish == "length":
+        notes.append(
+            f"incomplete response (finish_reason={finish}, max_tokens={limit}): the output "
+            "cap covers reasoning plus the final answer and came from --max-tokens, "
+            "default_max_tokens or max_context_tokens. Remove it so no cap is sent, or "
+            "narrow the task. Do not retry unchanged or treat partial analysis as a "
+            "completed review."
         )
     elif incomplete:
         notes.append(
@@ -3359,7 +3406,8 @@ def model_info(spec: str) -> dict[str, Any]:
         "context_length": context_window(slug),
         "max_output_tokens": top.get("max_completion_tokens"),
         "bridge_limits": {
-            "default_max_tokens": _setting("default_max_tokens", 32000),
+            "default_max_tokens": _optional_cap("default_max_tokens"),
+            "cost_guard_output_tokens": _setting("cost_guard_output_tokens", 32000),
             "default_effort": load_config().get("default_effort"),
             "mcp_default_effort": "max",
             "mcp_medium_requires_reason": True,
