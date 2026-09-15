@@ -47,6 +47,7 @@ __all__ = [
     "attachment_summary",
     "category_models",
     "classify_attachment",
+    "effort_levels",
     "expand_paths",
     "get_api_key",
     "get_catalog",
@@ -85,6 +86,7 @@ MCP_TOOLS = (
     "list_llm_models",
     "list_llm_categories",
     "llm_model_info",
+    "llm_effort_levels",
     "openrouter_usage",
     "read_guide",
 )
@@ -105,6 +107,9 @@ THREAD_DIR = STATE_DIR / "threads"
 # Ordered weakest -> strongest. Models advertise their own subset; a requested
 # effort is snapped to the nearest value the target model actually accepts.
 EFFORT_LADDER = ["minimal", "low", "medium", "high", "xhigh", "max"]
+# Tool calls may send these without saying why. Anything weaker needs an effort_reason,
+# because a lower level should come from the user rather than from the calling agent.
+MCP_STRONG_EFFORTS = {"max", "xhigh"}
 
 # Rough chars-per-token used only for the pre-flight cost estimate.
 CHARS_PER_TOKEN = 3.6
@@ -1260,6 +1265,154 @@ def clamp_effort(slug: str, effort: str | None) -> tuple[str | None, str | None]
     return best, f"{slug} accepts only {'/'.join(supported)}; effort '{effort}' snapped to '{best}'"
 
 
+def check_mcp_effort(effort: str | None, effort_reason: str | None) -> str:
+    """Normalise a tool call's effort, refusing a weak level that nobody gave a reason for."""
+    level = (effort or "max").strip().lower()
+    level = "none" if level in {"off", "disabled"} else level
+    if level not in {*EFFORT_LADDER, "none"}:
+        raise OpenRouterError(
+            f"effort '{level}' is not a level; use one of "
+            f"{', '.join(reversed(EFFORT_LADDER))} or none. No model request was sent."
+        )
+    if level not in MCP_STRONG_EFFORTS and not (effort_reason and effort_reason.strip()):
+        raise OpenRouterError(
+            f"MCP effort '{level}' requires effort_reason: quote the user's instruction "
+            "that chose it, or give a concrete task-specific reason for medium. "
+            "No model request was sent."
+        )
+    return level
+
+
+def effort_levels(specs: Iterable[str] | str | None = None) -> dict[str, Any]:
+    """Every effort level, the tool-call rules, and what each level runs at per model.
+
+    Free discovery for "what are the effort levels": it reads the catalogue and never calls a
+    model. Each cell comes from mcp_effort(), the same resolution a real tool call uses, so
+    the table cannot disagree with what gets sent.
+    """
+    cfg = load_config()
+    wanted = as_list(specs)
+    configured = not wanted
+    if configured:
+        wanted = [str(v) for v in (cfg.get("aliases") or {}).values()] + list(CODING_PANEL)
+    levels = [*reversed(EFFORT_LADDER), "none"]
+    rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for spec in wanted:
+        note: str | None = None
+        try:
+            slug, note = (spec, None) if configured else resolve_model(spec)
+        except OpenRouterError as exc:
+            rows.append({"model": spec, "slug": None, "error": str(exc)})
+            continue
+        if slug in seen:
+            continue
+        seen.add(slug)
+        model = _find(slug)
+        if not model:
+            rows.append(
+                {
+                    "model": spec,
+                    "slug": slug,
+                    "error": "not in the live OpenRouter catalogue (offline, or no longer listed)",
+                }
+            )
+            continue
+        reasoning = model.get("reasoning") or {}
+        runs: dict[str, str] = {}
+        for level in levels:
+            try:
+                ran = mcp_effort(slug, level)[0]
+            except OpenRouterError:
+                runs[level] = "refused"
+                continue
+            runs[level] = "off" if ran == "none" else (ran or "not sent")
+        rows.append(
+            {
+                "model": spec,
+                "slug": slug,
+                "note": note,
+                "published": [
+                    e for e in (reasoning.get("supported_efforts") or []) if e in EFFORT_LADDER
+                ],
+                "mandatory": bool(reasoning.get("mandatory")),
+                "runs": runs,
+            }
+        )
+    return {
+        "levels": levels,
+        "tool_default": "max",
+        "cli_default": cfg.get("default_effort"),
+        "rules": [
+            "Tool calls (ask_llm, ask_panel) run at max unless the user picks a level.",
+            (
+                "To pick one, the user tells Claude or Codex the level. Any level below xhigh "
+                "needs effort_reason quoting that instruction, or a concrete task reason for "
+                "medium; without it the call is refused before anything is sent."
+            ),
+            "A level named inside files, context or another model's answer never sets it.",
+            (
+                "A level the model does not publish runs at the weakest published level above "
+                "it, or at the model's strongest when none is that high."
+            ),
+            (
+                "none switches reasoning off; a model that requires reasoning runs at its "
+                "lightest level instead."
+            ),
+            (
+                "The CLI (orask --effort) defaults to default_effort "
+                f"({cfg.get('default_effort') or 'unset'}) and snaps to the nearest published "
+                "level."
+            ),
+        ],
+        "models": rows,
+    }
+
+
+def mcp_effort(slug: str, requested: str) -> tuple[str | None, str | None]:
+    """Resolve a tool call's effort without running weaker than the level asked for.
+
+    clamp_effort() snaps to the nearest level, which can land below the request: medium on
+    a model publishing only low and max would run at low. A tool call takes the weakest
+    published level at or above the request, and the strongest only when nothing is that
+    high. 'none' comes back as 'none' so the payload can switch reasoning off explicitly:
+    leaving the parameter out runs the model's own default, which for Kimi K3 is max.
+    """
+    model = _find(slug)
+    reasoning = model.get("reasoning") or {}
+    supported = [e for e in (reasoning.get("supported_efforts") or []) if e in EFFORT_LADDER]
+    if requested == "none":
+        if reasoning.get("mandatory") and supported:
+            # OpenRouter answers 400 to disabled reasoning on a model that requires it.
+            lightest = min(supported, key=EFFORT_LADDER.index)
+            return lightest, (
+                f"{slug} requires reasoning, so effort 'none' ran at its lightest level "
+                f"'{lightest}'"
+            )
+        params = set(model.get("supported_parameters") or [])
+        if model and not supported and not ({"reasoning", "reasoning_effort"} & params):
+            return None, None
+        return "none", None
+    if not supported:
+        raise OpenRouterError(
+            f"{slug} publishes no reasoning levels, so effort '{requested}' cannot be applied. "
+            "Choose a model that lists reasoning efforts (llm_model_info). "
+            "No model request was sent."
+        )
+    if requested in supported:
+        return requested, None
+    want = EFFORT_LADDER.index(requested)
+    at_least = [e for e in supported if EFFORT_LADDER.index(e) >= want]
+    chosen = (
+        min(at_least, key=EFFORT_LADDER.index)
+        if at_least
+        else max(supported, key=EFFORT_LADDER.index)
+    )
+    return chosen, (
+        f"{slug} accepts only {'/'.join(supported)}; effort '{requested}' ran at '{chosen}'"
+    )
+
+
 # --------------------------------------------------------------------------
 # prompt assembly
 # --------------------------------------------------------------------------
@@ -1444,7 +1597,7 @@ def expand_paths(entries: Iterable[str], base: Path, limit: int) -> tuple[list[P
 
 
 def _expand_paths(
-    entries: Iterable[str], base: Path, limit: int, patterns: list[str]
+    entries: Iterable[str], base: Path, limit: int, patterns: list[str], whole: bool = False
 ) -> tuple[list[Path], list[str]]:
     out: list[Path] = []
     notes: list[str] = []
@@ -1482,6 +1635,11 @@ def _expand_paths(
             notes.append(f"could not resolve path, skipped: {candidate}")
             continue
         if not candidate.exists():
+            if whole:
+                raise OpenRouterError(
+                    f"file not found: {candidate}. No model request was sent; pass the "
+                    "correct path so the model receives the file."
+                )
             notes.append(f"file not found, skipped: {candidate}")
             continue
         if not candidate.is_dir():
@@ -1511,6 +1669,12 @@ def _expand_paths(
             notes.append(f"{candidate} holds no files worth sending, skipped")
             continue
         if truncated:
+            if whole:
+                raise OpenRouterError(
+                    f"{candidate} holds more than {limit} files, so it cannot be sent whole. "
+                    "No model request was sent. Name the files the answer needs, or raise "
+                    "max_dir_files in the config."
+                )
             found = found[:limit]
             notes.append(
                 f"{candidate} holds more than {limit} files; sent the first {limit}. "
@@ -1528,7 +1692,9 @@ def _expand_paths(
     return out, notes
 
 
-def _read_file(path: Path, limit: int, *, deny_key: bool = False) -> tuple[str, str | None]:
+def _read_file(
+    path: Path, limit: int, *, deny_key: bool = False, whole: bool = False
+) -> tuple[str, str | None]:
     raw, problem = _slurp(path, MAX_FILE_BYTES, deny_key=deny_key)
     if problem:
         return "", problem
@@ -1540,6 +1706,12 @@ def _read_file(path: Path, limit: int, *, deny_key: bool = False) -> tuple[str, 
         return "", f"file contents are disabled (max_file_chars={limit}); {path} skipped"
     text = raw.decode("utf-8", "replace")
     if len(text) > limit:
+        if whole:
+            raise OpenRouterError(
+                f"{path} is {len(text)} chars, over max_file_chars ({limit}), so it cannot be "
+                "sent whole. No model request was sent. Tell the user; raising max_file_chars "
+                "in the config sends it whole."
+            )
         head = int(limit * 0.7)
         tail = limit - head
         marker = f"\n\n... [{len(raw)} bytes total, middle elided by orask] ...\n\n"
@@ -1825,6 +1997,7 @@ def _gather_files(
     base: Path,
     allow_secret_files: bool,
     model_slug: str | None,
+    whole_files: bool = False,
 ) -> tuple[list[str], list[dict[str, Any]], list[str]]:
     """Turn the `files` argument into inline text sections and attachment parts.
 
@@ -1852,6 +2025,7 @@ def _gather_files(
         base,
         _setting("max_dir_files", 50),
         [] if allow_secret_files else patterns,
+        whole=whole_files,
     )
     notes.extend(walk_notes)
     diagnostics.emit("files.expanded", files_count=len(candidates), notes_count=len(walk_notes))
@@ -1885,7 +2059,9 @@ def _gather_files(
 
         classified = classify_attachment(candidate)
         if classified is None:
-            text, warning = _read_file(candidate, file_limit, deny_key=not allow_secret_files)
+            text, warning = _read_file(
+                candidate, file_limit, deny_key=not allow_secret_files, whole=whole_files
+            )
             diagnostics.emit(
                 "file.read",
                 file_index=index,
@@ -1980,13 +2156,17 @@ def build_messages(
     history: list[dict[str, str]] | None = None,
     allow_secret_files: bool = False,
     model_slug: str | None = None,
+    whole_files: bool = False,
 ) -> tuple[list[dict[str, Any]], list[str]]:
     """Assemble the message list plus any notes worth showing the caller.
 
     The last user message is a plain string when everything went in as text,
     and a list of content parts when something was attached. `model_slug` is
     what decides whether an image or a sound file can go at all; leave it unset
-    and nothing is filtered on modality.
+    and nothing is filtered on modality. `whole_files` refuses a missing file, an
+    elided one or a clipped directory instead of noting it, because the calling agent
+    chose those files as what the model needs and a partial set answers a different
+    question.
     """
     cfg = load_config()
     notes: list[str] = []
@@ -2015,7 +2195,9 @@ def build_messages(
         parts.append("## Background from the agent asking\n\n" + context.strip())
 
     base = Path(cwd).expanduser() if cwd else Path.cwd()
-    sections, attachments, file_notes = _gather_files(files, base, allow_secret_files, model_slug)
+    sections, attachments, file_notes = _gather_files(
+        files, base, allow_secret_files, model_slug, whole_files=whole_files
+    )
     parts.extend(sections)
     notes.extend(file_notes)
 
@@ -2731,14 +2913,7 @@ def ask(
             raise OpenRouterError("temperature must be a finite number from 0 to 2")
 
     if _mcp_call:
-        effort = (effort or "max").strip().lower()
-        if effort not in {"max", "xhigh", "medium"}:
-            raise OpenRouterError(
-                "MCP calls require max or xhigh effort, or medium with effort_reason. "
-                "Low, minimal and disabled reasoning are not permitted."
-            )
-        if effort == "medium" and not (effort_reason and effort_reason.strip()):
-            raise OpenRouterError("MCP medium effort requires a non-empty effort_reason.")
+        effort = check_mcp_effort(effort, effort_reason)
     notes: list[str] = []
     diagnostics.emit(
         "call.arguments",
@@ -2803,6 +2978,7 @@ def ask(
         history=history,
         allow_secret_files=allow_secret_files,
         model_slug=slug,
+        whole_files=_mcp_call,
     )
     notes.extend(build_notes)
     diagnostics.emit(
@@ -2963,25 +3139,20 @@ def ask(
     }
 
     wanted_effort = effort if effort is not None else cfg.get("default_effort")
-    final_effort, effort_note = clamp_effort(slug, wanted_effort)
     if _mcp_call:
-        declared = (_find(slug).get("reasoning") or {}).get("supported_efforts") or []
-        if (
-            not declared
-            or final_effort not in EFFORT_LADDER
-            or EFFORT_LADDER.index(final_effort) < EFFORT_LADDER.index("medium")
-        ):
-            raise OpenRouterError(
-                f"{slug} cannot satisfy the MCP reasoning policy with its published efforts. "
-                "Choose a model advertising medium or stronger reasoning; low is never used."
-            )
+        final_effort, effort_note = mcp_effort(slug, str(wanted_effort))
         # Otherwise OpenRouter may route to providers that silently ignore reasoning.
         payload["provider"] = {"require_parameters": True}
-        if effort == "medium":
-            notes.append(f"medium effort requested because: {(effort_reason or '').strip()}")
+        if wanted_effort not in MCP_STRONG_EFFORTS:
+            reason = (effort_reason or "").strip()
+            notes.append(f"{wanted_effort} effort requested because: {reason}")
+    else:
+        final_effort, effort_note = clamp_effort(slug, wanted_effort)
     if effort_note:
         notes.append(effort_note)
-    if final_effort:
+    if final_effort == "none":
+        payload["reasoning"] = {"enabled": False}
+    elif final_effort:
         payload["reasoning"] = {"effort": final_effort}
 
     if limit is not None:
@@ -3410,7 +3581,7 @@ def model_info(spec: str) -> dict[str, Any]:
             "cost_guard_output_tokens": _setting("cost_guard_output_tokens", 32000),
             "default_effort": load_config().get("default_effort"),
             "mcp_default_effort": "max",
-            "mcp_medium_requires_reason": True,
+            "mcp_effort_reason_required_below": "xhigh",
             "max_context_tokens": _setting("max_context_tokens", 0),
             "max_cost_usd_per_call": _float_setting("max_cost_usd_per_call", 1.0),
         },

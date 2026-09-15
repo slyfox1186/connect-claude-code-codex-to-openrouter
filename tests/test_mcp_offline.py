@@ -43,9 +43,9 @@ def provider_fixture():
     def request(method, path, payload=None, **_kwargs):
         if method != "POST" or path != "/chat/completions":
             raise AssertionError("unexpected offline request")
-        effort = payload["reasoning"]["effort"]
-        if effort not in {"medium", "high", "xhigh", "max"}:
-            raise AssertionError("weak effort reached provider")
+        reasoning = payload.get("reasoning") or {}
+        if reasoning != {"enabled": False} and reasoning.get("effort") not in core.EFFORT_LADDER:
+            raise AssertionError(f"malformed reasoning reached provider: {reasoning}")
         if (
             "force-google-failure" in json.dumps(payload["messages"])
             and payload["model"] == "google/gemini-3.8-flash"
@@ -126,6 +126,8 @@ async def check_protocol():
             ask = next(t for t in tools.tools if t.name == "ask_llm")
             assert "effort_reason" in ask.input_schema["properties"]
             assert "the bridge sends no output cap" in client.instructions
+            for guidance in (client.instructions, ask.description):
+                assert "Choose `files` yourself on every call" in guidance, guidance
             assert not {"max_tokens", "max_context_tokens"} & set(ask.input_schema["properties"])
             panel = next(t for t in tools.tools if t.name == "ask_panel")
             categories = next(t for t in tools.tools if t.name == "list_llm_categories")
@@ -163,14 +165,34 @@ async def check_protocol():
                     assert "$0.0800" in text, text
                 else:
                     assert "Google Flash fixture unavailable" in text and "$0.0600" in text, text
-            for effort in ("low", "minimal", "off", "none", "medium"):
+            for effort in ("low", "minimal", "off", "none", "medium", "high"):
                 result = await client.call_tool("ask_llm", {"question": "q", "effort": effort})
                 text = "".join(getattr(c, "text", "") for c in result.content)
                 assert result.is_error and "\nFINISHED" not in text and "require" in text, text
-            for args in ({}, {"effort": "medium", "effort_reason": "Bounded syntax check"}):
+                assert "consultation_id" not in text, "an effort refusal must not start a worker"
+            for args, shown in (
+                ({}, "effort: max"),
+                ({"effort": "medium", "effort_reason": "Bounded syntax check"}, "effort: medium"),
+                ({"effort": "low", "effort_reason": "User said: use low effort"}, "effort: low"),
+                ({"effort": "none", "effort_reason": "User said: no reasoning"}, "effort: none"),
+            ):
                 result = await client.call_tool("ask_llm", {"question": "q", **args})
                 text = "".join(getattr(c, "text", "") for c in result.content)
-                assert "FINISHED" in text, text
+                assert "FINISHED" in text and shown in text, text
+            result = await client.call_tool(
+                "ask_llm", {"question": "q", "files": [tmp + "/missing-plan.md"]}
+            )
+            text = "".join(getattr(c, "text", "") for c in result.content)
+            assert result.is_error and "file not found" in text and "\nFINISHED" not in text, text
+            effort_tool = next(t for t in tools.tools if t.name == "llm_effort_levels")
+            assert "what are the effort levels" in effort_tool.description
+            result = await client.call_tool("llm_effort_levels", {"models": ["kimi"]})
+            text = "".join(getattr(c, "text", "") for c in result.content)
+            assert not result.is_error and "effort_reason" in text, text
+            assert (
+                "| `moonshotai/kimi-k3` | max/high/medium/low | max | max | high | medium | low "
+                "| low | off |"
+            ) in text, text
             result = await client.call_tool(
                 "ask_panel", {"question": "force-incomplete", "models": ["kimi", "glm"]}
             )

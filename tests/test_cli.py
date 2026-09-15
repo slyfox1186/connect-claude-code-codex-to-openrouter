@@ -100,6 +100,29 @@ check(
     proc.stdout[:80],
 )
 
+EFFORT_CATALOGUE = """
+import time
+core._catalog_cache = [{'id': 'moonshotai/kimi-k3', 'supported_parameters': ['reasoning'],
+    'reasoning': {'supported_efforts': ['max', 'high', 'low']}}]
+core._catalog_fetched_at = time.time()
+"""
+proc = run_cli(["efforts", "kimi"], data="", setup=EFFORT_CATALOGUE)
+check(
+    "effort discovery shows the published levels and what each runs at",
+    proc.returncode == 0
+    and "published: max/high/low" in proc.stdout
+    and "medium->high" in proc.stdout
+    and "none->off" in proc.stdout
+    and "effort_reason" in proc.stdout,
+    proc.stdout[-300:] + proc.stderr[-300:],
+)
+proc = run_cli(["efforts", "kimi", "--json"], data="", setup=EFFORT_CATALOGUE)
+check(
+    "effort discovery JSON is one parseable value",
+    proc.returncode == 0 and (payload(proc) or {}).get("levels", [None])[0] == "max",
+    proc.stdout[:120],
+)
+
 proc = run_cli(["categories"], data="")
 check(
     "category discovery shows the coding group and its vendor-filter exception",
@@ -407,6 +430,7 @@ for name, body in (
                 "list_llm_categories",
                 "list_llm_models",
                 "llm_model_info",
+                "llm_effort_levels",
                 "openrouter_usage",
                 "read_guide",
             )
@@ -432,6 +456,7 @@ CODEX_WITH_TOOLS = (
             "list_llm_categories",
             "list_llm_models",
             "llm_model_info",
+            "llm_effort_levels",
             "openrouter_usage",
             "read_guide",
         ]

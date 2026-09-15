@@ -37,6 +37,7 @@ EXPECTED_TOOLS = {
     "get_consultation",
     "list_llm_models",
     "llm_model_info",
+    "llm_effort_levels",
     "openrouter_usage",
     "list_llm_categories",
     "read_guide",

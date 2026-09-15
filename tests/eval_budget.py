@@ -60,6 +60,18 @@ CASES = [
         ),
         lambda d: d["tool"] == "ask_llm",
     ),
+    (
+        "user_effort",
+        "held-out",
+        (
+            "The user wrote: 'Ask kimi whether this regex is right, and use low effort, it is "
+            "a quick check.' The regex and its test strings are in context and fit every "
+            "limit. Choose the consultation."
+        ),
+        lambda d: (
+            d["tool"] == "ask_llm" and d["effort"] == "low" and bool(d["effort_reason"].strip())
+        ),
+    ),
 ]
 CONTRACT = (
     "Choose the next tool call as JSON only with exactly these fields: tool "
@@ -114,8 +126,12 @@ def main():
             if text.startswith("```"):
                 text = "\n".join(text.splitlines()[1:-1])
             decision = json.loads(text)
-            # Discovery has no effort setting; only a billed consultation is constrained.
-            strong = decision["tool"] == "llm_model_info" or decision["effort"] in {"max", "xhigh"}
+            # Discovery has no effort setting, and a level the user chose is the one to send.
+            strong = (
+                decision["tool"] == "llm_model_info"
+                or name == "user_effort"
+                or decision["effort"] in {"max", "xhigh"}
+            )
             passed = (
                 result["ok"]
                 and criterion(decision)

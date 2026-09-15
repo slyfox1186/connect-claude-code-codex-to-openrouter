@@ -35,6 +35,7 @@ SUBCOMMANDS = {
     "log",
     "doctor",
     "categories",
+    "efforts",
     "guide",
 }
 
@@ -336,6 +337,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     cats.add_argument("--json", action="store_true")
 
+    efforts = subs.add_parser("efforts", help="reasoning effort levels and what each model runs")
+    efforts.add_argument("models", nargs="*", help="aliases or slugs; omit for configured ones")
+    efforts.add_argument("--json", action="store_true")
+
     guide = subs.add_parser("guide", help="local best-practice guides (free, no model call)")
     guide.add_argument("topic", nargs="?", help="guide name; omit for the index")
     guide.add_argument("section", nargs="?", help="one heading within that guide")
@@ -349,6 +354,28 @@ def build_parser() -> argparse.ArgumentParser:
 
     subs.add_parser("doctor", help="check key, catalogue, aliases and registrations")
     return parser
+
+
+def _cmd_efforts(args: argparse.Namespace) -> int:
+    data = core.effort_levels(args.models)
+    status = int(any(row.get("error") for row in data["models"]))
+    if args.json:
+        print(json.dumps(data, indent=2))
+        return status
+    print("effort levels, strongest first: " + ", ".join(data["levels"]))
+    for rule in data["rules"]:
+        print(f"- {rule}")
+    for row in data["models"]:
+        print(f"\n{row['slug'] or row['model']}")
+        if row.get("error"):
+            print(f"    {row['error']}")
+            continue
+        required = "  (reasoning required)" if row["mandatory"] else ""
+        print(f"    published: {'/'.join(row['published']) or 'none'}{required}")
+        print("    runs: " + ", ".join(f"{level}->{ran}" for level, ran in row["runs"].items()))
+        if row.get("note"):
+            print(f"    note: {row['note']}")
+    return status
 
 
 def _cmd_categories(args: argparse.Namespace) -> int:
@@ -790,6 +817,7 @@ HANDLERS = {
     "log": _cmd_log,
     "doctor": _cmd_doctor,
     "categories": _cmd_categories,
+    "efforts": _cmd_efforts,
     "guide": _cmd_guide,
 }
 

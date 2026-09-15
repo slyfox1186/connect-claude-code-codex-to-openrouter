@@ -213,6 +213,24 @@ with tempfile.TemporaryDirectory() as tmp:
     core._config_cache = dict(cfg, max_file_chars=1000)
     _, notes = core.build_messages("q", files=[str(root / "big.txt")])
     check("oversized files are truncated with a note", any("truncated" in n for n in notes))
+    try:
+        core.build_messages("q", files=[str(root / "big.txt")], whole_files=True)
+        check("a tool call refuses a file it cannot send whole", False)
+    except core.OpenRouterError as exc:
+        check("a tool call refuses a file it cannot send whole", "cannot be sent whole" in str(exc))
+    try:
+        core.build_messages("q", files=[str(root / "absent.py")], whole_files=True)
+        check("a tool call refuses a missing file", False)
+    except core.OpenRouterError as exc:
+        check("a tool call refuses a missing file", "file not found" in str(exc))
+    from unittest.mock import patch as _patch
+
+    with _patch.object(core, "_request") as _transport:
+        try:
+            core.ask("q", model="kimi", files=[str(root / "absent.py")], _mcp_call=True)
+            check("a tool call naming a missing file bills nothing", False)
+        except core.OpenRouterError:
+            check("a tool call naming a missing file bills nothing", not _transport.called)
 
     core._config_cache = dict(cfg, max_input_chars=100)
     try:
@@ -1163,6 +1181,14 @@ with tempfile.TemporaryDirectory() as tmp:
         any("more than 1 files" in n for n in notes),
         str(notes)[:120],
     )
+    try:
+        core.build_messages("review this", files=[str(root / "src")], whole_files=True)
+        check("a tool call refuses a directory it cannot send whole", False)
+    except core.OpenRouterError as exc:
+        check(
+            "a tool call refuses a directory it cannot send whole",
+            "cannot be sent whole" in str(exc),
+        )
     core._config_cache = cfg
 
 
@@ -2138,15 +2164,17 @@ for _effort, _reason in (
     ("off", None),
     ("medium", None),
     ("medium", "   "),
+    ("high", None),
+    ("extreme", "User said: use extreme effort"),
 ):
     with patch.object(core, "_request", return_value=_answered) as _transport:
         try:
             core.ask("q", model="kimi", effort=_effort, effort_reason=_reason, _mcp_call=True)
-            check(f"MCP refuses disallowed effort {_effort!r}", False)
+            check(f"MCP refuses unjustified or unknown effort {_effort!r}", False)
         except core.OpenRouterError:
-            check(f"MCP refuses disallowed effort {_effort!r}", not _transport.called)
+            check(f"MCP refuses unjustified or unknown effort {_effort!r}", not _transport.called)
         except TypeError:
-            check(f"MCP refuses disallowed effort {_effort!r}", False)
+            check(f"MCP refuses unjustified or unknown effort {_effort!r}", False)
 try:
     with patch.object(core, "_request", return_value=_answered) as _transport:
         _result = core.ask("q", model="kimi", _mcp_call=True)
@@ -2156,17 +2184,95 @@ try:
     )
 except TypeError:
     check("MCP defaults to max regardless of lower configured defaults", False)
-try:
-    with patch.object(core, "_request", return_value=_answered) as _transport:
-        core.ask(
-            "q", model="kimi", effort="medium", effort_reason="Bounded syntax check", _mcp_call=True
+for _effort, _model, _sent, _label in (
+    ("medium", "kimi", {"effort": "high"}, "justified medium never maps down to low"),
+    ("low", "kimi", {"effort": "low"}, "a user-chosen low effort reaches the provider"),
+    ("high", "kimi", {"effort": "high"}, "a user-chosen high effort reaches the provider"),
+    ("minimal", "kimi", {"effort": "low"}, "user-chosen minimal runs at the next level up"),
+    ("none", "kimi", {"enabled": False}, "user-chosen none switches reasoning off explicitly"),
+    ("off", "kimi", {"enabled": False}, "off is accepted as none"),
+    ("none", "glm", {"effort": "low"}, "none on a reasoning-mandatory model runs lightest"),
+):
+    try:
+        with patch.object(core, "_request", return_value=_answered) as _transport:
+            _result = core.ask(
+                "q",
+                model=_model,
+                effort=_effort,
+                effort_reason="User said: use this effort",
+                _mcp_call=True,
+            )
+        _payload = _transport.call_args.args[2]
+        check(
+            _label,
+            _payload.get("reasoning") == _sent
+            and _payload.get("provider") == {"require_parameters": True}
+            and any("because: User said: use this effort" in n for n in _result["notes"]),
+            str(_payload.get("reasoning")),
         )
+    except (TypeError, core.OpenRouterError) as _exc:
+        check(_label, False, str(_exc))
+with patch.object(core, "_find", return_value={"reasoning": {"supported_efforts": ["low", "max"]}}):
     check(
-        "justified medium never maps down to low",
-        _transport.call_args.args[2]["reasoning"]["effort"] == "high",
+        "MCP effort never runs below the request when a stronger level exists",
+        core.mcp_effort("x/y", "medium")[0] == "max",
     )
-except TypeError:
-    check("justified medium never maps down to low", False)
+with patch.object(
+    core, "_find", return_value={"reasoning": {"supported_efforts": ["low", "high"]}}
+):
+    check(
+        "MCP effort above every published level runs the strongest",
+        core.mcp_effort("x/y", "max")[0] == "high",
+    )
+check(
+    "none on a model without reasoning sends no reasoning parameter",
+    core.mcp_effort("mistralai/mistral-large-2512", "none") == (None, None),
+)
+try:
+    core.mcp_effort("mistralai/mistral-large-2512", "low")
+    check("a level on a model without published efforts is refused", False)
+except core.OpenRouterError:
+    check("a level on a model without published efforts is refused", True)
+
+# ---- effort level discovery ------------------------------------------------
+_levels = core.effort_levels(["kimi", "moonshotai/kimi-k3", "glm", "mistralai/mistral-large-2512"])
+_rows = {r["slug"]: r for r in _levels["models"]}
+check(
+    "effort discovery lists every level strongest first",
+    _levels["levels"] == ["max", "xhigh", "high", "medium", "low", "minimal", "none"],
+)
+check("effort discovery shows each resolved model once", len(_levels["models"]) == 3)
+check(
+    "effort discovery shows what each level runs at on Kimi",
+    _rows["moonshotai/kimi-k3"]["runs"]
+    == {
+        "max": "max",
+        "xhigh": "max",
+        "high": "high",
+        "medium": "high",
+        "low": "low",
+        "minimal": "low",
+        "none": "off",
+    },
+    str(_rows["moonshotai/kimi-k3"]["runs"]),
+)
+check(
+    "effort discovery shows none on a reasoning-required model",
+    _rows["z-ai/glm-5.3"]["mandatory"] and _rows["z-ai/glm-5.3"]["runs"]["none"] == "low",
+)
+check(
+    "effort discovery shows refusals on a model without reasoning",
+    _rows["mistralai/mistral-large-2512"]["runs"]["max"] == "refused"
+    and _rows["mistralai/mistral-large-2512"]["runs"]["none"] == "not sent",
+)
+check(
+    "effort discovery states the effort_reason rule",
+    any("effort_reason" in rule for rule in _levels["rules"]),
+)
+check(
+    "effort discovery defaults to the configured aliases and coding group",
+    {"moonshotai/kimi-k3", "x-ai/grok-4.6"} <= {r["slug"] for r in core.effort_levels()["models"]},
+)
 
 # ---- audit: private, recoverable thread persistence ------------------------
 

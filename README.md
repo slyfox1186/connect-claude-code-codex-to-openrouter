@@ -106,6 +106,7 @@ search the saved pin, known environments and available Python installations.
 | `list_llm_categories` | The capability categories, the models each resolves to, and the evidence. |
 | `list_llm_models` | Search the live catalogue for slugs, prices, context, reasoning efforts. |
 | `llm_model_info` | Full detail for one model. |
+| `llm_effort_levels` | Effort levels, the rule for picking one, and what each level runs at per model. Free. |
 | `openrouter_usage` | Account spend plus what this bridge has cost. |
 | `read_guide` | Local best-practice guides. Free, no model call. |
 
@@ -306,6 +307,10 @@ per call, `max_attachments` per message, `max_dir_files` per expanded directory.
 The secrets denylist applies to attachments exactly as it does to text, so a
 private key does not become sendable by having binary contents.
 
+A tool call sends text files whole. A missing path, a file over `max_file_chars`
+or a directory over `max_dir_files` is refused before billing. The CLI instead
+elides the middle of a long file, clips the directory, and says so in a note.
+
 ### Following up on a document
 
 Name a `thread` and the attachment stays with it, so the next question can reuse its saved document context:
@@ -420,6 +425,17 @@ replaces it outright.
 
 ## Design decisions worth knowing
 
+**Tool calls pick their own files and send them whole.** A consultation used to
+carry whatever the calling agent remembered to attach, and a large file lost its
+middle with only a note. The other model cannot see this machine, so a missing
+plan or helper script produced a confident answer to a different question. The
+`ask_llm` and `ask_panel` descriptions now tell the agent to choose every file the
+answer needs: files the request names or points to, plans and scripts it wrote for
+the task, and the code they import or call. `build_messages(whole_files=True)`
+refuses a missing path, an oversized file or a clipped directory before billing.
+The bridge does not guess paths from the question text, because that would send
+files nobody chose to a third party.
+
 **The coding group is separate from benchmark recommendations.** Previously,
 the caller instructions sent "all coding LLMs" to a two-pin category that
 excluded Google, bypassing the four-member default panel. `core.CODING_PANEL`
@@ -484,12 +500,25 @@ published model levels, rounding upward on a tie and reporting substitutions.
 Use `llm_model_info` for the current advertised levels rather than relying on a
 fixed per-model effort table.
 
-MCP calls default to `max` independently of the CLI's configurable default.
-Claude Code and Codex must request `max` or `xhigh`; `medium` requires a concrete
-task-specific `effort_reason`. Low, minimal and disabled reasoning are rejected
-before billing. A preferred effort maps to the model's published levels; a model
-whose strongest level is `high` can use that level, and mapping never drops below
-medium. Models without published compatible reasoning levels are refused by MCP.
+MCP calls default to `max` independently of the CLI's configurable default. A
+person picks another level by telling Claude Code or Codex, which passes it as
+`effort` (`max`, `xhigh`, `high`, `medium`, `low`, `minimal` or `none`). Every
+level below `xhigh` needs an `effort_reason` quoting that instruction, or a
+concrete task reason for `medium`, and is refused before billing without one.
+This replaced an outright ban on low and disabled reasoning, added after an agent
+lowered effort on its own. The ban also stopped the key's owner from choosing,
+including `high`, the level just below `max` on Kimi K3. The required reason keeps
+a silent agent-initiated downgrade out, and an effort named inside a reference
+file is data rather than an instruction.
+
+A tool call runs the weakest published level at or above the request, or the
+strongest when none is that high, so `medium` on a model offering only `low` and
+`max` runs at `max`. `none` is sent as `reasoning.enabled: false`, because leaving
+the parameter out runs the model's default, which is `max` on Kimi K3. A model
+that requires reasoning runs at its lightest level instead of returning a 400.
+Models without published reasoning levels are refused unless the request is `none`.
+`llm_effort_levels` (or `orask efforts [model...]`) prints this mapping per model
+for free. Each cell comes from the same function a real call uses.
 MCP also sends `provider.require_parameters=true` to restrict routing to providers
 that support the request parameters, as described in [OpenRouter provider
 routing](https://openrouter.ai/docs/guides/routing/provider-selection). This may
